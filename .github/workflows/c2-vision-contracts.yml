@@ -7,6 +7,7 @@ on:
       - 'src/core/**'
       - 'src/program/generate.cpp'
       - 'tests/core/slot_mrope*'
+      - 'tests/batch_segments.cpp'
       - 'serve/**'
       - '.github/workflows/c2-vision-contracts.yml'
   workflow_dispatch:
@@ -27,6 +28,12 @@ jobs:
           /tmp/slot_mrope_cpu
           c++ -std=c++20 -O1 -g -fsanitize=address,undefined -Iinclude tests/core/slot_mrope_cpu.cpp -o /tmp/slot_mrope_sanitize
           /tmp/slot_mrope_sanitize
+      - name: Routed occurrence closure and existing batch layouts
+        run: |
+          c++ -std=c++17 -O2 -Wall -Wextra -Werror -Iinclude tests/batch_segments.cpp -o /tmp/batch_segments
+          /tmp/batch_segments
+          c++ -std=c++17 -O1 -g -fsanitize=address,undefined -Iinclude tests/batch_segments.cpp -o /tmp/batch_segments_sanitize
+          /tmp/batch_segments_sanitize
       - name: Disk format golden and refusal contracts
         run: |
           c++ -std=c++20 -O2 -Iinclude src/core/conversation_file_test.cpp src/core/conversation_file.cpp -o /tmp/conversation_file_test

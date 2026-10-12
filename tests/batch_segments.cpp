@@ -10,6 +10,25 @@ static void require(bool value) { if (!value) { std::fprintf(stderr, "segment te
 int main() {
     using namespace strata::core;
     std::string err;
+    require(batch_routed_counters_valid(100, 90, 3, 0, 7)); // tail7: formerly rejected
+    require(!batch_routed_counters_valid(100, 90, 3, 0, 0)); // never infer absent work as skipped
+    int accounting_cases = 0;
+    for (int hits = 0; hits <= 5; ++hits) for (int cpu = 0; cpu <= 5; ++cpu)
+    for (int offload = 0; offload <= 5; ++offload) for (int skipped = 0; skipped <= 5; ++skipped) {
+        const int routed = hits + cpu + offload + skipped;
+        require(batch_routed_counters_valid(routed, hits, cpu, offload, skipped) == (routed > 0));
+        require(!batch_routed_counters_valid(routed + 1, hits, cpu, offload, skipped));
+        require(!batch_routed_counters_valid(routed - 1, hits, cpu, offload, skipped));
+        ++accounting_cases;
+    }
+    require(!batch_routed_counters_valid(10, -1, 3, 3, 5));
+    require(!batch_routed_counters_valid(10, 3, -1, 3, 5));
+    require(!batch_routed_counters_valid(10, 3, 3, -1, 5));
+    require(!batch_routed_counters_valid(10, 3, 3, 5, -1));
+    const auto max_count = std::numeric_limits<int64_t>::max();
+    require(batch_routed_counters_valid(max_count, max_count, 0, 0, 0));
+    require(!batch_routed_counters_valid(max_count, max_count, 1, 0, 0));
+    std::printf("PASS: %d routed accounting combinations (hits+cpu+offload+skipped), negatives and overflow\n", accounting_cases);
     // Sparse active sets, asymmetric demand and rotating spare-row allocation.
     // Assert capacity, no starvation, work conservation and valid dense tiles.
     for (int code = 0; code < 625; ++code) {

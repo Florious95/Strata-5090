@@ -7,6 +7,18 @@ namespace strata::core {
 
 inline constexpr int kBatchMaxRows = 16;
 
+// Token-expert occurrences: skipped work is not a GPU hit, CPU job or offload.
+inline bool batch_routed_counters_valid(int64_t routed, int64_t hits, int64_t cpu,
+                                        int64_t offload, int64_t skipped) {
+    if (routed <= 0) return false;
+    const int64_t counts[] = {hits, cpu, offload, skipped};
+    for (const int64_t count : counts) {
+        if (count < 0 || count > routed) return false;
+        routed -= count;
+    }
+    return routed == 0;
+}
+
 // Give every active request its pending row, then rotate access to spare rows.
 // Callers bound legacy widths to four, or C2 widths to six, preserving two <=8-row groups.
 inline void allocate_batch_rows(const int* wanted, int count, int budget, int first, int* out) {
