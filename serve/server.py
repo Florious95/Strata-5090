@@ -588,6 +588,32 @@ FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed ou
                   "ERR verify: an earlier window never finished", "ERR verify batch: an earlier window never finished")
 
 
+class _TokenGaps:
+    """One request's actual native token-ID arrivals, measured before queue/SSE delivery."""
+    def __init__(self):
+        self.previous_ns = None
+        self.first_ns = None
+        self.gaps_ms = []
+        self.tokens = 0
+
+    def observe(self, at_ns=None):
+        now = time.perf_counter_ns() if at_ns is None else at_ns
+        if self.previous_ns is not None:
+            self.gaps_ms.append((now - self.previous_ns) / 1e6)
+        else:
+            self.first_ns = now
+        self.previous_ns = now
+        self.tokens += 1
+
+    def receipt(self):
+        gaps = sorted(self.gaps_ms)  # pump is the only writer; completed native lines precede receipt collection
+        return {"token_gap_source": "engine_stdout_token_id", "token_gap_tokens": self.tokens,
+                "token_gap_count": len(gaps),
+                "token_gap_p95_ms": round(gaps[math.ceil(0.95 * len(gaps)) - 1], 3) if gaps else None,
+                **({"token_gap_first_ns": self.first_ns, "token_gap_last_ns": self.previous_ns,
+                    "token_gaps_ms": list(self.gaps_ms)} if os.environ.get("STRATA_TOKEN_GAP_RAW") == "1" else {})}
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -730,6 +756,16 @@ class StrataEngine:
         # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
         asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
         self.batch = int(self.info.get("batch_slots") or 0)
+        slot_only = bool(int(self.info.get("slot_only") or 0))
+        if ("--batch-slot-only" in args) != slot_only or (slot_only and self.batch != 2):
+            self.ended = True
+            self.proc.kill()  # this constructor's own incompatible backend, never an unknown GPU process
+            self.proc.wait(timeout=5)
+            self.proc.stdin.close()
+            self.proc.stdout.close()
+            if log:
+                self.log.close()
+            raise RuntimeError("slot-only capability handshake mismatch; refusing solo fallback")
         if asked and self.batch != asked:
             print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
                   "(its log says why)", flush=True)
@@ -749,6 +785,8 @@ class StrataEngine:
         groups_run = int(self.info.get("batch_groups") or groups)
         self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
+        self.slot_clocks = [None] * self.batch
+        self._ctl_clock = None
         self.slot_busy = [False] * self.batch
         # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
         # given back; slot_releasing: slots handed to the background BDONE wait.  A busy slot in neither has no owner
@@ -782,6 +820,7 @@ class StrataEngine:
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         slot_q = self.slot_q
+        slot_clocks = self.slot_clocks
         line = None
         for line in proc.stdout:
             # checked before batch routing: a fatal line is never a slot's own
@@ -798,10 +837,15 @@ class StrataEngine:
                 break                           # publish EOF, never the trailing DONE
             if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
                 try:
-                    slot_q[int(line.split()[1])].put(line)
+                    b = int(line.split()[1])
+                    if line.startswith("BT ") and self.proc is proc and slot_clocks[b] is not None:
+                        slot_clocks[b].observe()
+                    slot_q[b].put(line)
                     continue
                 except (IndexError, ValueError):
                     pass
+            if line.startswith("T ") and self.proc is proc and self._ctl_clock is not None:
+                self._ctl_clock.observe()
             lines.put(line)
         if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
             self.ended = True                           # its output closed: it is gone, even before the OS says so
@@ -1266,7 +1310,8 @@ class StrataEngine:
         path with its MTP drafts: the engine continues it from the slot's sessions (its slot cache; INFO
         slot_cache=1).  STRATA_PARALLEL_SOLO=0 keeps it in the slot."""
         if (embeddings or times >= self.SOLO_AGAIN_MAX or left < self.SOLO_AGAIN_MIN_LEFT or
-                not (self.info or {}).get("slot_cache") or os.environ.get("STRATA_PARALLEL_SOLO") == "0"):
+                not (self.info or {}).get("slot_cache") or int((self.info or {}).get("slot_only") or 0) or
+                os.environ.get("STRATA_PARALLEL_SOLO") == "0"):
             return False
         with self.slot_cv:
             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
@@ -1292,6 +1337,7 @@ class StrataEngine:
         keys = self.sampling_keys(sampling or {})
         out: list[int] = []
         pending: list[int] = []
+        clock, clock_before = _TokenGaps(), self.last
         prompt, left = list(ids), int(max_new)
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
@@ -1314,9 +1360,10 @@ class StrataEngine:
                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
-                if alone and left > 1:
+                if alone and left > 1 and not int((self.info or {}).get("slot_only") or 0):
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     self._last_done = None                  # (#879: this request's DONE decides below)
+                    self._ctl_clock = clock
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     phase = "solo"
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
@@ -1428,6 +1475,8 @@ class StrataEngine:
                             "started": time.time(), "first_token": None}
                     self.slot_live[slot] = live
                     self._last_done = None                  # (#879: this admission's DONE decides below)
+                    self._ctl_clock = clock
+                    self.slot_clocks[slot] = clock
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
                     phase = "admit"
@@ -1535,15 +1584,44 @@ class StrataEngine:
             except EngineDied:
                 pass
             bdone_in = False
-            if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and self.gen == born:
-                bd = self._bdone_after_eos(slot)            # (#1869) the slot's figures, not the admission's
-                if bd is not None:
-                    self._apply_bdone(bd.split())
-                    bdone_in = True
+            cleanup_error = None
+            # EOS/max_new completion must wait for the committed backend state,
+            # while preserving v43 BDONE/nonfinite accounting and releasing locks on errors.
+            expected_done = out and (out[-1] in EOS_IDS or len(out) >= int(max_new)) and not cancel.is_set()
+            if phase == "slot" and expected_done and slot is not None and self.gen == born:
+                end = time.monotonic() + 600.0
+                try:
+                    while True:
+                        remaining = end - time.monotonic()
+                        if remaining <= 0:
+                            raise self._silent("the completed slot did not publish BDONE within 600 s")
+                        try:
+                            line = self.slot_q[slot].get(timeout=min(5.0, remaining))
+                        except queue.Empty:
+                            continue
+                        if line is None:
+                            raise EngineDied("the backend stopped before the completed slot published BDONE")
+                        if line.startswith("BDONE "):
+                            fields = line.split()
+                            self._apply_bdone(fields)
+                            if fields[3:4] == ["nonfinite"]:
+                                raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                            self.slot_held[slot] = (list(prompt) + out[gen0:])[:-1] if gen0 is not None else []
+                            phase = "none"
+                            bdone_in = True
+                            break
+                        if line.startswith("BT "):
+                            raise self._silent("the backend emitted a token after the request's completed output")
+                except (EngineDied, EngineNonFinite) as e:
+                    cleanup_error = e
+                    self.slot_held[slot] = []
+                    phase = "none"
             if reused0 is not None and isinstance(self.last, dict):
                 self.last = {**self.last, "reused": reused0}
             if carry and isinstance(self.last, dict):
                 self.last = add_carry(carry, self.last)
+            if self.last is not clock_before and isinstance(self.last, dict):
+                self.last = {**self.last, **clock.receipt()}
             if holding:
                 self.ctl.release()
             if admit_wait:
@@ -1574,6 +1652,8 @@ class StrataEngine:
                         self.slot_busy[slot] = False
                         self.slot_claims.discard(slot)
                         self.slot_cv.notify_all()
+            if cleanup_error is not None:
+                raise cleanup_error
 
     slot_groups = 1         # --batch-groups (set when the engine starts)
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
@@ -1617,7 +1697,8 @@ class StrataEngine:
         for b in range(self.batch):
             r = self.slot_live[b]
             if r is None:
-                view.append({"slot": b, "state": "idle", "held_tokens": len(self.slot_held[b])})
+                view.append({"slot": b, "state": "draining" if self.slot_busy[b] else "idle",
+                             "held_tokens": len(self.slot_held[b])})
                 continue
             ft = r.get("first_token")
             view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
@@ -1640,6 +1721,8 @@ class StrataEngine:
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        clock, clock_before = _TokenGaps(), self.last
+        self._ctl_clock = clock
         try:
             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
@@ -1747,6 +1830,8 @@ class StrataEngine:
                         break
                     if not self.can_stop:
                         heard = time.monotonic()
+            if self.last is not clock_before and isinstance(self.last, dict):
+                self.last = {**self.last, **clock.receipt()}
 
     def _activity(self) -> tuple[float, int] | None:
         """#1317: (CPU seconds, I/O bytes) the engine process has used so far, or None when they cannot be read."""
@@ -4172,7 +4257,10 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
             "predicted_per_second": round(decoded / (decode_ms / 1000), 1) if decoded and decode_ms > 0 else None,
             # the speculative drafts, as llama.cpp names them (from PR #83, @mikicvi): only when the engine reported them
             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
-               if last.get("drafts_offered") is not None else {})}
+               if last.get("drafts_offered") is not None else {}),
+            **{k: last[k] for k in ("token_gap_source", "token_gap_tokens", "token_gap_count", "token_gap_p95_ms",
+                                    "token_gap_first_ns", "token_gap_last_ns", "token_gaps_ms")
+               if k in last}}
 
 
 def request_stats(segments: list[dict]) -> dict:
@@ -4180,6 +4268,26 @@ def request_stats(segments: list[dict]) -> dict:
     if not segments:
         return {}
     result = dict(segments[-1])
+    if len(segments) > 1 and all("token_gaps_ms" in s for s in segments):
+        gaps = []
+        previous = None
+        for segment in segments:
+            first, last = segment.get("token_gap_first_ns"), segment.get("token_gap_last_ns")
+            if first is None: continue
+            if previous is not None: gaps.append((first - previous) / 1e6)
+            gaps.extend(segment["token_gaps_ms"])
+            previous = last
+        ordered = sorted(gaps)
+        result.update(token_gap_tokens=sum(s.get("token_gap_tokens", 0) for s in segments),
+                      token_gap_count=len(gaps), token_gaps_ms=gaps,
+                      token_gap_first_ns=next((s["token_gap_first_ns"] for s in segments
+                                              if s.get("token_gap_first_ns") is not None), None),
+                      token_gap_last_ns=previous,
+                      token_gap_p95_ms=round(ordered[math.ceil(0.95 * len(ordered)) - 1], 3) if ordered else None)
+    elif len(segments) > 1:
+        # Per-segment p95s cannot be combined; never label the last summary as the whole request.
+        for key in tuple(result):
+            if key.startswith("token_gap"): result.pop(key)
     for key in ("reused", "prompt_read"):
         if key in segments[0]:
             result[key] = segments[0][key]

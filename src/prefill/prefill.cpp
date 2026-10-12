@@ -738,6 +738,7 @@ struct Prefill::Impl {
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
     core::SessionState* ss = nullptr;
+    std::atomic<bool> active{false}; // run/bind are mutually exclusive; callers serialize other configuration
     core::ExpertSource* src = nullptr;
     const core::ExpertCache* cache = nullptr;
     const int32_t* host_res = nullptr;
@@ -1302,6 +1303,32 @@ bool Prefill::carve(size_t T, void* alloc) {
     take_stage(o, ss, s, m.stage, ok);
     m.T = (int64_t) T;
     return ok;
+}
+
+bool Prefill::bind_session(core::SessionState& ss, std::string& err) {
+    Impl& m = *impl_;
+    bool idle = false;
+    if (!m.ss || !m.active.compare_exchange_strong(idle, true)) {
+        err = "prefill: session binding requires an initialized idle prefill";
+        return false;
+    }
+    struct IdleGuard {
+        std::atomic<bool>& active;
+        ~IdleGuard() { active.store(false); }
+    } guard{m.active};
+    if (ss.max_cells != m.ss->max_cells || ss.k != m.ss->k ||
+        ss.layer_lo != m.ss->layer_lo || ss.layer_hi != m.ss->layer_hi) {
+        err = "prefill: incompatible session binding";
+        return false;
+    }
+    for (auto stream : {m.cs, m.copy, m.kv_copy}) {
+        if (stream && cudaStreamSynchronize(stream) != cudaSuccess) {
+            err = "prefill: draining streams before session binding failed";
+            return false;
+        }
+    }
+    m.ss = &ss;
+    return true;
 }
 
 bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err) {
@@ -4179,6 +4206,15 @@ bool Prefill::drain_pipeline(std::string& err) {
 }
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+    bool idle = false;
+    if (!impl_->active.compare_exchange_strong(idle, true)) {
+        err = "prefill: another run or session binding is in flight";
+        return false;
+    }
+    struct IdleGuard {
+        std::atomic<bool>& active;
+        ~IdleGuard() { active.store(false); }
+    } guard{impl_->active};
     const bool body_ok = run_impl(tokens, n, pos0, err);
 
     std::string drain_err;

@@ -78,6 +78,20 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
 void native_q6_k_f32(const void* weights, const float* x, void* scratch_q8_1,
                      float* y, int n_in, int n_out, int ncols, void* stream);
 
+// CUDA exact-mode wide head: Q5_K(13) / Q6_K(14), 9..12 columns, bitwise
+// independent single-column calls. Two <=8-column quantizers, ONE weight-reading
+// projection, four warps. Scratch is ncols * native_q8_1_bytes(n_in, 1);
+// no allocation or synchronization. Reads canonical GGUF weights.
+// Unsupported type/width/backend/non-exact mode returns false without a launch.
+// Existing native_mmvq/quantizer APIs still accept only 1..8 columns.
+constexpr int kNativeHeadWideMaxCols = 12;
+bool native_head_f32_wide(int ggml_type, const void* weights, const float* x, void* scratch_q8_1,
+                          float* y, int n_in, int n_out, int ncols, void* stream);
+// Q6_K-only compatibility composition.
+constexpr int kQ6KWideMaxCols = kNativeHeadWideMaxCols;
+bool native_q6_k_f32_wide(const void* weights, const float* x, void* scratch_q8_1,
+                          float* y, int n_in, int n_out, int ncols, void* stream);
+
 void native_q4_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream);
 
