@@ -9896,7 +9896,7 @@ int main(int argc, char** argv) {
                 return false;
             }
             for (int t = 0; t < S; t += widths[t]) {
-                for (int j = 0; j < widths[t]; ++j) poisoned[t] = poisoned[t] || ver.nonfinite_row(t + j);
+                for (int j = 0; j < widths[t]; ++j) poisoned[t] = poisoned[t] || ver.nonfinite_in(t + j);
                 // A poisoned slot is discarded, not published. The existing commit API requires
                 // one input row; never commit the rest of its speculative window or emit its outputs.
                 keeps[t] = poisoned[t] ? 1 : strata::core::accepted_segment_prefix(tok + t, outb + t, useful[t],
