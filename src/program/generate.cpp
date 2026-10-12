@@ -9872,6 +9872,7 @@ int main(int argc, char** argv) {
             const double wait0 = ver.ms_wait, pool0 = ver.ms_pool;
             const int64_t hit0 = drive.d.cache_hits, miss0 = drive.d.multi_misses, pcie0 = drive.d.pcie_experts;
             const int64_t expert0 = drive.d.experts, entries0 = drive.d.multi_entries, offload0 = drive.d.offload_entries;
+            const int64_t skipped0 = drive.d.tail_skipped;
             if (o.batch_slot_only) {
                 for (int t = 0; t < S; t += widths[t]) {
                     const auto& sl = bs[(size_t) rows[t]];
@@ -9906,8 +9907,9 @@ int main(int argc, char** argv) {
             const int64_t hits = drive.d.cache_hits - hit0, routed = drive.d.experts - expert0;
             const int64_t cpu_entries = drive.d.multi_entries - entries0;
             const int64_t offload_entries = drive.d.offload_entries - offload0;
-            if (o.batch_slot_only && (routed <= 0 || hits < 0 || cpu_entries < 0 || offload_entries < 0 ||
-                                      routed != hits + cpu_entries + offload_entries)) {
+            const int64_t skipped = drive.d.tail_skipped - skipped0;
+            if (o.batch_slot_only && !strata::core::batch_routed_counters_valid(
+                    routed, hits, cpu_entries, offload_entries, skipped)) {
                 std::printf("ERR slot-only native routed counters unavailable or inconsistent\n");
                 return false;
             }
@@ -9926,9 +9928,9 @@ int main(int argc, char** argv) {
                     sl.row_limit = strata::core::adaptive_c2_row_limit(sl.row_limit, o.batch_spec,
                                                                        useful[t], keeps[t], hits, routed);
                     if (o.batch_trace && before != sl.row_limit)
-                        std::fprintf(stderr, "batch-depth slot=%d old=%d new=%d useful=%d kept=%d hits=%lld routed=%lld cpu_entries=%lld offload_entries=%lld\n",
+                        std::fprintf(stderr, "batch-depth slot=%d old=%d new=%d useful=%d kept=%d hits=%lld routed=%lld cpu_entries=%lld offload_entries=%lld skipped=%lld\n",
                                      rows[t], before, sl.row_limit, useful[t], keeps[t], (long long) hits, (long long) routed,
-                                     (long long) cpu_entries, (long long) offload_entries);
+                                     (long long) cpu_entries, (long long) offload_entries, (long long) skipped);
                 }
             }
             if (!(batch_fast ? ver.commit_segment_prefixes(keeps, err) : ver.commit_slots(err))) {
@@ -10028,7 +10030,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "batch-round id=%llu active=%d rows=%d verify_ms=%.3f commit_ms=%.3f emit_ms=%.3f draft_ms=%.3f",
                     (unsigned long long) batch_round, logical, S, msd(w0,w1), msd(w1,w2), msd(w2,wd), msd(wd,Clock::now()));
                 std::fprintf(stderr, " adapt_ms=%.3f adapt_deferred=%d", batch_adapt_ms, batch_adapt_due ? 1 : 0);
-                std::fprintf(stderr, " prefill=%d merged=%d dense_groups=%d dense_parallel=%d shared_after_ring=%d head_type=%d head_wide_active=%d qsa_tile_active=%d qsa_tile_calls=%d qsa_tile_rows=%d qsa_scalar_rows=%d elapsed_ms=%.3f wait_ms=%.3f pool_ms=%.3f hits=%lld misses=%lld pcie=%lld routed=%lld cpu_entries=%lld offload_entries=%lld",
+                std::fprintf(stderr, " prefill=%d merged=%d dense_groups=%d dense_parallel=%d shared_after_ring=%d head_type=%d head_wide_active=%d qsa_tile_active=%d qsa_tile_calls=%d qsa_tile_rows=%d qsa_scalar_rows=%d elapsed_ms=%.3f wait_ms=%.3f pool_ms=%.3f hits=%lld misses=%lld pcie=%lld routed=%lld cpu_entries=%lld offload_entries=%lld skipped=%lld",
                     batch_prefilling ? 1 : 0, ver.batch_experts_merged() ? 1 : 0, ver.batch_dense_groups(),
                     ver.batch_dense_parallel() ? 1 : 0, ver.batch_shared_after_ring() ? 1 : 0,
                     ver.batch_head_type(), ver.batch_head_wide_active() ? 1 : 0,
@@ -10036,7 +10038,7 @@ int main(int argc, char** argv) {
                     ver.batch_qsa_tile_rows(), ver.batch_qsa_scalar_rows(),
                     msd(bt_start, Clock::now()), ver.ms_wait-wait0, ver.ms_pool-pool0,
                     (long long) hits, (long long)(drive.d.multi_misses-miss0), (long long)(drive.d.pcie_experts-pcie0),
-                    (long long) routed, (long long) cpu_entries, (long long) offload_entries);
+                    (long long) routed, (long long) cpu_entries, (long long) offload_entries, (long long) skipped);
                 for (int t = 0; t < S; t += widths[t])
                     std::fprintf(stderr, " slot=%d:pos=%lld:rows=%d:useful=%d:emitted=%d:suffix=%d",
                         rows[t], (long long)pos[t], widths[t], useful[t], poisoned[t] ? 0 : keeps[t], bs[(size_t)rows[t]].from_suffix ? 1 : 0);
