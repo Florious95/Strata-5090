@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1620" viewBox="0 0 2400 1620">
 <rect width="100%" height="100%" fill="#f6f8fc"/>
 <g font-family="Heiti SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif">
-<text x="95" y="55" dominant-baseline="text-before-edge" font-size="64" fill="#263147">同一张显卡，三种完全不同的吞吐问题</text>
+<text x="95" y="55" dominant-baseline="text-before-edge" font-size="64" fill="#263147">真实业务吞吐，与跑分数字不是同一个问题</text>
 <text x="98" y="142" dominant-baseline="text-before-edge" font-size="35" fill="#55637a">真实长上下文 / 真实工程  vs  玩具短文本最高值  vs  社区四卡宣称</text>
 <rect x="95" y="215" width="2210" height="85" fill="#fff0dd" stroke="none"/>
 <text x="125" y="237" dominant-baseline="text-before-edge" font-size="34" fill="#8c5210">口径、上下文、并发与卡数不同：展示数字，不直接排名，也不计算虚假提升。</text>

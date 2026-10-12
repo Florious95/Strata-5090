@@ -70,7 +70,7 @@ def draw(items, output, font_path=None, svg_only=False):
                 fonts[size] = ImageFont.truetype(str(font_path), size)
             painter.text((x, y), value, font=fonts[size], fill=fill)
 
-    text(95, 55, "同一张显卡，三种完全不同的吞吐问题", 64)
+    text(95, 55, "真实业务吞吐，与跑分数字不是同一个问题", 64)
     text(98, 142, "真实长上下文 / 真实工程  vs  玩具短文本最高值  vs  社区四卡宣称", 35, "#55637a")
     rect(95, 215, 2210, 85, "#fff0dd")
     text(125, 237, "口径、上下文、并发与卡数不同：展示数字，不直接排名，也不计算虚假提升。", 34, "#8c5210")

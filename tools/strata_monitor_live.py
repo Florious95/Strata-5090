@@ -50,6 +50,26 @@ def number(value, decimals=0):
     return "n/a" if value is None else format(value, f",.{decimals}f")
 
 
+def snapshot(data, url):
+    """Public display fields only; never archive arbitrary API extensions or request text."""
+    keys = {
+        "engine": ("model", "max_context"),
+        "live": ("state", "prompt_read", "prompt_total", "generated", "max_tokens", "tok_s", "tok_s_mean",
+                 "prefill_tok_s_mean", "parallel", "running", "queued", "admitting", "tok_s_window_s"),
+        "hardware": ("gpu_util", "gpu_power", "gpu_temp", "gpu_mem_used", "gpu_mem_total", "gpu_pcie_gen",
+                     "gpu_pcie_width", "cpu", "ram_used", "ram_total"),
+        "hardware_static": ("gpu_name", "gpu_count"),
+    }
+    result = {name: {key: data.get(name, {}).get(key) for key in fields} for name, fields in keys.items()}
+    result["live"]["slots"] = [{k: row.get(k) for k in ("slot", "state", "prompt_tokens", "generated", "elapsed_s", "tok_s")}
+                                for row in data.get("live", {}).get("slots", [])]
+    result["requests"] = [{k: row.get(k) for k in ("prompt_tokens", "reused", "output_tokens", "decode_tok_s", "finish")}
+                          for row in data.get("requests", [])[:5]]
+    result["source_endpoint"] = endpoint(url)
+    result["captured_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    return result
+
+
 def render(data, url):
     live, engine = data.get("live", {}), data.get("engine", {})
     hw, recent = data.get("hardware", {}), data.get("requests", [])
@@ -65,7 +85,8 @@ def render(data, url):
                    f"Request mean: {number(live.get('tok_s_mean'), 1)} tok/s (API)",
                    f"Prefill: {number(live.get('prefill_tok_s_mean'), 1)} tok/s (fresh input)",
                    f"Last native decode: {number(recent[0].get('decode_tok_s'), 1) if recent else 'n/a'} tok/s"]
-    lines = [f"STRATA / MONITOR LIVE {safe(url)}  |  {time.strftime('%H:%M:%S')}",
+    stamp = data.get("captured_at") or time.strftime('%H:%M:%S')
+    lines = [f"STRATA / MONITOR LIVE {safe(url)}  |  {safe(stamp)}",
              "READ-ONLY /metrics | fork viewer, NOT the unidentified screenshot CLI", "─" * 112,
              "SERVING".ljust(54) + "PERFORMANCE"]
     for left, right in zip(serving, performance):
@@ -77,7 +98,12 @@ def render(data, url):
         lines.append(f"  slot {slot.get('slot')}: {safe(slot.get('state'))} | "
                      f"prompt {number(slot.get('prompt_tokens'))} | output {number(slot.get('generated'))} | "
                      f"API mean {number(slot.get('tok_s'), 1)} tok/s")
+    static = data.get("hardware_static", {})
+    generation = hw.get("gpu_pcie_gen")
+    link = {1: 2.5, 2: 5, 3: 8, 4: 16, 5: 32, 6: 64}.get(generation)
     lines += ["─" * 112, "HARDWARE",
+              f"{number(static.get('gpu_count'))} × {safe(static.get('gpu_name', 'GPU name unavailable'))}",
+              f"PCIe link: {number(link, 1)} GT/s ×{number(hw.get('gpu_pcie_width'))} (not GDDR MT/s)",
               f"GPU busy {number(hw.get('gpu_util'), 1)}% | power {number(hw.get('gpu_power'), 1)} W | "
               f"temperature {number(hw.get('gpu_temp'), 1)} °C",
               f"VRAM {number(hw.get('gpu_mem_used', 0) / 2**30, 2) if hw.get('gpu_mem_used') is not None else 'n/a'} / "
@@ -100,7 +126,10 @@ def main(argv=None):
     parser.add_argument("--key-config", type=Path, default=Path.home() / "Projects/Strata/strata-iq3_s.json")
     parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--once", action="store_true", help="one frame, suitable for a log/receipt")
+    parser.add_argument("--snapshot", type=Path, help="with --once: archive public numeric display fields for TUI PNG")
     args = parser.parse_args(argv)
+    if args.snapshot and not args.once:
+        parser.error("--snapshot requires --once; one immutable frame, not an overwritten time series")
     try:
         endpoint(args.url)
         if not math.isfinite(args.interval) or args.interval < 0.2:
@@ -111,7 +140,11 @@ def main(argv=None):
     try:
         while True:
             try:
-                frame = render(fetch(args.url, key), args.url)
+                data = fetch(args.url, key)
+                frame = render(data, args.url)
+                if args.snapshot:
+                    args.snapshot.parent.mkdir(parents=True, exist_ok=True)
+                    args.snapshot.write_text(json.dumps(snapshot(data, args.url), ensure_ascii=False, indent=2)+"\n", encoding="utf-8")
             except urllib.error.HTTPError as error:
                 frame = f"MONITOR UNAVAILABLE: HTTP {error.code}; no stale LIVE data displayed"
             except (OSError, ValueError):

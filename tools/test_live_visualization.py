@@ -14,6 +14,7 @@ import xml.etree.ElementTree as ET
 
 from tools import render_throughput_comparison as chart
 from tools import strata_monitor_live as monitor
+from tools import render_tui_report as tui
 
 
 class MonitorTests(unittest.TestCase):
@@ -75,6 +76,27 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("MONITOR UNAVAILABLE", output.getvalue())
         self.assertNotIn("fixture-secret", output.getvalue())
         self.assertNotIn("LIVE", output.getvalue().replace("stale LIVE", "stale"))
+
+    def test_snapshot_is_allowlisted_and_keeps_capture_provenance(self):
+        data = {"live": {"prompt_read": 250, "prompt_total": 400, "api_key": "do-not-save",
+                         "slots": [{"slot": 1, "prompt": "private-content", "state": "reading"}]},
+                "requests": [{"output": "private-output", "output_tokens": 50}],
+                "api_key": "do-not-save", "hardware": {"gpu_pcie_gen": 5, "gpu_pcie_width": 16},
+                "hardware_static": {"gpu_count": 1, "gpu_name": "NVIDIA RTX 5090"}}
+        saved = monitor.snapshot(data, "http://localhost:8080")
+        self.assertNotIn("do-not-save", json.dumps(saved))
+        self.assertNotIn("private-", json.dumps(saved))
+        self.assertEqual(saved["live"]["prompt_total"], 400)
+        self.assertTrue(saved["captured_at"])
+        self.assertEqual(saved["source_endpoint"], "http://localhost:8080/metrics")
+        frame = monitor.render(saved, "http://localhost:8080")
+        self.assertIn("32.0 GT/s ×16 (not GDDR MT/s)", frame)
+        self.assertIn(saved["captured_at"], frame)
+
+    def test_snapshot_requires_once(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+            monitor.main(["--snapshot", "/tmp/no-write.json"])
+        self.assertEqual(caught.exception.code, 2)
 
     def test_private_key_config_and_environment(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -144,6 +166,39 @@ class ChartTests(unittest.TestCase):
                 chart.main(["--short-tok-s", "300", "--svg-only", "--output", str(output)])
             self.assertEqual(caught.exception.code, 2)
             self.assertEqual(list(Path(directory).iterdir()), [])
+
+
+class TuiTests(unittest.TestCase):
+    def test_render_measured_snapshot_and_separate_peak(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "fixture-snapshot.json"
+            output = Path(directory) / "fixture-only.png"
+            data = monitor.snapshot({"live": {"prompt_read": 250, "prompt_total": 400},
+                                     "hardware_static": {"gpu_name": "fixture GPU", "gpu_count": 1}}, "http://localhost:8080")
+            source.write_text(json.dumps(data))
+            width, height = tui.draw(source, output, peak=300.25, source="fixture-only", basis="fixture peak")
+            with Image.open(output) as image:
+                self.assertEqual(image.size, (width, height))
+                self.assertEqual(width, 2400)
+                self.assertGreater(height, 1200)
+            meta = json.loads(output.with_suffix(".json").read_text())
+            self.assertTrue(meta["rendered_not_terminal_capture"])
+            self.assertEqual(meta["peak_tok_s"], 300.25)
+            self.assertEqual(len(meta["snapshot_sha256"]), 64)
+            self.assertEqual(json.loads(source.read_text())["live"]["prompt_total"], 400)
+
+    def test_tui_rejects_unbound_or_unsourced_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "fixture.json"
+            output = Path(directory) / "not-created.png"
+            source.write_text('{"live":{}}')
+            with self.assertRaises(ValueError):
+                tui.draw(source, output)
+            source.write_text(json.dumps(monitor.snapshot({"live": {}}, "http://localhost:8080")))
+            with self.assertRaises(ValueError):
+                tui.draw(source, output, peak=300)
+            self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":
