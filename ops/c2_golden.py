@@ -161,9 +161,8 @@ def run(config):
     cfg = load(config)
     artifact_check(cfg)
     idle_check()
-    env = dict(os.environ)
-    for key in ABSENT:
-        env.pop(key, None)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("STRATA_")}
+    # No stale community/benchmark knobs from the user manager; child_env adds the frozen config's env.
     env.update(ENV)
     env["STRATA_API_KEY"] = key_from(cfg["_production"]["key_config"])
     os.chdir(CANDIDATE)
@@ -197,7 +196,7 @@ def smoke(config, base, timeout):
             if code == 200 and health.get("loaded") is True:
                 require(health.get("api_key") is True, "server authentication is not enabled")
                 break
-        except (OSError, ValueError):
+        except (OSError, json.JSONDecodeError):
             pass
         require(time.monotonic() < deadline, "model did not become healthy within deadline")
         time.sleep(1)

@@ -86,13 +86,14 @@ class ReleaseConfigTests(unittest.TestCase):
         config.write_text(json.dumps(cfg))
         with patch.object(release, "artifact_check"), patch.object(release, "idle_check"), \
                 patch.object(release.os, "chdir"), patch.object(release.os, "execve") as execute, \
-                patch.dict(release.os.environ, {"STRATA_VERIFY_PROFILE": "0", "STRATA_API_KEY": "stale",
+                patch.dict(release.os.environ, {"STRATA_VERIFY_PROFILE": "0", "STRATA_API_KEY": "stale", "STRATA_GDN_CHUNKED": "1",
                                               "STRATA_PRODUCTION_CONFIG_SHA256": release.digest(config)}):
             release.run(config)
         _, argv, env = execute.call_args.args
         self.assertNotIn("--api-key", argv)
         self.assertNotIn("synthetic-test-key", " ".join(argv))
         self.assertNotIn("STRATA_VERIFY_PROFILE", env)
+        self.assertNotIn("STRATA_GDN_CHUNKED", env)
         self.assertEqual(env["STRATA_API_KEY"], "synthetic-test-key-not-a-real-secret")
 
     def test_unit_process_tree_and_restart(self):
