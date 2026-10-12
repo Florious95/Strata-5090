@@ -1,0 +1,36 @@
+{
+  "source_archive": "979142a6694180e4cd458a96dfc6d544e25523f8",
+  "source_report": "Strata-bench-c2-bench-dev-20261011/benchmarks/PRODUCTION-USER-TASK-20261012.md",
+  "source_report_sha256": "fcd5acca2acd79beff3846c1240102cd7a519ea2e866600b1200323f8e373038",
+  "latest_request": {
+    "prompt_tokens": 75680,
+    "reused": 75619,
+    "new_input_tokens": 61,
+    "output_tokens": 1005,
+    "native_decode_s": 5.7953,
+    "native_decode_tok_s_reported": 173.4,
+    "service_active_s_rounded": 6.1,
+    "active_slots_per_native_window": [1],
+    "hits": 574190,
+    "routed": 624480,
+    "cpu_entries": 50290,
+    "offload_entries": 0
+  },
+  "inferred_recent_usage_interval": {
+    "requests": 55,
+    "prompt_tokens_first": 9989,
+    "prompt_tokens_last": 75680,
+    "native_generated": 57431,
+    "native_decode_s": 332.015,
+    "native_decode_tok_s": 172.9771245275063,
+    "api_output_tokens": 57427,
+    "service_active_s_rounded_sum": 357.6,
+    "limitations": "Task/conversation IDs not retained; not proof of one unique task or fixed75K context. Native and API-active timing differ; client end-to-end timing is unavailable."
+  },
+  "raw_artifact_sha256": {
+    "production-user-task-20261012-rounds.csv": "b1b9b21b3ca2f3b8793fddd5413e2d17a9ae8ee5d74f501a902f3d8995ff67f7",
+    "production-user-task-20261012-latest.engine.log": "e373d1cd74ab6255d07c905dc3087dbe878426f17e36b07653c222c9e3e41700",
+    "production-user-task-20261012-metrics.json": "c060a4249d5b732eca03b97e076ac70279312fe7946cd5c33856614a6fffd52c"
+  },
+  "provenance": "Read-only bench report excerpt. No new production request or benchmark by the chart worker."
+}

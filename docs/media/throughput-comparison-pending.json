@@ -1,0 +1,38 @@
+{
+  "rows": [
+    {
+      "label": "258K 极限长上下文",
+      "detail": "1×5090 · C2双路 · 三轮HTTP池化（历史验收）",
+      "value": 209.9903,
+      "color": "#2463cb",
+      "basis": "HTTP pooled: 24,576 tokens / 117.033979 s",
+      "source": "benchmarks/results/PR-EVIDENCE-LEDGER-20261012.json → c15c25f-fusion43-queued4-summary.json"
+    },
+    {
+      "label": "75K 实际工程写代码",
+      "detail": "1×5090 · 单路active · 最新实际生产请求",
+      "value": 173.4,
+      "color": "#15836e",
+      "basis": "75,680 prompt / 1,005 output; native decode 5.7953 s",
+      "source": "docs/evidence/production-coding-20261012.json;55-round pooled native=172.977 across9,989→75,680 contexts"
+    },
+    {
+      "label": "250 Token 玩具短prompt",
+      "detail": "1×5090 · 选取最高值，不代表稳定业务吞吐",
+      "value": null,
+      "color": "#d18a18",
+      "basis": "待bench实测，非零吞吐",
+      "source": "pending"
+    },
+    {
+      "label": "社区 4 卡宣传数字",
+      "detail": "4×GPU · 外部宣称；硬件/上下文/口径按来源",
+      "value": null,
+      "color": "#9158b5",
+      "basis": "待原始数字与来源，尚不可比",
+      "source": "pending"
+    }
+  ],
+  "axis": "linear-zero-origin",
+  "directly_comparable": false
+}

@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1620" viewBox="0 0 2400 1620">
+<rect width="100%" height="100%" fill="#f6f8fc"/>
+<g font-family="Heiti SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif">
+<text x="95" y="55" dominant-baseline="text-before-edge" font-size="64" fill="#263147">真实业务吞吐，与跑分数字不是同一个问题</text>
+<text x="98" y="142" dominant-baseline="text-before-edge" font-size="35" fill="#55637a">真实长上下文 / 真实工程  vs  玩具短文本最高值  vs  社区四卡宣称</text>
+<rect x="95" y="215" width="2210" height="85" fill="#fff0dd" stroke="none"/>
+<text x="125" y="237" dominant-baseline="text-before-edge" font-size="34" fill="#8c5210">口径、上下文、并发与卡数不同：展示数字，不直接排名，也不计算虚假提升。</text>
+<rect x="670.0" y="367" width="1" height="902" fill="#dde3ed" stroke="none"/>
+<text x="648.0" y="324" dominant-baseline="text-before-edge" font-size="25" fill="#778398">0</text>
+<rect x="934.0" y="367" width="1" height="902" fill="#dde3ed" stroke="none"/>
+<text x="912.0" y="324" dominant-baseline="text-before-edge" font-size="25" fill="#778398">920</text>
+<rect x="1198.0" y="367" width="1" height="902" fill="#dde3ed" stroke="none"/>
+<text x="1176.0" y="324" dominant-baseline="text-before-edge" font-size="25" fill="#778398">1840</text>
+<rect x="1462.0" y="367" width="1" height="902" fill="#dde3ed" stroke="none"/>
+<text x="1440.0" y="324" dominant-baseline="text-before-edge" font-size="25" fill="#778398">2760</text>
+<rect x="1726.0" y="367" width="1" height="902" fill="#dde3ed" stroke="none"/>
+<text x="1704.0" y="324" dominant-baseline="text-before-edge" font-size="25" fill="#778398">3680</text>
+<rect x="1990.0" y="367" width="1" height="902" fill="#dde3ed" stroke="none"/>
+<text x="1968.0" y="324" dominant-baseline="text-before-edge" font-size="25" fill="#778398">4600</text>
+<text x="2030" y="324" dominant-baseline="text-before-edge" font-size="27" fill="#778398">tok/s</text>
+<text x="105" y="395" dominant-baseline="text-before-edge" font-size="41" fill="#2463cb">258K 极限长上下文</text>
+<text x="105" y="462" dominant-baseline="text-before-edge" font-size="23" fill="#55637a">1×5090 · C2双路 · 三轮HTTP池化（历史验收）</text>
+<rect x="670" y="404" width="60.258086086956524" height="64" fill="#2463cb" stroke="none"/>
+<text x="753.2580860869565" y="403" dominant-baseline="text-before-edge" font-size="47" fill="#2463cb">209.99</text>
+<text x="670" y="491" dominant-baseline="text-before-edge" font-size="25" fill="#55637a">HTTP pooled: 24,576 tokens / 117.033979 s</text>
+<text x="105" y="616" dominant-baseline="text-before-edge" font-size="41" fill="#15836e">75K 实际工程写代码</text>
+<text x="105" y="683" dominant-baseline="text-before-edge" font-size="23" fill="#55637a">1×5090 · 单路active · 最新实际生产请求</text>
+<rect x="670" y="625" width="49.75826086956522" height="64" fill="#15836e" stroke="none"/>
+<text x="742.7582608695652" y="624" dominant-baseline="text-before-edge" font-size="47" fill="#15836e">173.40</text>
+<text x="670" y="712" dominant-baseline="text-before-edge" font-size="25" fill="#55637a">75,680 prompt / 1,005 output; native decode 5.7953 s</text>
+<text x="105" y="837" dominant-baseline="text-before-edge" font-size="41" fill="#d18a18">315 Token 玩具短prompt</text>
+<text x="105" y="904" dominant-baseline="text-before-edge" font-size="23" fill="#55637a">1×5090 · 选取最高值，不代表稳定业务吞吐</text>
+<rect x="670" y="846" width="89.81739130434782" height="64" fill="#d18a18" stroke="none"/>
+<text x="782.8173913043478" y="845" dominant-baseline="text-before-edge" font-size="47" fill="#d18a18">313.00</text>
+<text x="670" y="933" dominant-baseline="text-before-edge" font-size="25" fill="#55637a">2s rolling peak, C2; HTTP aggregate=292.45; reported, raw receipt pending</text>
+<text x="105" y="1058" dominant-baseline="text-before-edge" font-size="41" fill="#9158b5">社区 4 卡宣传数字</text>
+<text x="105" y="1125" dominant-baseline="text-before-edge" font-size="23" fill="#55637a">4×GPU · 外部宣称；硬件/上下文/口径按来源</text>
+<rect x="670" y="1067" width="1320.0" height="64" fill="#9158b5" stroke="none"/>
+<text x="2013.0" y="1066" dominant-baseline="text-before-edge" font-size="47" fill="#9158b5">4600.00</text>
+<text x="670" y="1154" dominant-baseline="text-before-edge" font-size="25" fill="#55637a">4GPU external claim; context / timer / hardware / quality unverified</text>
+<text x="100" y="1304" dominant-baseline="text-before-edge" font-size="31" fill="#263147">210 ≠ 双路各210；173 ≠ 客户端端到端速度；短prompt ≠ context容量只有250。</text>
+<text x="100" y="1360" dominant-baseline="text-before-edge" font-size="28" fill="#263147">最高值不是中位数/池化值；短请求decode增长后KV也增长；社区4卡数据不是本机复测。</text>
+<text x="100" y="1435" dominant-baseline="text-before-edge" font-size="28" fill="#55637a">75K最新173.4；9.99K→75.68K工程55轮池化172.98。完整来源见同名JSON。</text>
+<text x="100" y="1490" dominant-baseline="text-before-edge" font-size="24" fill="#778398">Strata-5090 / evidence comparison / lossless golden baseline; no runtime or GPU mutation</text>
+</g></svg>
