@@ -61,7 +61,8 @@ Obtain the benchmark owner's absolute frozen config path/hash and the working Py
 git clone https://github.com/Florious95/Strata-5090.git ~/Projects/Strata-5090-delivery
 cd ~/Projects/Strata-5090-delivery
 git fetch origin ops/c2-golden-production-20261012
-git checkout --detach 8ccc17d89f6551254be16e79837473771f58383b
+# REVIEWED_SHA is the exact 40-character delivery SHA handed off by Leader/PR review.
+git checkout --detach "$REVIEWED_SHA"
 
 bash ops/deploy-c2-golden.sh \
   /absolute/path/to/accepted-golden.json \
