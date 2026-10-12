@@ -609,7 +609,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
               mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_) &&
               mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) &&
-              mapped((size_t) strata::kernels::kVerifyMaxT * strata::kernels::kNonfiniteBlocks * 4, (void**) &h_nf_,
+              mapped((size_t) T * strata::kernels::kNonfiniteBlocks * sizeof(uint32_t), (void**) &h_nf_,
                      (void**) &m_nf_) &&
               mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
               mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
@@ -3137,10 +3137,7 @@ void Verifier::note_nonfinite(int T, const int64_t* pos_b) {
     nf_pos_ = -1;
     nf_mask_ = 0;
     if (!nan_guard_on() || h_nf_ == nullptr || !last_stage()) return;   // (a stage without the head checks nothing)
-    const volatile uint32_t* f = h_nf_;
-    for (int t = 0; t < T && t < strata::kernels::kVerifyMaxT; ++t)
-        for (int b = 0; b < strata::kernels::kNonfiniteBlocks; ++b)
-            if (f[t * strata::kernels::kNonfiniteBlocks + b] != 0) { nf_mask_ |= 1u << t; break; }
+    nf_mask_ = strata::kernels::nonfinite_row_mask(h_nf_, T, max_t_);
     const std::vector<long long>& inject = nan_inject_list();
     if (!inject.empty()) {
         const long long k = g_nf_windows.fetch_add(1) + 1;
