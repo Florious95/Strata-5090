@@ -1,6 +1,6 @@
 # Independent PR extraction plan
 
-Design IDs are not GitHub PR numbers. Feature branches are prepared locally; no empty feature PR is advertised as delivered. Each dependency-bound task starts only after its predecessor's exact SHA is accepted and recorded. The current starting point is upstream v0.1.43 (`7695859aa13afb248bdb4d36f9b2e95707db079d`).
+Design IDs are not GitHub PR numbers. Repository governance is [GitHub PR #1](https://github.com/Florious95/Strata-5090/pull/1). Eight feature branch names are reserved **locally at the v43 pin**, with no runtime changes and no empty feature PRs advertised as delivered. Each dependency-bound task must be based on its actual accepted predecessor SHA before implementation; the reservations are not executable dependency integrations. The starting point is upstream v0.1.43 (`7695859aa13afb248bdb4d36f9b2e95707db079d`).
 
 ## Provenance and limits
 

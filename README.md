@@ -19,7 +19,7 @@ The IDs below are **design IDs, not GitHub PR numbers**. [Task contracts and dep
 
 | Module | Responsibility / physical mechanism | Dependency | Delivery status |
 |---|---|---|---|
-| [PR-0](docs/FORK-WORKFLOW.md) · Repository governance | Archive upstream README, evidence-bound documentation, upstream sync and PR gates | v0.1.43 | Documentation PR |
+| PR-0 · Repository governance ([GitHub #1](https://github.com/Florious95/Strata-5090/pull/1)) | Archive upstream README, evidence-bound documentation, upstream sync and PR gates | v0.1.43 | Open; [workflow](docs/FORK-WORKFLOW.md) |
 | [PR-6](docs/pr/06-wide-nonfinite-guard.md) · Wide NaN/Inf guard | Allocate/consume guards by verifier capacity, including 9–12 rows; keep checks enabled | v0.1.43 | Prepared; safety prerequisite |
 | [PR-2a](docs/pr/02a-c2-speculative-foundation.md) · C2 compatibility foundation | Slot-private drafts and segmented accepted-prefix state; preserve v43 lifecycle | PR-6 | Prepared; no standalone speed claim |
 | [PR-1](docs/pr/01-direct-slot-admission.md) · Direct Slot Admission | Remove third solo target/draft state and full admission KV copy; lazy RAM spill | PR-2a | Prepared; allocation/copy mechanism proven |
