@@ -1,0 +1,33 @@
+[Unit]
+Description=Strata v0.1.43 golden C2 (IQ3_XXS full-Q4 spec6 rows12)
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/Strata-c2-v0.1.43-port
+ExecStart=/usr/bin/python3 %h/Projects/Strata-5090-delivery/ops/c2_golden.py run --config %h/.config/strata-c2-golden/production.json
+EnvironmentFile=%h/.config/strata-c2-golden/release.env
+Environment=PYTHONUNBUFFERED=1
+Environment=STRATA_BATCH_DENSE_PARALLEL=1
+Environment=STRATA_BATCH_NARROW_PARALLEL=1
+Environment=STRATA_BATCH_SHARED_AFTER_RING=1
+Environment=STRATA_BATCH_HEAD_WIDE=1
+Environment=STRATA_BATCH_QSA_TILE=1
+Environment=STRATA_TOKEN_GAP_RAW=1
+Environment=STRATA_PLE_KEYED_PREFETCH=0
+Environment=STRATA_NAN_GUARD=1
+Environment=STRATA_ROUTE_TAIL_SKIP=0
+UnsetEnvironment=STRATA_VERIFY_PROFILE STRATA_VERIFY_DEVICE_PLAN STRATA_BATCH_DENSE_PROFILE STRATA_BATCH_HOST_PROFILE STRATA_BATCH_RING_PROFILE STRATA_NAN_INJECT STRATA_DBG_NAN STRATA_ROUTE_PRIOR STRATA_ROUTE_RESIDENT STRATA_ROUTE_RESIDENT_MTP STRATA_API_KEY
+Restart=always
+RestartSec=10
+KillMode=control-group
+KillSignal=SIGINT
+TimeoutStopSec=45
+LimitNOFILE=65536
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
