@@ -1,0 +1,129 @@
+{
+  "measurement_class": "upstream-baseline-observation",
+  "performance_qualified": false,
+  "source_sha": "7695859aa13afb248bdb4d36f9b2e95707db079d",
+  "binary_sha256": "57bf4ba09deb2a58356b2738056d31a72efc432ea72a84795cba2e94bd90650f",
+  "server_sha256": "55ee9d1160f0da457cabe6f9dfea9884296b6d70fd3d14abd4ed42e6f79dd72b",
+  "harness_sha256": "7ccc06f2e16734c76e784df447d0632ffc3b022683495cd12e7bca909a057795",
+  "fixture_manifest_sha256": "e4c2295352792fed373dd77e2186472d7b5b51d5f159438cd449b6f1e956e04e",
+  "production_deployed": false,
+  "original_summary_sha256": "7018046fff7d7353e9f99e06613fcf71ee53be15a9c5c1512a6e8f99448745f5",
+  "arms": [
+    {
+      "name": "upstream43-c1-single-r1",
+      "source_sha": "7695859aa13afb248bdb4d36f9b2e95707db079d",
+      "harness_repo_sha": "58a25d405d98c68cc9d2606661a17cef78c3ed14",
+      "config_sha256": "0af8a6a766b4cb2986b1772fab52a51908be609123e419e0b290e4ef5c699a47",
+      "completion_tokens": 2048,
+      "HTTP_wall_s": 11.06416699399415,
+      "HTTP_tok_s": 185.10205071124608,
+      "benchmark_exit": 1,
+      "performance_qualified": false,
+      "failed_observer_gates": [
+        "token_gap_p95_available"
+      ],
+      "whole_cohort_exact_routed_accounting_available": true,
+      "token_gap_p95": null,
+      "token_gap_source": "unavailable in unmodified upstream43; no SSE substitution",
+      "upstream_reported_batch_periods": [],
+      "live_status": {
+        "measured_samples": 21,
+        "max_slots_decoding": 0,
+        "two_decoding_samples": 0,
+        "max_waiting": 0,
+        "max_http_running_includes_waiters": 0,
+        "independent_C2_dual_activity_observed": null,
+        "scope": "upstream live slot state, independent of absent batch-round trace; HTTP running is not GPU active capacity"
+      },
+      "measured_admission_copies": [],
+      "measured_admission_copy_total_ms": 0
+    },
+    {
+      "name": "upstream43-c2-mtp-queued4-r1",
+      "source_sha": "7695859aa13afb248bdb4d36f9b2e95707db079d",
+      "harness_repo_sha": "58a25d405d98c68cc9d2606661a17cef78c3ed14",
+      "config_sha256": "8883b04fdaf83cf55c57e46ce92e4991969a935af8c80e1c7c008d4372d571c7",
+      "completion_tokens": 8192,
+      "HTTP_wall_s": 58.602671644999646,
+      "HTTP_tok_s": 139.7888487000233,
+      "benchmark_exit": 1,
+      "performance_qualified": false,
+      "failed_observer_gates": [
+        "dual_active_verified",
+        "expert_hit_at_least_93pct",
+        "token_gap_p95_available"
+      ],
+      "whole_cohort_exact_routed_accounting_available": false,
+      "token_gap_p95": null,
+      "token_gap_source": "unavailable in unmodified upstream43; no SSE substitution",
+      "upstream_reported_batch_periods": [
+        {
+          "original_native_line": "strata batch: 1476 windows, avg 3.57 rows, 22.25 ms/window = run 20.16 (CUDA0 GPU-reach wait 13.36 + CPU experts 2.96) + commit 0.55 + emit 1.01 + adapt wait 0.53; per stage (ms/window): CUDA0 wait 13.36 + pool 2.96; per layer-window: CPU experts 1.71, VRAM hits 36.76, PCIe 1.26; routed entries per window: VRAM 1764.6 (91.9%), PCIe 64.5 (3.4%), CPU 92.0 (4.8%); adaptive tier: 369 rounds, 28012 experts swapped in; 147.0 rows/s over 35841 ms of wall time (admissions included)",
+          "windows": 1476,
+          "avg_rows": 3.57,
+          "rounded_VRAM_cache_hit_pct": 91.9,
+          "rounded_PCIe_pct": 3.4,
+          "rounded_CPU_pct": 4.8,
+          "scope": "original rounded aggregate while batch period active; not exact whole-cohort accounting"
+        },
+        {
+          "original_native_line": "strata batch: 803 windows, avg 3.63 rows, 22.48 ms/window = run 20.31 (CUDA0 GPU-reach wait 13.52 + CPU experts 3.29) + commit 0.55 + emit 1.00 + adapt wait 0.62; per stage (ms/window): CUDA0 wait 13.52 + pool 3.29; per layer-window: CPU experts 1.97, VRAM hits 35.95, PCIe 1.52; routed entries per window: VRAM 1725.6 (90.5%), PCIe 76.9 (4.0%), CPU 105.0 (5.5%); adaptive tier: 200 rounds, 17559 experts swapped in; 148.1 rows/s over 19669 ms of wall time (admissions included)",
+          "windows": 803,
+          "avg_rows": 3.63,
+          "rounded_VRAM_cache_hit_pct": 90.5,
+          "rounded_PCIe_pct": 4.0,
+          "rounded_CPU_pct": 5.5,
+          "scope": "original rounded aggregate while batch period active; not exact whole-cohort accounting"
+        }
+      ],
+      "live_status": {
+        "measured_samples": 113,
+        "max_slots_decoding": 2,
+        "two_decoding_samples": 97,
+        "max_waiting": 3,
+        "max_http_running_includes_waiters": 4,
+        "independent_C2_dual_activity_observed": true,
+        "scope": "upstream live slot state, independent of absent batch-round trace; HTTP running is not GPU active capacity"
+      },
+      "measured_admission_copies": [
+        {
+          "tokens": 258002,
+          "copied_ms": 528.7
+        },
+        {
+          "tokens": 258000,
+          "copied_ms": 334.7
+        },
+        {
+          "tokens": 258000,
+          "copied_ms": 523.9
+        },
+        {
+          "tokens": 258000,
+          "copied_ms": 334.9
+        },
+        {
+          "tokens": 258572,
+          "copied_ms": 366.7
+        },
+        {
+          "tokens": 258627,
+          "copied_ms": 563.2
+        }
+      ],
+      "measured_admission_copy_total_ms": 2652.1
+    }
+  ],
+  "interpretation_limits": [
+    "Only one fresh run of C1 and one queued4 C2, not a3-group same-binary comparison to historical207+.",
+    "Official C2 still allocates solo+2target slots; startup states2.25GiB each/4.49GiB slots plus2x193MiB draft private. Expert cache shrinks22738MiB/C1 to17728MiB/C2.",
+    "Official standard --batch-mtp one proposal/slot (up to4 rows for2 slots), not custom spec6/12-row, QSA tile, narrow Dense or lazyspill. Official NaN guard default retained.",
+    "Original cfg model_name carries legacy PR1524 label; actual official source/binary/server pins above are authoritative; assets unchanged.",
+    "Default official adaptive and PCIe-auto behavior retained; this is not a same-feature configuration against optimized batch-PCIE0 golden.",
+    "C2 native rounded cache hits91.9% and90.5% are below93%; do not add PCIe-served entries toVRAM cache hit. C2 partial scalar observer hit is not whole-cohort rate.",
+    "Old dual_active false stems from missing batch-round schema; independent live samples prove2decoding slots. No exact routed hardware balance or raw token-gap/p95 is invented.",
+    "C2 lane1 uses2 EOS turns, others1; all2048/lane preserved with frozen continuation protocol, no ignore-EOS/outlier trimming.",
+    "Window mode keeps unchanged observer exit1 and false gates, explicitly measurement-only. It tolerates only known instrumentation/hit gaps; all context/prefix/quality/memory/cache/process/kernel guards stay strict.",
+    "No production qualification/deployment or Tailscale exposure; official old unit intentionally inactive and owned experimental backends cleaned."
+  ]
+}
