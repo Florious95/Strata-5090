@@ -144,6 +144,8 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const Ses
                                       const ModelGeometry& g, std::string& error) {
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
+    if (c.rope_delta > 0 || (int64_t) c.rope_delta < -(int64_t) c.ids.size())
+        return fail(error, "invalid checkpoint rotary offset");
     const size_t layers = owned_qsa(ss);
     if (c.gdn.size() != z.gdn || c.ple.size() != (ss.ple_hist ? z.ple : 0) ||
         c.tails.size() != layers * z.tail || c.dead.size() != layers * z.dead ||
@@ -157,6 +159,7 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     const size_t layers = owned_qsa(ss);
+    c.rope_delta = ss.rotary_position((int64_t) c.ids.size()) - (int32_t) c.ids.size();
     c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
     c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
     if (!copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error) ||
@@ -191,6 +194,7 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     const size_t tokens = c.ids.size();
     ss.ple_prev[0] = tokens >= 2 ? c.ids[tokens - 2] : -1;
     ss.ple_prev[1] = tokens >= 1 ? c.ids[tokens - 1] : -1;
+    ss.rope_delta = c.rope_delta;
     return sync(error);
 }
 

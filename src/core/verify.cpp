@@ -967,6 +967,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         cudaStreamWaitEvent(cs, df_join_[i], 0);
     };
     const int64_t nQall = g.n_qsa_layers();
+    // Merged rows are generated text, each with its slot's explicit rotary position.
+    // Never let a previously admitted image's global table reinterpret another slot.
+    const MropeTableScope batch_rope(nullptr, batch_rec_ && ss.mrope_device != nullptr);
     // a batch window: row t is slot t, whose state lives in its own session
     auto slot_ss = [&](int t) -> SessionState& { return batch_rec_ ? *slots_[(size_t) brow_[t]] : ss; };
     const int hrow0 = batch_rec_ ? row_base_ : 0;   // a slot group's own hand-off rows
@@ -1466,7 +1469,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                     rope_scaling(), cs);
                 } else {
                     for (int t = tb; t < te; ++t) {
-                        const QsaState& sx = slot_ss(t).qsa_states[qi];
+                        const auto& row_session = slot_ss(t);
+                        const MropeTableScope pool_rope(row_session.mrope_device, row_session.mrope_device != nullptr);
+                        const QsaState& sx = row_session.qsa_states[qi];
                         const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
                         native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
                                                   (const float*) wikn->data, EPS, ib, s, sx.max_cells,
@@ -2884,7 +2889,9 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                 for (int t = 0; t < S;) {
                     const int first = t;
                     while (t < S && rows[t] == rows[first]) ++t;
-                    const QsaState& st = slots_[(size_t) rows[first]]->qsa_states[qsa_index];
+                    const auto& row_session = *slots_[(size_t) rows[first]];
+                    const MropeTableScope pool_rope(row_session.mrope_device, row_session.mrope_device != nullptr);
+                    const QsaState& st = row_session.qsa_states[qsa_index];
                     copy_from_mapped(st.idx_tail, tail_snap_b_ + ((size_t) rows[first] * nQ + qsa_index) * TS,
                                      TS, cs_);
                     const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
@@ -3048,11 +3055,12 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     for (int t = 0; t < S; ++t) {
         h_tok_[t] = tokens[t];
         qsa_step_fill(h_step_ + t * kStepCount, pos[t], s);
-        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = (int32_t) pos[t];
+        const int32_t rotary = slots_[(size_t) rows[t]]->rotary_position(pos[t]);
+        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = rotary;
         int32_t* pk = h_pos_ + (size_t) max_t_ * g.n_head;
         int32_t* pi = pk + (size_t) max_t_ * g.n_head_kv;
-        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = (int32_t) pos[t];
-        for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) pos[t];
+        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = rotary;
+        for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = rotary;
     }
     if (ss_->ple.ready() && ple_stage()) {
         uint32_t ple_rows[kBatchMaxRows * PLE_N_HEADS];   // (not `rows`: that is the slots of the window's rows)
