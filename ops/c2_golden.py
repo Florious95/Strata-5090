@@ -13,8 +13,8 @@ import time
 import urllib.error
 import urllib.request
 
-SOURCE = "c15c25f4513ec0d0733cef8c780b1d0538a2753a"
-BINARY = "bfb410bcce1fbb52cde9e77c7490b6e90c9ff3448f47f770b39995aae8edad58"
+SOURCE = "77cd2b2de043721bda8deff2fd691e88d7499a2a"
+BINARY = "640c5a6600e687c23c870a99d16b3c59bd769c86aefd0b331460371fa1c950d8"
 SERVER = "06ca08c2497f4200a46d602b88e8b87df91e79b8fc2af0caf855b4da7358ddb1"
 CANDIDATE = Path("/home/florious/Projects/Strata-c2-v0.1.43-port")
 ENV = {"STRATA_BATCH_DENSE_PARALLEL": "1", "STRATA_BATCH_NARROW_PARALLEL": "1",
@@ -84,6 +84,20 @@ def validate(cfg):
     require("--batch-spec-fixed" not in args and "--no-host-worker" not in args,
             "unqualified fixed layout or host-worker change")
     require("iq3_xxs" in str(cfg.get("model_name", "")).lower(), "release model must remain IQ3_XXS")
+    require(not cfg.get("vision_on_demand") and "--vision-on-demand" not in args,
+            "standalone vision-on-demand is not implemented")
+    require("--mmproj" not in args, "mmproj belongs in the vision section, not text-engine args")
+    vision = cfg.get("vision")
+    if vision:
+        require(isinstance(vision, dict), "vision must be an object")
+        require(vision.get("gpu", False) is False, "this release qualifies CPU vision only")
+        require(all(isinstance(vision.get(k), str) and vision[k] for k in ("exe", "mmproj", "model")),
+                "vision executable, projector and vocabulary model are required")
+        for field in ("threads", "max_tokens", "min_tokens"):
+            if field in vision:
+                require(type(vision[field]) is int and vision[field] > 0, "positive integer vision setting required")
+        if "min_tokens" in vision and "max_tokens" in vision:
+            require(vision["min_tokens"] <= vision["max_tokens"], "vision minimum exceeds token cap")
     env = cfg.get("env") or {}
     require(isinstance(env, dict), "env must be an object")
     require(not any(k in env for k in ABSENT), "diagnostic/approximation/key environment is forbidden")
@@ -141,6 +155,18 @@ def artifact_check(cfg):
                 if not p.is_absolute():
                     p = Path(cfg["cwd"]) / p
                 require(p.exists(), "qualified asset missing for " + flag)
+    for field, value in (cfg.get("vision") or {}).items():
+        if field not in ("exe", "mmproj", "model"):
+            continue
+        p = Path(value)
+        if not p.is_absolute():
+            p = Path(cfg["cwd"]) / p
+        require(p.is_file(), "CPU vision asset missing: " + field)
+        if field == "exe":
+            require(os.access(p, os.X_OK), "vision executable is not runnable")
+        else:
+            with p.open("rb") as f:
+                require(f.read(4) == b"GGUF", "vision asset is not GGUF: " + field)
     require(os.path.ismount("/mnt/strata-models"), "model filesystem is not mounted")
     key_from(meta["key_config"])
 

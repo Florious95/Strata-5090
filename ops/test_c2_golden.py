@@ -96,6 +96,30 @@ class ReleaseConfigTests(unittest.TestCase):
         self.assertNotIn("STRATA_GDN_CHUNKED", env)
         self.assertEqual(env["STRATA_API_KEY"], "synthetic-test-key-not-a-real-secret")
 
+    def test_cpu_vision_preserved_without_input_mutation(self):
+        self.cfg["vision"] = {"exe": "/qualified/strata-vision", "mmproj": "/qualified/mmproj.gguf",
+                              "model": "/qualified/vocabulary.gguf", "gpu": False, "threads": 4, "max_tokens": 1024}
+        before = copy.deepcopy(self.cfg)
+        cfg = self.prepared()
+        self.assertEqual(cfg["vision"], before["vision"])
+        self.assertEqual(self.cfg, before)
+        self.assertEqual(cfg["_production"]["source_sha"], release.SOURCE)
+
+    def test_reject_unqualified_gpu_vision_and_missing_assets(self):
+        vision = {"exe": "/qualified/vision", "mmproj": "/qualified/mmproj", "model": "/qualified/model"}
+        for change in ({"gpu": True}, {"gpu": "false"}, {"model": ""}, {"threads": True}, {"max_tokens": 0},
+                       {"max_tokens": 10, "min_tokens": 11}):
+            cfg = {**self.cfg, "vision": {**vision, **change}}
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                release.validate(cfg)
+
+    def test_reject_invented_on_demand_and_misplaced_mmproj(self):
+        for cfg in ({**self.cfg, "vision_on_demand": True},
+                    {**self.cfg, "args": self.cfg["args"] + ["--vision-on-demand"]},
+                    {**self.cfg, "args": self.cfg["args"] + ["--mmproj", "not-a-text-engine-option"]}):
+            with self.assertRaises(ValueError):
+                release.validate(cfg)
+
     def test_unit_process_tree_and_restart(self):
         text = (Path(__file__).parent / "strata-c2-golden.service").read_text()
         for setting in ("Restart=always", "KillMode=control-group", "UMask=0077", "--config",

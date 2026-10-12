@@ -5,8 +5,9 @@ This is an operator runbook, not a claim that installation has already happened.
 ## Release and network pins
 
 - Host: `5090-omarchy`, account `florious`.
-- Candidate: `/home/florious/Projects/Strata-c2-v0.1.43-port`, source `c15c25f4513ec0d0733cef8c780b1d0538a2753a`.
-- Engine: `build/strata`, SHA-256 `bfb410bcce1fbb52cde9e77c7490b6e90c9ff3448f47f770b39995aae8edad58`.
+- Published runtime: `/home/florious/Projects/Strata-c2-v0.1.43-port`, source `77cd2b2de043721bda8deff2fd691e88d7499a2a` ([runtime PR#3](https://github.com/Florious95/Strata-5090/pull/3)).
+- Engine: `build/strata`, SHA-256 `640c5a6600e687c23c870a99d16b3c59bd769c86aefd0b331460371fa1c950d8`.
+- Independently built staging artifact: `/home/florious/Projects/Strata-c2-vision-direct-research-dev-20261012/build/strata`. Publish only after the owner stops the production control group; never overwrite a live executable.
 - Matching `serve/server.py`: SHA-256 `06ca08c2497f4200a46d602b88e8b87df91e79b8fc2af0caf855b4da7358ddb1`.
 - Assets: previously qualified **IQ3_XXS**, full262144 Q4_0 KV, C2 spec6/rows12, reserve1400. Do not substitute the old production IQ3_S/INT8/32K-streaming config or a new GGUF.
 - Target confirmed by benchmark owner: GPU2MiB/no compute process, port8080 free, Tailscale IPv4 **100.99.91.50**.
@@ -75,6 +76,21 @@ The default official venv may be `/home/florious/Projects/Strata/.venv/bin/pytho
 The script prepares and validates before stopping anything, stops/disables only the owned old `strata-iq3.service`, checks the GPU/port again, installs/enables the new unit and enables user lingering for reboot persistence. Unknown GPU processes are not killed. Restart is always/10s with control-group cleanup and45s stop timeout. Mount/source/config/auth failures refuse launch; the operator must inspect repeated preflight failures rather than bypass them.
 
 It does **not** mount a missing model filesystem, change GPU clocks, alter firewall/TS ACLs, reset GPU, re-download weights or merge either GitHub PR. If one prerequisite is unavailable, fix that owned prerequisite explicitly. Existing config files are not overwritten on rerun; back up the new config and release.env deliberately before regenerating.
+
+## CPU vision release and controlled update
+
+The original c15 text release cannot accept golden slot-only images. Runtime PR#3 now implements direct BGENI, per-slot image banks and saved rotary deltas while retaining existing Dense/Narrow/QSA dispatch. Its **new Linux Release** passed17 scoped CPU tests and hardware contracts in0.927s:1512 bitwise RoPE fixtures/4536 captured replays,3985 snapshot checks; GPU returned to0 compute PID/2MiB. Receipt log SHA `ad0a5c2c0d4ca7b36d5a816a2e362f6095f6f73e3068787238ddc6fbf2ca8343` in the staging tree's `build/vision-gpu.log`. This is not real image identification or new258K performance evidence.
+
+For the benchmark owner's approved CPU encoder, add the complete `vision` object to a **target-only derived input config** before regeneration: `exe`, `mmproj`, `model`, `gpu: false`, and approved positive integer `threads`/image token caps if set. The text model remains IQ3_XXS; the encoder's `model` is vocabulary metadata, not a second GPU model. The launcher checks assets/executable/GGUF headers and refuses GPU vision, misplaced text-engine `--mmproj`, or invented `vision_on_demand`. No secret is moved into this input or output.
+
+Controlled cutover order (bench owner only):
+1. Stop `strata-c2-golden.service`, confirm its cgroup/GPU releases. Preserve the c15 source/binary/config and old ops SHA62d18827 for rollback.
+2. In the published runtime tree, require tracked source clean, Git-fetch runtime PR#3 and checkout exact77cd2b2. Do not reset unknown changes.
+3. Install the independently built binary under a temporary filename in `build/`, verify its full640c5a66 SHA, then atomically rename to `build/strata` while stopped. Source/binary/server now match the new pins. The build uses its own Git-pinned GGML source/fresh ABI; no old object library was reused.
+4. Git-checkout the exact reviewed **new ops release SHA** in the delivery clone. Back up existing production.json/release.env privately, then regenerate from the approved complete CPU-vision input and its SHA using the existing deploy script (or its prepare/check commands). Do not merely edit production.json while leaving `_production` or release.env stale.
+5. Enable/start the existing independent C2 unit; run local and TS authentication/generation checks, then actual known-image identification in both slots and mixed text/image. Record native `slot_vision=1` and `slot=N images=M rope_delta=D direct=1 solo_kv=0` receipts.
+
+CPU vision does not reserve a GPU encoder; keep reserve1400 initially but measure first/max/multi-image minfree and CPU contention. Two stable image banks cost about6MiB total. There is no standalone on-demand unload. Picture hot-slot reuse remains conservative; RAM offsets round-trip, but nonzero-offset SAVE refuses the old disk schema instead of dropping metadata. Full long-text regression remains separately bench-owned. Rollback must restore **all** source/binary/config/ops pins together, not just one file.
 
 ## Acceptance (must return actual receipts)
 
