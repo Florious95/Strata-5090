@@ -112,6 +112,32 @@ class DirectSlotProtocol(unittest.TestCase):
         self.assertFalse(self.engine._may_go_solo(64, 0, None))
         self.assertEqual([x.split()[0:2] for x in self.log.read_text().splitlines()], [["BGEN", "1"]])
 
+    def test_images_use_direct_bgeni_in_each_slot_and_mixed_queue(self):
+        self.engine.unload()
+        fake = FAKE_SLOT_ONLY.replace('line.startswith("GEN "):', 'line.startswith(("GEN ", "GENI ")):')
+        fake = fake.replace('("GEN ", "BGEN ")', '("GEN ", "BGEN ", "BGENI ")')
+        fake = fake.replace('f[0] == "BGEN"', 'f[0] in ("BGEN", "BGENI")')
+        self.script.write_text(fake, encoding="utf-8")
+        self.engine = self.start(["--batch", "2", "--slotcache", "--batch-slot-only", "--log", str(self.log)])
+
+        def image():
+            return [t for t in self.engine.generate(list(b"picture"), 16, {}, threading.Event(),
+                                                    embeddings="synthetic.sve") if t is not None]
+        self.assertTrue(image())
+        self.engine.slot_busy[0] = True
+        try:
+            self.assertTrue(image())
+        finally:
+            self.engine.slot_busy[0] = False
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(image), pool.submit(self.run_request, "mixed text", 16)]
+            self.assertTrue(all(f.result(timeout=10) for f in futures))
+        commands = [row.split() for row in self.log.read_text().splitlines()]
+        self.assertEqual([row[:2] for row in commands[:2]], [["BGENI", "0"], ["BGENI", "1"]])
+        self.assertEqual(sorted(row[0] for row in commands[2:]), ["BGEN", "BGENI"])
+        self.assertFalse(any(self.engine.slot_busy))
+        self.assertFalse(self.engine.slot_claims)
+
     def test_four_queued_requests_have_private_clocks(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             results = list(pool.map(lambda i: self.run_request(f"hello {i}", 64), range(4)))

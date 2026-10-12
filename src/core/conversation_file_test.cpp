@@ -270,6 +270,15 @@ int main() {
         check(!session_file_read((dir / "absent.bin").string(), id, keep, b, error), "missing read fails");
         check(same(keep, original), "failed read does not modify the destination");
     }
+    // Format v1 must never discard a new C2 image's rotary offset silently.
+    for (bool live : {false, true}) {
+        auto rotary = sample();
+        (live ? rotary.live : rotary.checkpoints[0]).rope_delta = -3;
+        const fs::path p = dir / "rotary.bin";
+        check(!session_file_write(p.string(), rotary, id, written, error) &&
+              error.find("rotary offsets") != std::string::npos, "multimodal offset refused by old disk schema");
+        check(!fs::exists(p) && no_temp(dir), "rotary refusal leaves no file");
+    }
     // layer-split images are not written; no file appears
     {
         SavedConversation split = sample();

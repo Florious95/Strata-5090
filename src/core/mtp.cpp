@@ -18,6 +18,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/mrope.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -1051,6 +1052,7 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
 bool MtpDrafter::capture_prefill(int T, std::string& err) {
     if (prefill_exec_[T]) return true;
     using namespace strata::kernels;
+    const MropeTableScope slot_rope(ss_->mrope_device, ss_->mrope_device != nullptr);
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     copy_i32_from_mapped(tok_, m_tok_, T, cs_);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * 4, cs_);
@@ -1061,6 +1063,7 @@ bool MtpDrafter::capture_prefill(int T, std::string& err) {
 
 bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
     if (prefill_dev_exec_[T]) return true;
+    const strata::kernels::MropeTableScope slot_rope(ss_->mrope_device, ss_->mrope_device != nullptr);
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     const bool ok = record_forward(T, -1, cs_, err);   // K/V only, rows [0, T); tok_/step_/pos_ filled before launch
     return finish_capture(cs_, ok, prefill_dev_exec_[T], "prefill (device inputs)", err);
@@ -1070,6 +1073,7 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     cudaGraphExec_t& exec = coupled ? round_exec_c_[T] : round_exec_[T];
     if (exec) return true;
     using namespace strata::kernels;
+    const MropeTableScope text_rope(nullptr, ss_->mrope_device != nullptr);
     const int64_t HCN = g_->hc * g_->n_embd;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     bool ok = true;
@@ -1116,6 +1120,7 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     cudaGraphExec_t& exec = coupled ? step_exec_c_[j] : step_exec_[j];
     if (exec) return true;
     using namespace strata::kernels;
+    const MropeTableScope text_rope(nullptr, ss_->mrope_device != nullptr);
     const int64_t HCN = g_->hc * g_->n_embd;
     const int row = max_t_ + j - 1;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
@@ -1294,7 +1299,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         h_step_[row * 4 + 1] = (int32_t) (cell + 1);
         h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
         h_step_[row * 4 + 3] = (int32_t) (cell + 1);
-        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
+        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = ss_->rotary_position(cell);
     };
     for (int t = 0; t < T; ++t) {
         h_tok_[t] = tokens[t];
@@ -1453,7 +1458,7 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
         h_step_[row * 4 + 1] = (int32_t) (cell + 1);
         h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
         h_step_[row * 4 + 3] = (int32_t) (cell + 1);
-        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
+        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = ss_->rotary_position(cell);
     };
     for (int t = 0; t < T; ++t) {
         h_tok_[t] = tokens[t];
@@ -1546,7 +1551,7 @@ bool MtpDrafter::draft_batch(const std::vector<DraftRound>& batch, std::string& 
         d.h_step_[row * 4 + 1] = (int32_t) (cell + 1);
         d.h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
         d.h_step_[row * 4 + 3] = (int32_t) (cell + 1);
-        for (int64_t h = 0; h < d.g_->n_head; ++h) d.h_pos_[row * d.g_->n_head + h] = (int32_t) cell;
+        for (int64_t h = 0; h < d.g_->n_head; ++h) d.h_pos_[row * d.g_->n_head + h] = d.ss_->rotary_position(cell);
     };
     auto prefetch = [&](size_t i, int32_t token) {
         auto& d = *batch[i].drafter;

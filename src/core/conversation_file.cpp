@@ -795,6 +795,13 @@ bool get_payload(In& in, SavedConversation& s) {
     return true;
 }
 
+bool has_rotary_offset(const SavedConversation& s) {
+    if (s.live.rope_delta != 0) return true;
+    for (const auto& c : s.checkpoints) if (c.rope_delta != 0) return true;
+    for (const auto& part : s.stage_images) if (has_rotary_offset(part)) return true;
+    return false;
+}
+
 bool has_stage_parts(const SavedConversation& s) {
     if (!s.live.stage_parts.empty()) return true;
     for (const auto& c : s.checkpoints) if (!c.stage_parts.empty()) return true;
@@ -1030,6 +1037,9 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     st = {};
     st.error = SessionError::invalid;   // refusals before any disk access
     if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
+    // The existing disk schema has no rotary offset. Never silently publish a
+    // C2 multimodal image with its offset discarded; RAM parking remains supported.
+    if (has_rotary_offset(image)) { error = "session file: multimodal rotary offsets are not in this disk schema"; return false; }
     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
     Out sizing;
     put_payload(sizing, image, sources);

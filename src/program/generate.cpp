@@ -3100,9 +3100,13 @@ int main(int argc, char** argv) {
     std::vector<int32_t> mrope_host;
     if (o.vision) {
         const int64_t cells = o.max_context + 64;
-        mrope_host.resize((size_t) cells * 3);
-        for (int64_t c = 0; c < cells; ++c)
-            mrope_host[(size_t) c * 3] = mrope_host[(size_t) c * 3 + 1] = mrope_host[(size_t) c * 3 + 2] = (int32_t) c;
+        const int banks = o.batch_slot_only ? 2 : 1;
+        mrope_host.resize((size_t) banks * cells * 3);
+        for (int b = 0; b < banks; ++b)
+            for (int64_t c = 0; c < cells; ++c) {
+                const size_t off = ((size_t) b * cells + c) * 3;
+                mrope_host[off] = mrope_host[off + 1] = mrope_host[off + 2] = (int32_t) c;
+            }
         if (cudaMalloc(&d_mrope, mrope_host.size() * sizeof(int32_t)) != cudaSuccess ||
             cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
                 cudaSuccess) {
@@ -4352,7 +4356,7 @@ int main(int argc, char** argv) {
         return strata::program::batch_groups::resolve(bin);
     };
     bool batch_fast = o.batch_spec > 1 && o.batch >= 2 && o.batch <= 4 && !o.mtp.empty() &&
-                     !multi_gpu && !split_same && o.serve && o.spec >= 2 && stages.empty() && !o.vision && o.kv_resident == 0 &&
+                     !multi_gpu && !split_same && o.serve && o.spec >= 2 && stages.empty() && (!o.vision || o.batch_slot_only) && o.kv_resident == 0 &&
                      !remote_caches && o.peer_device < 1 && (o.kv == "int8" || o.kv == "q4_0");
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
     batch_fast = false;
@@ -4389,7 +4393,7 @@ int main(int argc, char** argv) {
     }
     if (o.batch_slot_only && (!batch_fast || o.batch != 2 || o.kv != "q4_0" || o.batch_spec_fixed ||
                              o.pipeline_windows || o.kv_grow || o.adapt_async)) {
-        std::fprintf(stderr, "strata: --batch-slot-only requires C2 Q4 wide MTP, full-resident text on one GPU, "
+        std::fprintf(stderr, "strata: --batch-slot-only requires C2 Q4 wide MTP, full-resident KV on one GPU, "
                              "without fixed padding, pipelining, KV grow or async adaptation\n");
         return 2;
     }
@@ -4518,6 +4522,14 @@ int main(int argc, char** argv) {
         (o.batch_prefill_rows != 0 && o.batch_prefill_rows != 8 && o.batch_prefill_rows != 12 && o.batch_prefill_rows != 16) ||
         !std::isfinite(o.batch_pcie_frac) || (o.batch_pcie_frac < 0 && o.batch_pcie_frac != -1) || o.batch_pcie_frac > 1) {
         std::fprintf(stderr, "strata: invalid experimental batch prefill/PCIe options\n"); return 2;
+    }
+    if (o.batch_slot_only && o.vision) {
+        const size_t stride = (size_t) (o.max_context + 64) * 3;
+        for (size_t b = 0; b < bslot_ss[0].size(); ++b) {
+            auto& sx = *bslot_ss[0][b];
+            sx.mrope_device = d_mrope + b * stride;
+            sx.mrope_host = mrope_host.data() + b * stride;
+        }
     }
     const int max_batch_spec = o.batch_slot_only ? 6 : 4;
     if (o.batch_spec < 1 || o.batch_spec > max_batch_spec ||
@@ -9140,6 +9152,7 @@ int main(int argc, char** argv) {
                                        " batch_suffix=" + std::to_string(batch_fast && o.batch_suffix && o.suffix_draft > 0 ? 1 : 0) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                        " slot_only=" + std::to_string(o.batch_slot_only ? 1 : 0) +
+                                        " slot_vision=" + std::to_string(o.batch_slot_only && o.vision ? 1 : 0) +
                                        " slot_spill_lazy=" + std::to_string(o.batch_slot_only ? 1 : 0) +
                                        " adaptive_rows=" + std::to_string(adaptive_rows ? 1 : 0) +
                                        " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
@@ -9358,6 +9371,7 @@ int main(int argc, char** argv) {
             // fed).  Kept when the request ends (`cached`), so the next turn of that conversation continues from it
             // instead of reading its history again (see `slot_source` in the request path).
             std::vector<int32_t> ids;
+            std::vector<ImgKey> imgs;
             bool cached = false;           ///< idle, and its sessions still hold `ids`
             bool cvec = true;              ///< the control vector setting `ids` were read with
             bool img = false;              ///< the conversation has pictures (never reused from the slot)
@@ -9385,6 +9399,7 @@ int main(int argc, char** argv) {
             serve_session = bslot_ss[0][(size_t) b];
             serve_drafter = slot_mtp[(size_t) b];
             std::swap(live, sl.ids);
+            std::swap(live_imgs, sl.imgs);
             std::swap(checks, sl.checks);
             std::swap(live_ok, sl.cached);
             std::swap(cvec_cached, sl.cvec);
@@ -9401,6 +9416,7 @@ int main(int argc, char** argv) {
             std::swap(checks, sl.checks);
             std::swap(live_ok, sl.cached);
             std::swap(cvec_cached, sl.cvec);
+            std::swap(live_imgs, sl.imgs);
             serve_session = old_session;
             serve_drafter = old_drafter;
             return ok;
@@ -10310,18 +10326,18 @@ int main(int argc, char** argv) {
             serve_session = o.batch_slot_only && admit_slot >= 0 ? bslot_ss[0][(size_t) admit_slot] : &ss;
             serve_drafter = o.batch_slot_only && admit_slot >= 0 ? slot_mtp[(size_t) admit_slot] : &mtp;
             if (line == "QUIT") break;
-            if (o.batch_slot_only && (admit_slot < 0 || line.rfind("GENI ", 0) == 0 ||
-                                     !sp.bind_session(*serve_session, err))) {
-                std::printf("ERR slot-only requires direct BGEN admission: %s\n", err.c_str());
+            if (o.batch_slot_only && (admit_slot < 0 || !sp.bind_session(*serve_session, err))) {
+                std::printf("ERR slot-only requires direct BGEN/BGENI admission: %s\n", err.c_str());
                 std::fflush(stdout);
                 continue;
             }
             auto& ss = *serve_session; // canonical target; the verifier's anchor/pointer table never moves
             auto& mtp = *serve_drafter;
+            const strata::kernels::MropeTableScope admission_rope(ss.mrope_device, ss.mrope_device != nullptr);
             if (o.batch_slot_only) {
                 const auto& sl = bs[(size_t) admit_slot];
                 live = sl.ids;
-                live_imgs.clear();
+                live_imgs = sl.imgs;
                 live_ok = sl.cached;
                 checks = sl.checks;
                 cvec_cached = sl.cvec;
@@ -10664,17 +10680,25 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            if (n > o.max_context - 8 || max_new > o.max_context - n - 8) {
+                std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
+                            (long long) max_new, (long long) o.max_context);
+                continue;
+            }
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
-            if (geni || !mrope_identity) {
-                // positions for every cell this request can reach; the identity again for a text request
+            const int64_t mrope_cells = o.max_context + 64;
+            const size_t mrope_offset = o.batch_slot_only && o.vision ? (size_t) admit_slot * mrope_cells * 3 : 0;
+            if (geni || !mrope_identity || (o.batch_slot_only && o.vision)) {
+                // Update only this slot's stable bank. Other live slots keep their captured pointers and values.
                 std::string ve;
                 row_ptr.assign((size_t) n, nullptr);
-                const int64_t cells = (int64_t) mrope_host.size() / 3;
+                const int64_t cells = mrope_cells;
                 auto put = [&](int64_t c, int64_t t, int64_t h, int64_t w) {
-                    mrope_host[(size_t) c * 3] = (int32_t) t;
-                    mrope_host[(size_t) c * 3 + 1] = (int32_t) h;
-                    mrope_host[(size_t) c * 3 + 2] = (int32_t) w;
+                    const size_t off = mrope_offset + (size_t) c * 3;
+                    mrope_host[off] = (int32_t) t;
+                    mrope_host[off + 1] = (int32_t) h;
+                    mrope_host[off + 2] = (int32_t) w;
                 };
                 if (!geni) {
                     for (int64_t c = 0; c < cells; ++c) put(c, c, c, c);
@@ -10733,8 +10757,8 @@ int main(int argc, char** argv) {
                 tr("device idle");
                 // CUDA0's table and, with a layer split, every later stage's (each device reads its own)
                 auto upload_mrope = [&]() -> bool {
-                    bool ok = cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
-                                         cudaMemcpyHostToDevice) == cudaSuccess;
+                    bool ok = cudaMemcpy(d_mrope + mrope_offset, mrope_host.data() + mrope_offset,
+                                         (size_t) mrope_cells * 3 * sizeof(int32_t), cudaMemcpyHostToDevice) == cudaSuccess;
                     for (auto& st : stages) {
                         const strata::core::OnDevice on(st->dev);
                         cudaDeviceSynchronize();
@@ -10756,11 +10780,7 @@ int main(int argc, char** argv) {
                 mrope_identity = !geni;
             }
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
-            if (n + max_new + 8 > o.max_context) {
-                std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
-                            (long long) max_new, (long long) o.max_context);
-                continue;
-            }
+            const int32_t request_rope_delta = ss.mrope_host ? ss.mrope_host[(size_t) n * 3] - (int32_t) n : 0;
             bool bad = false;
             for (int64_t t : ids) bad = bad || t < 0 || t >= n_vocab;
             if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); continue; }
@@ -11090,6 +11110,10 @@ int main(int argc, char** argv) {
             tr("request", n, geni ? 1 : 0);
             if (use_mtp) mtp.set_prompt_len(n);
             const int64_t read_from = reread_to > 0 ? 0 : resume;
+            if (ss.mrope_host) {
+                ss.rope_delta = request_rope_delta;
+                ss.rope_tail_start = n;
+            }
             conversations.limit_reuse(read_from);
             pp_total = n;
             pp_from = read_from;
@@ -12853,7 +12877,11 @@ int main(int argc, char** argv) {
                     sl.cacheable = req_ckpt;
                     sl.sampling = req_sp;
                     sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
-                    if (batch_fast && !sl.img) {
+                    sl.imgs = live_imgs;
+                    if (o.batch_slot_only && o.vision)
+                        std::fprintf(stderr, "strata batch vision: slot=%d images=%zu rope_delta=%d direct=1 solo_kv=0\n",
+                                     admit_slot, sl.imgs.size(), ss.rope_delta);
+                    if (batch_fast) {
                         auto& draft = *slot_mtp[(size_t) admit_slot];
                         if (adaptive_rows) draft.set_max_drafts(sl.row_limit - 1);
                         // The solo admission emitted one token without drafting the
@@ -12891,7 +12919,7 @@ int main(int argc, char** argv) {
                         if (c.ids.size() < live.size() && (best == nullptr || c.ids.size() > best->ids.size()) &&
                             std::equal(c.ids.begin(), c.ids.end(), live.begin()))
                             best = &c;
-                    if (o.batch_slot_only && !sl.img) sl.checks = checks;
+                    if (o.batch_slot_only) sl.checks = checks;
                     else if (best != nullptr && !sl.img) sl.checks.push_back(*best);
                     std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (%s in %.1f ms)\n", admit_slot,
                                  (long long) live.size(), o.batch_slot_only ? "direct admission" : "copied",
