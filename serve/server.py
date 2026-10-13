@@ -529,32 +529,33 @@ class ConvCacheLog:
             size = os.path.getsize(path)
             if size < self.pos:                         # the log was emptied or replaced
                 self.pos = 0
-            if size - self.pos > self.READ_MAX:
-                self.pos = size - self.READ_MAX
             with open(path, "rb") as f:
-                f.seek(self.pos)
-                data = f.read(size - self.pos)
+                # Bound memory per chunk, not history: verbose traces must not hide cache events.
+                while self.pos < size:
+                    f.seek(self.pos)
+                    data = f.read(min(size - self.pos, self.READ_MAX))
+                    end = data.rfind(b"\n") + 1
+                    if not end:
+                        break
+                    self.pos += end
+                    for line in data[:end].decode("utf-8", "replace").splitlines():
+                        if "conversation cache:" not in line:
+                            continue
+                        m = self.EVENT.search(line)
+                        if m:
+                            st = self.state
+                            st["parked"], st["bytes"] = int(m.group(3)), int(m.group(4))
+                            if m.group(5) is not None:
+                                st["evictions"] = int(m.group(5))
+                            if m.group(1) != "skipped":
+                                st["parks" if m.group(1) == "parked" else "restores"] += 1
+                                st["last_event"], st["last_tokens"], st["last_at"] = m.group(1), int(m.group(2)), time.time()
+                            continue
+                        m = self.DROPPED.search(line)
+                        if m:
+                            self.state["parked"] = int(m.group(1))
         except OSError:
-            return dict(self.state)
-        end = data.rfind(b"\n") + 1                     # whole lines only: the rest is read next time
-        self.pos += end
-        now = time.time()
-        for line in data[:end].decode("utf-8", "replace").splitlines():
-            if "conversation cache:" not in line:
-                continue
-            m = self.EVENT.search(line)
-            if m:
-                st = self.state
-                st["parked"], st["bytes"] = int(m.group(3)), int(m.group(4))
-                if m.group(5) is not None:
-                    st["evictions"] = int(m.group(5))
-                if m.group(1) != "skipped":
-                    st["parks" if m.group(1) == "parked" else "restores"] += 1
-                    st["last_event"], st["last_tokens"], st["last_at"] = m.group(1), int(m.group(2)), now
-                continue
-            m = self.DROPPED.search(line)
-            if m:
-                self.state["parked"] = int(m.group(1))
+            pass
         return dict(self.state)
 
 
@@ -2075,6 +2076,12 @@ class ImageReferenceMissing(Exception):
         super().__init__("image reference is not cached; resend the original image")
 
 
+class _ImageLease(list):
+    def __init__(self):
+        super().__init__()
+        self.refs = []
+
+
 class Vision:
     """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
@@ -2144,7 +2151,9 @@ class Vision:
         if not self.key_to_raw[key]:
             del self.key_to_raw[key]
 
-    def _remember_raw(self, raw, key):
+    def _remember_raw(self, raw, key, lease=None):
+        if isinstance(lease, _ImageLease):
+            lease.refs.append("strata-sha256://" + raw)
         if raw in self.raw_to_key:
             self._forget_raw(raw)
         self.raw_to_key[raw] = key
@@ -2173,7 +2182,7 @@ class Vision:
         key = self.raw_to_key.get(raw)
         result = self._hit(key, lease) if key is not None else None
         if result is not None:
-            self._remember_raw(raw, key)
+            self._remember_raw(raw, key, lease)
         return result
 
     def _trim_cache(self, keep=()):
@@ -2186,7 +2195,7 @@ class Vision:
 
     @contextlib.contextmanager
     def lease(self):
-        held = []
+        held = _ImageLease()
         try:
             yield held
         finally:
@@ -2380,7 +2389,7 @@ class Vision:
         with self.lock:
             result = self._hit(key, lease)
             if result is not None:
-                self._remember_raw(raw, key)
+                self._remember_raw(raw, key, lease)
                 return result
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             img.write_bytes(data)
@@ -2398,7 +2407,7 @@ class Vision:
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
                                                                      "the vision encoder stopped"))
             self.cache[key] = (out, int(line.split()[1]))
-            self._remember_raw(raw, key)
+            self._remember_raw(raw, key, lease)
             if lease is not None:
                 self.leased[key] += 1
                 lease.append(key)
@@ -3660,7 +3669,10 @@ class Service:
         # Lease cache files across tool precheck, tokenization and combined-file creation, including failures.
         scope = self.vision.lease() if hasattr(self.vision, "lease") else contextlib.nullcontext(None)
         with scope as lease:
-            return self._prepare(messages, tools, kwargs, max_new, force, req, lease)
+            result = self._prepare(messages, tools, kwargs, max_new, force, req, lease)
+            if req is not None:
+                req["_strata_image_refs"] = list(dict.fromkeys(getattr(lease, "refs", ())))
+            return result
 
     def _prepare(self, messages, tools, kwargs, max_new, force, req, lease):
         ready, missing = {}, []
@@ -5028,6 +5040,8 @@ def make_handler(svc: Service):
         def _cors(self):
             """#321: CORS headers for an API path (/v1/*) and an origin the config lists in cors_origins - nothing
             otherwise, so a browser keeps every other page away from the API, /settings, /unload and the MCP tools."""
+            if getattr(self, "_image_refs", None):
+                self.send_header("X-Strata-Image-Refs", json.dumps(self._image_refs, separators=(",", ":")))
             if not svc.cors_origins or not self.path.split("?")[0].startswith("/v1/"):
                 return
             origin = (self.headers.get("Origin") or "").rstrip("/")
@@ -5039,6 +5053,7 @@ def make_handler(svc: Service):
             else:
                 return
             self.send_header("Access-Control-Allow-Origin", allow)
+            self.send_header("Access-Control-Expose-Headers", "X-Strata-Image-Refs")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             # the headers the preflight asks for (SDKs add their own; "*" does not cover Authorization)
             asked = self.headers.get("Access-Control-Request-Headers")
@@ -5243,6 +5258,7 @@ def make_handler(svc: Service):
                 self._json(404, {"error": {"message": "not found"}})
 
         def do_POST(self):
+            self._image_refs = []
             try:
                 self._post()
             except BadBody as e:                              # #893: a malformed or oversized chunked body
@@ -5352,7 +5368,7 @@ def make_handler(svc: Service):
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
                            else {"error": {"type": "server_error", "message": str(e)}})
             except ImageReferenceMissing as e:
-                self._json(409, {"error": {"type": "image_reference_error", "code": "image_cache_miss",
+                self._json(400, {"error": {"type": "image_reference_error", "code": "image_cache_miss",
                                           "message": str(e), "missing_sha256": e.hashes}})
             except ValueError as e:
                 print(f"[strata] 400 invalid request: {e}", flush=True)
@@ -5631,6 +5647,7 @@ def make_handler(svc: Service):
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req)
+            self._image_refs = req.pop("_strata_image_refs", [])
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431
@@ -5822,6 +5839,7 @@ def make_handler(svc: Service):
             except ValueError as e:                          # too long for the context, an image without vision
                 raise ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None) \
                     from None
+            self._image_refs = req.pop("_strata_image_refs", [])
             if svc.codex_compaction_cache:
                 responses_api.prompt_made(req, shown)
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
@@ -5853,6 +5871,7 @@ def make_handler(svc: Service):
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req)
+            self._image_refs = req.pop("_strata_image_refs", [])
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431

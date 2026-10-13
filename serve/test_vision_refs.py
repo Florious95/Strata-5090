@@ -65,6 +65,18 @@ class Cache(unittest.TestCase):
         t = tempfile.TemporaryDirectory()
         self.addCleanup(t.cleanup)
         self.v = make_vision(t.name)
+    def test_request_refs_are_isolated_and_do_not_decode_again(self):
+        a, b = png(), png(1)
+        with self.v.lease() as first:
+            self.v.encode(source(a), lease=first)
+            with self.v.lease() as second:
+                self.v.encode(source(b), lease=second)
+                self.assertEqual(second.refs, [reference(b)])
+            with mock.patch.object(self.v, 'load', side_effect=AssertionError('reference must not load')):
+                self.v.encode(reference(a), lease=first)
+            self.assertEqual(first.refs, [reference(a), reference(a)])
+        self.assertFalse(self.v.leased)
+
     def test_raw_base64_indexes_and_reference_are_identical(self):
         data = png()
         row = self.v.encode(source(data))
@@ -303,6 +315,7 @@ class API(Fixture):
         except urllib.error.HTTPError as e:
             response = e
         with response:
+            self.last_headers = response.headers
             return response.status, json.load(response)
     def test_query_is_authenticated_and_does_not_encode(self):
         data = png(); self.v.encode(data)
@@ -317,12 +330,12 @@ class API(Fixture):
         status, body = self.request('/props')
         self.assertEqual(status, 200)
         self.assertEqual(body['image_references']['hash'], 'sha256-raw-bytes')
-    def test_missing_tool_ref_409_no_generation(self):
+    def test_missing_tool_ref_400_no_generation(self):
         ref = reference(png())
         payload = {'model': self.svc.model, 'max_tokens': 8, 'messages': [
             {'role': 'tool', 'content': [{'type': 'image_url', 'image_url': {'url': ref}}]}]}
         status, body = self.request('/v1/chat/completions', payload)
-        self.assertEqual(status, 409)
+        self.assertEqual(status, 400)
         self.assertEqual(body['error']['code'], 'image_cache_miss')
         self.assertEqual(body['error']['missing_sha256'], [ref.split('://')[1]])
         self.assertEqual(self.svc.engine.last_prompt, [])
@@ -333,6 +346,7 @@ class API(Fixture):
             status, body = self.request('/v1/chat/completions', {'model': self.svc.model, 'max_tokens': 8,
                 'messages': [{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': src}}]}]})
             self.assertEqual(status, 200, body)
+            self.assertEqual(json.loads(self.last_headers['X-Strata-Image-Refs']), [reference(data)])
             ids = self.svc.engine.last_prompt
             if src.startswith('data:'):
                 old = ids
@@ -352,6 +366,8 @@ class API(Fixture):
                 'messages': [{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': src}}]}]},
                 origin='https://foreign.test')
             self.assertEqual(status, expected)
+            if expected == 200:
+                self.assertEqual(self.last_headers['Access-Control-Expose-Headers'], 'X-Strata-Image-Refs')
 
 
 if __name__ == '__main__':
