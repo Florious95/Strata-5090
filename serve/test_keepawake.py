@@ -82,7 +82,12 @@ class KeepAwakeTests(unittest.TestCase):
         svc = Service(MockEngine(tok, "ok"), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         rec = Recorder()
         svc.keep_awake = ka = KeepAwake(rec)
-        kinds = [k for k, _ in svc.run(tok.encode("hi"), False, None, 8, {}, threading.Event())]
+        gen = svc.run(tok.encode("hi"), False, None, 8, {}, threading.Event())
+        first = next(gen)
+        # Keep the fake request alive until the async worker observes it. A sub-ms mock
+        # can otherwise acquire/release before that worker runs (baseline scheduling race).
+        self.assertTrue(wait_for(lambda: rec.calls == [ON]))
+        kinds = [first[0]] + [k for k, _ in gen]
         self.assertIn("done", kinds)
         self.assertTrue(wait_for(lambda: rec.calls == [ON, ES_CONTINUOUS]))
         gen = svc.run(tok.encode("hi"), False, None, 8, {}, threading.Event())

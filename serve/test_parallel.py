@@ -235,7 +235,7 @@ class PickSlot(unittest.TestCase):
         e.slot_busy = [True] * 3
         self.assertIsNone(e.pick_slot([7, 8]))
         e.slot_busy = [False] * 3
-        self.assertEqual(e.pick_slot([1, 2, 3]), 1)                 # a held prompt is never the WHOLE prompt
+        self.assertEqual(e.pick_slot([1, 2, 3]), 0)                 # LCP routes the shorter replay; native rewinds safely
 
     def test_batch_groups_spread_requests_over_the_groups(self):
         # #1249: with --batch-groups 2 over 4 slots (groups {0,1} and {2,3}) a second request goes to the other group,
