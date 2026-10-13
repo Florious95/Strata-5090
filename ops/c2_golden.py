@@ -13,9 +13,9 @@ import time
 import urllib.error
 import urllib.request
 
-SOURCE = "77cd2b2de043721bda8deff2fd691e88d7499a2a"
+SOURCE = "cd48d6fb86d031f4a54305c3cb67a1e7f113e9a7"
 BINARY = "640c5a6600e687c23c870a99d16b3c59bd769c86aefd0b331460371fa1c950d8"
-SERVER = "06ca08c2497f4200a46d602b88e8b87df91e79b8fc2af0caf855b4da7358ddb1"
+SERVER = "1cb56746b82fc5524d0d0b74aaf3e2db77836920ff3b1fff65fe5e405665b62d"
 CANDIDATE = Path("/home/florious/Projects/Strata-c2-v0.1.43-port")
 ENV = {"STRATA_BATCH_DENSE_PARALLEL": "1", "STRATA_BATCH_NARROW_PARALLEL": "1",
        "STRATA_BATCH_SHARED_AFTER_RING": "1", "STRATA_BATCH_HEAD_WIDE": "1",
