@@ -508,7 +508,7 @@ class ConvCacheLog:
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
-    READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
+    READ_MAX = 1 << 20                                  # at most one MiB per chunk; never skip events
 
     def __init__(self):
         self.key, self.pos = None, 0
@@ -3666,12 +3666,16 @@ class Service:
         return fetched
 
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None):
+        # Internal response metadata cannot be supplied by a client.
+        if req is not None:
+            req.pop("_strata_image_refs", None)
         # Lease cache files across tool precheck, tokenization and combined-file creation, including failures.
         scope = self.vision.lease() if hasattr(self.vision, "lease") else contextlib.nullcontext(None)
         with scope as lease:
             result = self._prepare(messages, tools, kwargs, max_new, force, req, lease)
-            if req is not None:
-                req["_strata_image_refs"] = list(dict.fromkeys(getattr(lease, "refs", ())))
+            refs = getattr(lease, "refs", ())
+            if req is not None and refs:
+                req["_strata_image_refs"] = list(dict.fromkeys(refs))
             return result
 
     def _prepare(self, messages, tools, kwargs, max_new, force, req, lease):

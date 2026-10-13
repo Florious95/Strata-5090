@@ -353,6 +353,13 @@ class API(Fixture):
             else:
                 self.assertEqual(ids, old)
         self.assertEqual(len(self.v.calls), 1)
+    def test_client_cannot_forge_ref_headers_for_text_only_request(self):
+        status, body = self.request('/v1/chat/completions', {'model': self.svc.model, 'max_tokens': 8,
+            '_strata_image_refs': ['strata-sha256://' + 'f' * 64],
+            'messages': [{'role': 'user', 'content': 'hello'}]})
+        self.assertEqual(status, 200, body)
+        self.assertIsNone(self.last_headers.get('X-Strata-Image-Refs'))
+
     def test_query_validation_and_unknown_digest(self):
         self.assertEqual(self.request('/v1/vision/cache?sha256=bad')[0], 400)
         status, body = self.request('/v1/vision/cache?sha256=' + 'f' * 64)
