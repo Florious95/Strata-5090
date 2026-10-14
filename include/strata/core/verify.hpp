@@ -22,11 +22,14 @@
 #pragma once
 
 #include <cstdio>
+#include <array>
+#include "strata/core/batch_segments.hpp"
 
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/cpu/host_profile.hpp"
 
 #include <cuda_runtime.h>
 
@@ -49,6 +52,14 @@ struct AdaptGate {
     std::atomic<bool> active{false};
     std::vector<uint8_t> has;             ///< per layer: a swap copies into this layer's slots
     std::vector<Tick> ticks;              ///< host-function contexts, one per layer and the final one (stable storage)
+    const int32_t* dvals = nullptr;       ///< device [0..n_layers]: the source of those copies
+    volatile int32_t* hland = nullptr;   ///< pinned host int the copy stream writes (a D2H copy of the layer number), instead of a host function; null: host functions
+    int32_t reached() const {
+        const int32_t a = landed.load(std::memory_order_acquire);
+        if (hland == nullptr) return a;
+        const int32_t b = *hland;
+        return a > b ? a : b;
+    }
 };
 
 class NativeHead;
@@ -65,6 +76,24 @@ struct VerifyHits {
     const uint64_t* slot_off = nullptr;   ///< E-6: host per-slot offsets when slots differ in size (null: slot * blob)
     int64_t n_slots = 0;                  ///< E-6: how many (for the device copy)
     int64_t blob = 0;
+};
+
+// Sequential HOST wall-time bins only. stage_data includes ple_gather; stage
+// contains its sub-bins. Never sum nested bins or add these to GPU envelopes.
+struct BatchHostProfile {
+    int64_t run_ns = 0, stage_ns = 0, evict_ns = 0, capture_exec_ns = 0, capture_commit_ns = 0;
+    int64_t stage_data_ns = 0, ple_gather_ns = 0;
+    int64_t context_enter_ns = 0, context_exit_ns = 0;
+    int64_t launch_ns = 0, query_ns = 0, ring_ns = 0, tail_sync_ns = 0, copy_sync_ns = 0;
+    int64_t collect_ns = 0, sample_ns = 0, out_ns = 0, progress_ns = 0, end_mono_ns = 0;
+    bool graph_cache_hit = false;
+    int64_t stage_other_ns() const {
+        return stage_ns - evict_ns - capture_exec_ns - capture_commit_ns - stage_data_ns;
+    }
+    int64_t run_other_ns() const {
+        return run_ns - context_enter_ns - context_exit_ns - stage_ns - launch_ns - query_ns - ring_ns -
+               tail_sync_ns - copy_sync_ns - collect_ns - sample_ns - out_ns - progress_ns;
+    }
 };
 
 class Verifier {
@@ -185,14 +214,38 @@ public:
     // split's stages each get their own sessions, and run_slots/commit_slots continue into the next stage.
     bool init_slots(const std::vector<SessionState*>& slots, std::string& err);
     int n_slots() const { return (int) slots_.size(); }
+    // Set once before any graph capture. Native single-stage speculative batches
+    // can share one expert dispatch while keeping dense tiles within eight rows.
+    void set_batch_expert_merge(bool enabled) { batch_expert_merge_ = enabled; }
+    bool batch_experts_merged() const { return last_batch_ && batch_expert_merged_; }
+    int batch_dense_groups() const { return last_batch_ ? (batch_dense_boundary_ > 0 ? 2 : 1) : 0; }
+    bool batch_dense_parallel() const { return last_batch_ && batch_dense_parallel_; }
+    bool batch_shared_after_ring() const { return last_batch_ && batch_shared_after_ring_; }
+    // Actual dispatch captured in the graph replayed by the last batch, not env
+    // eligibility. Cached layouts restore their own metadata; no GPU readback.
+    int batch_head_type() const { return last_batch_ ? last_head_.type : -1; }
+    bool batch_head_wide_active() const { return last_batch_ && last_head_.wide; }
+    int batch_qsa_tile_calls() const { return last_batch_ ? last_head_.qsa_tiles : 0; }
+    int batch_qsa_tile_rows() const { return last_batch_ ? last_head_.qsa_rows : 0; }
+    int batch_qsa_scalar_rows() const { return last_batch_ ? last_head_.qsa_scalar : 0; }
+    bool batch_host_profile_enabled() const { return host_prof_on_; }
+    const BatchHostProfile& batch_host_profile() const { return host_prof_; }
+    bool batch_ring_profile_enabled() const { return ring_prof_on_; }
+    const strata::kernels::cpu::RingHostProfile& batch_ring_profile() const { return ring_prof_; }
     /// One batch window over slots [0, S): tokens[s] at positions pos[s]; out[s] = the greedy pick after it.
     bool run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err);
     /// The same over the S slots `rows` (row t is slot rows[t], any distinct slots in any order): the slots not
     /// listed are not touched, so an idle slot keeps its state (a finished conversation it may continue later).
     bool run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user,
-                       int32_t* out, std::string& err);
-    /// Keep every row of the last batch window.
+                       int32_t* out, std::string& err, bool segmented = false);
+    /// Direct admission/teacher-forced reads on one canonical slot. Keeps scalar sampling/history
+    /// and head-sampling suppression while using the slot graph; commit with commit_slots().
+    bool run_admission_slot(int slot, int T, const int32_t* tokens, int64_t pos0,
+                            PoolMultiFn pool, void* user, int32_t* out, std::string& err);
+    /// Experimental single-stage causal segments, at most max_t total rows.
+    /// Repeated slot IDs must be contiguous, with consecutive absolute positions.
+    bool commit_segment_prefixes(const int* keep, std::string& err);
     bool commit_slots(std::string& err);
     /// Commit an accepted prefix in each contiguous slot group of the last window. `keep` has
     /// one entry per slot (indexed by slot ID), each in 1..that slot's group length.
@@ -216,6 +269,11 @@ public:
     void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) {
         if (slot >= 0 && slot < (int) slot_sp_.size()) slot_sp_[(size_t) slot] = sp;
         if (next_) next_->set_slot_sampling(slot, sp);
+    }
+    /// Current batch row's private history, uploaded by the caller before run_slot_rows().
+    void set_batch_row_history(int row, const int32_t* history, int length) {
+        if (row >= 0 && row < kBatchMaxRows) { batch_hist_[row] = history; batch_hist_len_[row] = length; }
+        if (next_) next_->set_batch_row_history(row, history, length);
     }
     const int32_t* batch_out() const { return b_out_; }
     bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
@@ -314,16 +372,27 @@ private:
     std::vector<SessionState*> slots_;
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
-    int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
+    int brow_[kBatchMaxRows] = {};          ///< ... and row t is slot brow_[t]
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
+    bool admission_sampling_ = false;      ///< scalar request history/params on the slot admission path
+    const int32_t* batch_hist_[kBatchMaxRows] = {};
+    int batch_hist_len_[kBatchMaxRows] = {};
     std::map<std::vector<int>, cudaGraphExec_t> exec_bm_, commit_bm_;   ///< full row layout avoids slot-ID collisions
+    // Cached native GPU dispatch metadata, restored on every graph replay.
+    struct HeadDispatch { int type = -1; bool wide = false; int qsa_tiles = 0, qsa_rows = 0, qsa_scalar = 0; };
+    HeadDispatch record_head_, last_head_;
+    std::map<std::vector<int>, HeadDispatch> bm_head_;   ///< actual captured head dispatch per layout
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU)
     uint64_t bm_tick_ = 0;
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
-    int last_rows_[8] = {};                ///< the slots of the last batch window's rows
+    int last_rows_[kBatchMaxRows] = {};                ///< the slots of the last batch window's rows
     std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
         std::vector<int> k = batch_key(rows, S, hbase);
         k.push_back(ar_off_ ? 1 : 0);
+        k.push_back(batch_expert_merged_ ? 1 : 0);
+        k.push_back(batch_dense_boundary_);
+        k.push_back(batch_dense_parallel_ ? 1 : 0);
+        k.push_back(batch_shared_after_ring_ ? 1 : 0);
         return k;
     }
     static std::vector<int> batch_key(const int* rows, int S, int hbase) {
@@ -333,18 +402,24 @@ private:
         for (int t = 0; t < S; ++t) k.push_back(rows[t]);
         return k;
     }
+    int batch_boundary_ = 0;           // host expert groups (one for merged dispatch)
+    int batch_dense_boundary_ = 0;     // graph tiles, never split a slot's segment
+    bool batch_dense_parallel_ = false;
+    bool batch_shared_after_ring_ = false;
+    bool batch_expert_merge_ = false;
+    bool batch_expert_merged_ = false;
     // batch_launch / batch_poll
     bool b_running_ = false;
     int64_t b_k_ = 0, b_steps_ = 0;
     std::chrono::steady_clock::time_point b_last_;
-    int32_t b_out_[8] = {};
+    int32_t b_out_[kBatchMaxRows] = {};
     std::vector<strata::kernels::SamplerParams> slot_sp_;
     bool sample_rows(int S, std::string& err);   ///< the sampled slots' rows of the last batch window
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;
     float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot
     void* arena_b_ = nullptr;
-    int64_t last_pos_b_[8] = {};
+    int64_t last_pos_b_[kBatchMaxRows] = {};
     bool capture_batch(const int* rows, int S, int hbase, std::string& err);
     /// Free the graph pair of the least recently used batch layout other than `keep` (`evicted`: there was one).
     bool evict_batch_graph(const std::vector<int>& keep, bool& evicted, std::string& err);
@@ -368,7 +443,8 @@ private:
     int32_t pl_prev_[2] = {-1, -1};
     std::vector<uint32_t> pl_ple_rows_;   ///< the window's PLE rows (T x PLE_N_HEADS), gathered when layer 0 is served
     bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err);
-    bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err);
+    bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err,
+                     bool segmented = false);
     strata::kernels::SamplerParams sampling_ = [] {
         strata::kernels::SamplerParams s;
         s.greedy = true;
@@ -381,6 +457,9 @@ private:
     int32_t* d_spec_ = nullptr;          ///< device: kVerifyMaxT draft ids, then kVerifyMaxT q rows
     int hist_len_ = 0;
     bool head_sampling_ = true;          ///< set_head_sampling
+#if defined(STRATA_GPU_METAL)
+    void* metal_ = nullptr;              ///< the Metal decode window (metal/src/engine/window.cpp): init/run/commit go there
+#endif
     std::vector<float> logit_bias_host_;
     float* logit_bias_device_ = nullptr;
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
@@ -419,6 +498,22 @@ private:
     size_t trace_n_ = 0;
     static constexpr int kProfPer = 33;              // stamps per layer (32 left the hc-read second
                                       // half's up-stamp at slot 32 = the next layer's slot 0: D8)
+    void collect_dense_profile();
+    unsigned long long *dense_prof_h_ = nullptr, *dense_prof_m_ = nullptr;
+    double dense_pre_ns_ = 0, dense_post_ns_ = 0;
+    int64_t dense_windows_ = 0;
+    bool host_prof_on_ = false; // independent of prof_on_: never changes GPU paths/stream gates
+    BatchHostProfile host_prof_;
+    bool ring_prof_on_ = false;
+    strata::kernels::cpu::RingHostProfile ring_prof_;
+    int64_t host_stamp_ns() const; // returns zero without reading a clock when disabled
+    bool dense_parallel_ = false; // immutable after init; graph cache is per verifier
+    bool narrow_parallel_ = false; // opt-in complete two-slot tiles also when rows <= 8
+    cudaStream_t dense_cs_ = nullptr;
+    cudaEvent_t dense_fork_ = nullptr, dense_join_ = nullptr;
+    uint8_t* dense_ple_ = nullptr;
+    float* dense_ple_values_ = nullptr;
+    size_t xq_stride_ = 0;
     bool prof_on_ = false;
     unsigned long long* prof_ = nullptr;              // device: n_layers * kProfPer + 4 stamps
     std::vector<unsigned long long> prof_h_;
@@ -435,7 +530,7 @@ private:
     float* ple_val_ = nullptr;
     int last_t_ = 0;
     int64_t last_pos0_ = 0;
-    int32_t last_tokens_[8] = {};
+    int32_t last_tokens_[kBatchMaxRows] = {};
     int64_t n_vocab_ = 0;
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
@@ -492,6 +587,7 @@ private:
     float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
     float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;
     uint8_t* xq_ = nullptr;                                   // T columns of q8_1
+    size_t xil_stride_ = 0;
     uint8_t* xil_ = nullptr;                                  // fork F4: the interleaved copy of xq_'s 2-4 columns
     uint8_t* sh_xq_ = nullptr;                                // T columns of q8_1 for shared expert branch
     float *qkv_L_ = nullptr, *h_L_ = nullptr, *gate_L_ = nullptr, *beta_L_ = nullptr;   // per GDN layer

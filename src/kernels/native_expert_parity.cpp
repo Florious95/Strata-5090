@@ -45,10 +45,11 @@ static double rel(const std::vector<float>& a, const std::vector<float>& b) {
 
 
 namespace {
-constexpr int NT = 3, E = 7;
+constexpr int E = 7;
 constexpr int64_t H = 2560, FF = 640;
 
 // The three ways and the dequantizers for one expert blob; returns the number of failed checks.
+template<int NT = 3>
 int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed, const std::string& label,
                cudaStream_t s) {
     int failures = 0;
@@ -61,6 +62,13 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         tg->to_float(blob.data() + f.up_off + r * f.gu_row, U.data() + r * H, H);
     }
     for (int64_t r = 0; r < H; ++r) td->to_float(blob.data() + f.down_off + r * f.d_row, D.data() + r * FF, FF);
+    if (f.tail_off) {   // the blob's scales, as the engine applies them (gate and up as read, down on its output)
+        float tail[4];
+        std::memcpy(tail, blob.data() + f.tail_off, sizeof tail);
+        for (auto& v : G) v *= tail[0];
+        for (auto& v : U) v *= tail[1];
+        for (auto& v : D) v *= tail[2];
+    }
     std::mt19937 rng(11 + seed);
     std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<float> x((size_t) NT * H);
@@ -134,6 +142,23 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
                 float* f1[1] = {ffp[0]};
                 const int it = 50;
                 const auto gu = is512 ? cpu::iq512_gu_rows : cpu::iq256_gu_rows;
+                // Exercise partial and full wide groups directly on each ISA.
+                // A native-dispatch check alone can miss the unused ISA's bug.
+                if (NT > 8) {
+                    std::vector<float> one(FF), many((size_t) NT * FF);
+                    float* mp[NT];
+                    for (int k = 0; k < NT; ++k) mp[k] = many.data() + k * FF;
+                    for (int width : {9, 12, 16}) {
+                        if (width > NT) continue;
+                        std::fill(many.begin(), many.end(), NAN);
+                        gu(f.gu_type, blob.data(), f.gu_row, f.up_off, (int) H, a, width, mp, 0, (int) FF);
+                        for (int k = 0; k < width; ++k) {
+                            const void* ap[1] = {a[k]}; float* fp[1] = {one.data()};
+                            gu(f.gu_type, blob.data(), f.gu_row, f.up_off, (int) H, ap, 1, fp, 0, (int) FF);
+                            if (std::memcmp(one.data(), mp[k], (size_t) FF * sizeof(float))) ++failures;
+                        }
+                    }
+                }
                 auto t0 = std::chrono::steady_clock::now();
                 for (int i = 0; i < it; ++i) gu(f.gu_type, blob.data(), f.gu_row, f.up_off, (int) H, a, 1, f1, 0, (int) FF);
                 auto t1 = std::chrono::steady_clock::now();
@@ -239,6 +264,34 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             cpu::q2_rows_any(blob.data() + f.down_off, f.d_row, (int) (FF / 64), ap, NT, altp, 0, (int) H);
             std::printf("          q2_0 %s down vs ggml down: rel %.2e\n",
                         cpu::cpu_avx512_ok() ? "AVX-512" : "AVX-2", rel(alt, got_c));
+            // Same arithmetic, different grouping: every row must be written,
+            // including rows beyond the AVX-512 kernel's eight-row tile.
+            std::vector<float> single((size_t) NT * H);
+            for (int k = 0; k < NT; ++k) {
+                float* dst = single.data() + k * H;
+                cpu::q2_rows_any(blob.data() + f.down_off, f.d_row, (int) (FF / 64),
+                                 ap + k, 1, &dst, 0, (int) H);
+            }
+            int width_failures = 0;
+            for (int width = 1; width <= NT; ++width) {
+                for (int partial = 0; partial < 2; ++partial) {
+                    const int r0 = partial ? 3 : 0;
+                    const int r1 = partial ? (int) H - 5 : (int) H;
+                    std::fill(alt.begin(), alt.end(), -123456.0f);
+                    cpu::q2_rows_any(blob.data() + f.down_off, f.d_row, (int) (FF / 64),
+                                     ap, width, altp, r0, r1);
+                    bool bad = false;
+                    for (int k = 0; k < NT; ++k)
+                        for (int r = 0; r < H; ++r) {
+                            const float expected = k < width && r >= r0 && r < r1
+                                ? single[(size_t) k * H + r] : -123456.0f;
+                            if (std::memcmp(&alt[(size_t) k * H + r], &expected, sizeof(float))) bad = true;
+                        }
+                    if (bad) ++width_failures;
+                }
+            }
+            std::printf("          q2_0 width invariance 1..%d: %d failures\n", NT, width_failures);
+            failures += width_failures;
         }
         if (f.d_type == 20 && cpu::cpu_avx2_ok()) {
             // (b3) the IQ4_NL multi-token AVX-2 kernel the pool now uses for IQ4_NL down projections,
@@ -296,7 +349,9 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         cudaMemcpy(dblob, blob.data(), blob.size(), cudaMemcpyHostToDevice);
         cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
         const unsigned long long p = (unsigned long long) dblob;
-        const int32_t st[2] = {0, NT}, one = 1, idx[NT] = {0, 1, 2};
+        const int32_t st[2] = {0, NT}, one = 1;
+        int32_t idx[NT];
+        for (int k = 0; k < NT; ++k) idx[k] = k;
         cudaMemcpy(dptr, &p, 8, cudaMemcpyHostToDevice);
         cudaMemcpy(dstart, st, 8, cudaMemcpyHostToDevice);
         cudaMemcpy(dn, &one, 4, cudaMemcpyHostToDevice);
@@ -404,6 +459,11 @@ std::vector<uint8_t> synthetic_blob(const cpu::NativeFmt& f, int seed) {
     quant(f.gu_type, FF, H, blob.data());
     quant(f.gu_type, FF, H, blob.data() + f.up_off);
     quant(f.d_type, H, FF, blob.data() + f.down_off);
+    if (f.tail_off) {   // NVFP4's {s_gate, s_up, s_down, 0}: non-unit for an NVFP4 projection, 1.0 for another format
+        const bool g4 = f.gu_type == 40, d4 = f.d_type == 40;
+        const float tail[4] = {g4 ? 0.75f : 1.f, g4 ? 1.25f : 1.f, d4 ? 0.5f : 1.f, 0.f};
+        std::memcpy(blob.data() + f.tail_off, tail, sizeof tail);
+    }
     return blob;
 }
 
@@ -530,6 +590,7 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: native_expert_parity <shard.gguf> [layer ...]\n"
                              "       native_expert_parity --synthetic GU/DOWN ...   (ggml type names, e.g. q4_K/q5_1)\n"
+                             "       native_expert_parity --synthetic-wide GU/DOWN ...   (sixteen-row groups)\n"
                              "       native_expert_parity --q5_1-min\n"
                              "       native_expert_parity --bf16-embd\n");
         return 2;
@@ -550,7 +611,7 @@ int main(int argc, char** argv) {
         failures += check_q5_1_min(s);
     } else if (mode == "--bf16-embd") {
         failures += check_bf16_embd(s);
-    } else if (mode == "--synthetic") {
+    } else if (mode == "--synthetic" || mode == "--synthetic-wide") {
         for (int i = 2; i < argc; ++i) {
             const std::string arg = argv[i];
             const size_t slash = arg.find('/');
@@ -564,7 +625,10 @@ int main(int argc, char** argv) {
                 ++failures;
                 continue;
             }
-            failures += check_blob(f, synthetic_blob(f, i), i, "synthetic", s);
+            if (mode == "--synthetic-wide")
+                failures += check_blob<16>(f, synthetic_blob(f, i), i, "synthetic-wide", s);
+            else
+                failures += check_blob(f, synthetic_blob(f, i), i, "synthetic", s);
         }
     } else {
         const strata::GgufModel model(strata::gguf_split_paths(argv[1]));

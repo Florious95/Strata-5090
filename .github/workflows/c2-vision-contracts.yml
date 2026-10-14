@@ -1,0 +1,37 @@
+name: C2 vision CPU contracts
+on:
+  pull_request:
+    paths:
+      - 'include/strata/core/**'
+      - 'include/strata/kernels/mrope.hpp'
+      - 'src/core/**'
+      - 'src/program/generate.cpp'
+      - 'tests/core/slot_mrope*'
+      - 'serve/**'
+      - '.github/workflows/c2-vision-contracts.yml'
+  workflow_dispatch:
+jobs:
+  cpu-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Pinned server test dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Production position helper and pointer scopes
+        run: |
+          c++ -std=c++20 -O2 -Iinclude tests/core/slot_mrope_cpu.cpp -o /tmp/slot_mrope_cpu
+          /tmp/slot_mrope_cpu
+          c++ -std=c++20 -O1 -g -fsanitize=address,undefined -Iinclude tests/core/slot_mrope_cpu.cpp -o /tmp/slot_mrope_sanitize
+          /tmp/slot_mrope_sanitize
+      - name: Disk format golden and refusal contracts
+        run: |
+          c++ -std=c++20 -O2 -Iinclude src/core/conversation_file_test.cpp src/core/conversation_file.cpp -o /tmp/conversation_file_test
+          /tmp/conversation_file_test
+      - name: Server protocol regressions (mock CPU, not native GPU)
+        run: python -m unittest discover -s serve -p 'test_*.py'
+      - name: NVFP4 setup format and asset policy (local mocked files, no downloads)
+        run: python -m unittest tools.test_setup_nvfp4

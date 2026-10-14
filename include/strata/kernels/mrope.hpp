@@ -27,6 +27,27 @@ namespace strata::kernels {
 void mrope_table_set(const int32_t* device_table);
 const int32_t* mrope_table();
 
+// Text-only chunks before/after an image keep their prompt-local position; decode
+// past the prompt uses the saved per-slot delta. This never shifts a KV cell index.
+inline int32_t mrope_text_position(int64_t cell, int64_t tail_start, int32_t delta, const int32_t* host_table) {
+    return host_table && cell < tail_start ? host_table[cell * 3] : (int32_t) (cell + delta);
+}
+
+// Host-side launch/capture selection only: CUDA kernels retain the pointer by value.
+// Slot prefill/pooling uses its own table; merged text decode uses explicit positions.
+class MropeTableScope {
+    const int32_t* previous_;
+    bool active_;
+public:
+    explicit MropeTableScope(const int32_t* table, bool active = true)
+        : previous_(active ? mrope_table() : nullptr), active_(active) {
+        if (active_) mrope_table_set(table);
+    }
+    ~MropeTableScope() { if (active_) mrope_table_set(previous_); }
+    MropeTableScope(const MropeTableScope&) = delete;
+    MropeTableScope& operator=(const MropeTableScope&) = delete;
+};
+
 /// #280, opt-in (STRATA_ROPE_TABLE=1): the rotation angles, 32 pairs of a 64-wide rotary slice, from the session's
 /// float64 table (build_rope_table, [max_pos][32] cos and sin in VRAM, the rope scaling inside) of the CURRENT
 /// device.  With it the rope kernels rotate by the table's exact angles; without it they compute pos * powf(...) with cosf/sinf, which under

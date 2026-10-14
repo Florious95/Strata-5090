@@ -1,5 +1,6 @@
 // CPU-only task partition parity. Optional real expert: pool_tasks_test GU_TYPE DOWN_TYPE BLOB_FILE
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/kernels/cpu/host_profile.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "ggml.h"
 
@@ -16,6 +17,8 @@ namespace cpu = strata::kernels::cpu;
 
 int main(int argc, char** argv) {
     if (argc != 1 && argc != 4) return 2;
+    // its activation quantiser is the AVX one at least (act_quant_any): a CPU without AVX (Westmere) would stop on an illegal instruction
+    if (!cpu::cpu_avx1_ok()) { std::printf("pool_tasks_test: no AVX on this CPU, skipped\n"); return 0; }
     cpu::NativeFmt f;
     std::string err;
     if (!cpu::native_fmt(argc == 4 ? std::atoi(argv[1]) : GGML_TYPE_Q4_0,
@@ -55,7 +58,8 @@ int main(int argc, char** argv) {
         std::vector<float> out((size_t) n * cpu::MAXT * cpu::H);
         for (int e = 0; e < n; ++e) {
             jobs[e].blob = blob.data();
-            jobs[e].nt = e % 3 == 0 ? 1 : e % 3 == 1 ? 4 : cpu::MAXT;
+            static constexpr int widths[] = {1, 4, 8, 9, 10, 11, 12, cpu::MAXT};
+            jobs[e].nt = widths[e % 8];
             for (int t = 0; t < jobs[e].nt; ++t) {
                 jobs[e].nact[t] = act[t].data();
                 jobs[e].act[t] = &qact[t];
@@ -75,7 +79,21 @@ int main(int argc, char** argv) {
                     std::fill(out.begin(), out.end(), 0.0f);
                     for (const auto& job : jobs) for (int t = 0; t < job.nt; ++t)
                         std::fill(job.out[t], job.out[t] + cpu::H, std::numeric_limits<float>::quiet_NaN());
-                    pool.run_split_multi_native(f, jobs.data(), n);
+                    cpu::HostExpertProfile profile;
+                    {
+                        cpu::HostExpertProfileScope scope(repeat ? &profile : nullptr);
+                        pool.run_split_multi_native(f, jobs.data(), n);
+                    }
+                    const auto& p = profile.phases;
+                    const int chunks = (n + cpu::ExpertPool::kMaxSplitMulti - 1) / cpu::ExpertPool::kMaxSplitMulti;
+                    if (repeat ? (p.native_calls != 1 || p.calls != 2 * chunks || p.total_ns <= 0 ||
+                                  p.other_ns() < 0 || p.native_other_ns() < 0 || p.native_phase_ns != p.total_ns ||
+                                  p.park_before_ns < 0 || p.publish_ns < 0 || p.host_work_ns < 0 ||
+                                  p.wait_done_ns < 0 || p.park_after_ns < 0 || p.ff_quant_ns < 0) :
+                                 (p.native_calls != 0 || p.calls != 0 || p.total_ns != 0)) {
+                        std::fprintf(stderr, "pool profiling lifecycle/accounting failure\n");
+                        return 1;
+                    }
                     if (std::memcmp(ref.data(), out.data(), out.size() * sizeof(float)) != 0) {
                         std::fprintf(stderr, "mismatch n=%d workers=%d host=%d tasks=%d repeat=%d\n",
                                      n, workers, host, tasks, repeat);

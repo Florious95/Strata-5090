@@ -69,11 +69,16 @@ public:
     /// lent for the prompt and refilled after it); null = allocate normally.
     bool init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
               core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
-              void* stream, std::string& err, void* borrow = nullptr, uint64_t borrow_bytes = 0);
+              void* stream, std::string& err, void* borrow = nullptr, uint64_t borrow_bytes = 0,
+              bool borrow_spill = false);
 
     /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` - a
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
     bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
+
+    /// Bind a compatible canonical session between prompts. Rejects an in-flight run/bind and drains
+    /// all owned streams before changing the pointer; no SessionState or CUDA ownership is copied.
+    bool bind_session(core::SessionState& ss, std::string& err);
     int64_t chunk() const;
 
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
