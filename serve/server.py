@@ -2599,7 +2599,9 @@ class Vision:
             if cancel is not None and cancel.is_set():
                 raise ClientGone()
             if src not in ready:
-                ready[src] = self.encode(src, keep=[p for p, _ in out], lease=lease)
+                keep = [p for p, _ in out]
+                ready[src] = (self.encode(src, keep=keep, lease=lease) if lease is not None
+                              else self.encode(src, keep=keep))
             out.append(ready[src])
         return out
 
