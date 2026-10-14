@@ -6,6 +6,7 @@
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/host_profile.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 
 #include "strata/core/pinned.hpp"
@@ -3656,7 +3657,7 @@ namespace {
 // the verify window's per-entry tables in `expert_pool_dispatch_multi` (`kind`, `distinct`, `first_of`)
 // are fixed arrays of this many entries: MAXT tokens of the model's 10 routed experts must fit, and a larger k is
 // refused at run time rather than written past them.
-constexpr int64_t kMaxWindowEntries = 128;
+constexpr int64_t kMaxWindowEntries = strata::kernels::cpu::MAXT * 16;
 static_assert(strata::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
 }  // namespace
 
@@ -3687,6 +3688,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.fail_layer = d.layers;
         return;
     }
+    auto* host_profile = host_expert_profile();
+    const auto dispatch_begin = host_profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (d.lookahead != nullptr) {
         if (d.lookahead->stats_on()) {
             if (d.layers == 0) d.lookahead->stats_window_start();
@@ -3887,11 +3890,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     for (int64_t i = 0; i < n; ++i)
         if (kind[i] == -1) { any_cpu = true; break; }   // -2: skipped (STRATA_ROUTE_TAIL_SKIP), no work
     const auto c1 = std::chrono::steady_clock::now();
+    int64_t cpu_needed_tokens = 0, quantized_tokens = 0;
     if (any_cpu) {
         // #578 --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
         const bool ep = d.remote_count > 0 && d.remote[0]->optimized_decode();
         for (int64_t t = 0; t < n_tok; ++t) {
+            if (host_profile && std::any_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v < 0; })) ++cpu_needed_tokens;
             if (ep && std::all_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v >= 0; })) continue;
+            if (host_profile) ++quantized_tokens;
             if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
                 act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
             else if (native)
@@ -4000,6 +4006,16 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.multi_misses += njobs;
     ++d.layers;
     d.experts += n_tok * k;
+    if (host_profile) {
+        const auto end = std::chrono::steady_clock::now();
+        const auto ns = [](auto dt) { return std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count(); };
+        auto& p = host_profile->dispatch;
+        ++p.calls;
+        p.total_ns += ns(end-dispatch_begin);
+        p.plan_ns += ns(c1-c0); p.actq_ns += ns(c2-c1); p.jobs_ns += ns(c3-c2); p.run_ns += ns(c4-c3);
+        p.zero_cpu_calls += !any_cpu; p.cpu_jobs += njobs;
+        p.cpu_needed_tokens += cpu_needed_tokens; p.quantized_tokens += quantized_tokens;
+    }
 }
 
 void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids, int64_t k) {

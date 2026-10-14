@@ -178,6 +178,8 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
     s.ple_prev[0] = -1;
     s.ple_prev[1] = -1;
     s.ple_token = -1;
+    s.rope_delta = 0;
+    s.rope_tail_start = 0;
 }
 
 /// Sets `s.gdn.state`/`conv_state` for `layer`, which is what makes one layer's GDN state its own.  Shared by
