@@ -143,7 +143,7 @@ def _local_command(a: argparse.Namespace, machine: bool) -> int:
     return 0
 
 
-def run(a: argparse.Namespace) -> int:
+def run(a: argparse.Namespace, *, standalone: bool = False) -> int:
     machine = a.output in ("json", "jsonl") or getattr(a, "json", False)
     quiet = bool(getattr(a, "quiet", False) and not machine)
     try:
@@ -189,15 +189,21 @@ def run(a: argparse.Namespace) -> int:
             if not quiet:
                 print(render_view(snapshot, "overview", width=80, height=24))
             return 0
+        options = dict(interval=a.interval, requests=a.requests, theme=a.theme, color=a.color, glyphs=a.glyphs)
         try:
-            from strata_cli.launch.monitor_ext import LaunchMonitor
+            if standalone:
+                # The thin zipapp is read-only: it intentionally excludes launch/config-writing helpers.
+                from strata_cli.monitor import MonitorApp
+                app = MonitorApp(endpoint, None, **options)
+            else:
+                from strata_cli.launch.monitor_ext import LaunchMonitor
+                # Source CLI keeps the seventh Connect view; q only detaches here.
+                app = LaunchMonitor(endpoint, None, info={"url": endpoint.base_url, "urls": [endpoint.base_url],
+                                    "key": endpoint.credential or "", "model": "", "profile": None, "name": None},
+                                    ask_quit=False, **options)
         except ImportError:
             return _error("monitor component missing; install the optional terminal UI dependency", 5, machine)
-        # the one monitor, with the same seven views as the one `strata launch` opens (Connect is key 7 and works against this --url
-        # server); q just detaches here: nothing was started by this command, so there is nothing to stop
-        LaunchMonitor(endpoint, None, info={"url": endpoint.base_url, "urls": [endpoint.base_url], "key": endpoint.credential or "", "model": "",
-                                            "profile": None, "name": None}, ask_quit=False, interval=a.interval, requests=a.requests,
-                      theme=a.theme, color=a.color, glyphs=a.glyphs).run()
+        app.run()
         return 0
     except ClientError as e:
         return _error(str(e), e.exit_code, machine)
@@ -215,5 +221,5 @@ def run(a: argparse.Namespace) -> int:
         return _error("interrupted; operation completion may be unknown", 130, machine)
 
 
-def main(argv: list[str] | None = None) -> int:
-    return run(parser().parse_args(argv))
+def main(argv: list[str] | None = None, *, standalone: bool = False) -> int:
+    return run(parser().parse_args(argv), standalone=standalone)

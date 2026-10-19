@@ -35,6 +35,23 @@ verify = BUILDER_MODULE.verify
 
 
 class MonitorBundleTests(unittest.TestCase):
+    def test_read_only_bundle_uses_base_monitor_without_launch_helpers(self):
+        from strata_cli.monitor_commands import main
+        self.assertIn(b"main(standalone=True)", BUILDER_MODULE.BOOTSTRAP)
+        for standalone in (True, False):
+            with self.subTest(standalone=standalone):
+                base = mock.Mock()
+                launch = mock.Mock()
+                modules = {"strata_cli.monitor": mock.Mock(MonitorApp=base),
+                           "strata_cli.launch.monitor_ext": mock.Mock(LaunchMonitor=launch)}
+                with mock.patch.dict(sys.modules, modules), mock.patch("sys.stdout.isatty", return_value=True):
+                    self.assertEqual(main(["monitor", "--url", "http://127.0.0.1:12345"],
+                                          standalone=standalone), 0)
+                selected, unused = (base, launch) if standalone else (launch, base)
+                selected.assert_called_once()
+                selected.return_value.run.assert_called_once_with()
+                unused.assert_not_called()
+
     @staticmethod
     def _candidate(source: Path, destination: Path) -> Path:
         destination.parent.mkdir()
@@ -65,7 +82,7 @@ class MonitorBundleTests(unittest.TestCase):
                 build(bundle)
             with zipfile.ZipFile(bundle) as archive:
                 self.assertIn(b"MIT License\r\n", archive.read("LICENSE"))
-            self.assertEqual(verify(bundle)["schema_version"], 5)
+            self.assertEqual(verify(bundle)["schema_version"], 6)
 
     def test_update_rollback_and_commit_keep_one_verified_previous_copy(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -290,41 +307,41 @@ class MonitorBundleTests(unittest.TestCase):
             previous = root / "previous-monitor.pyz"
             build(modern)
             old_visual = root / "visual-monitor.pyz"
-            for old_bundle, version in ((current, 1), (previous, 2), (old_visual, 3)):
+            old_detail = root / "detail-monitor.pyz"
+            old_nav = root / "nav-monitor.pyz"
+            for old_bundle, version in ((current, 1), (previous, 2), (old_visual, 3), (old_detail, 4), (old_nav, 5)):
+                members = set(getattr(BUILDER_MODULE, f"MEMBERS_V{version}"))
                 with zipfile.ZipFile(modern) as source, zipfile.ZipFile(old_bundle, "w", zipfile.ZIP_DEFLATED) as legacy:
                     for item in source.infolist():
-                        if item.filename not in ("strata_cli/detail_dashboard.py", "strata_cli/nav.py") and \
-                                (version >= 3 or item.filename != "strata_cli/dashboard.py") and \
-                                (version != 1 or item.filename != "LICENSE"):
+                        if item.filename in members or item.filename == "strata_cli/":
                             legacy.writestr(item, source.read(item.filename))
                 report = json.loads((root / "next-monitor.pyz.manifest.json").read_text())
                 report["schema_version"] = version
                 report["bundle"] = old_bundle.name
                 report["sha256"] = hashlib.sha256(old_bundle.read_bytes()).hexdigest()
-                del report["files"]["strata_cli/detail_dashboard.py"]
-                del report["files"]["strata_cli/nav.py"]
-                if version < 3:
-                    del report["files"]["strata_cli/dashboard.py"]
+                report["files"] = {name: digest for name, digest in report["files"].items() if name in members}
                 if version == 1:
-                    del report["files"]["LICENSE"]
                     for field in ("compatibility", "license", "license_file"):
                         del report[field]
                 old_bundle.with_name(old_bundle.name + ".manifest.json").write_text(json.dumps(report))
             self.assertEqual(verify(current)["schema_version"], 1)
             self.assertEqual(verify(previous)["schema_version"], 2)
             self.assertEqual(verify(old_visual)["schema_version"], 3)
-            self.assertEqual(verify(modern)["schema_version"], 5)
+            self.assertEqual(verify(old_detail)["schema_version"], 4)
+            self.assertEqual(verify(old_nav)["schema_version"], 5)
+            self.assertEqual(verify(modern)["schema_version"], 6)
             with zipfile.ZipFile(modern) as archive:
                 self.assertIn(b"MIT License", archive.read("LICENSE"))
                 self.assertIn(b"render_dashboard", archive.read("strata_cli/dashboard.py"))
                 self.assertIn(b"render_detail_dashboard", archive.read("strata_cli/detail_dashboard.py"))
+                self.assertIn(b"def classic_style", archive.read("strata_cli/consoleinfo.py"))
             target = root / "optional-monitor"
             install(current, target, if_candidate_sha256=verify(current)["sha256"])
             preview = update(modern, target, plan=True)
             self.assertTrue(preview["would_update"])
             self.assertTrue(update(modern, target, if_current_sha256=preview["current_sha256"],
                                    if_candidate_sha256=preview["candidate_sha256"])["updated"])
-            self.assertEqual(verify(target / modern.name)["schema_version"], 5)
+            self.assertEqual(verify(target / modern.name)["schema_version"], 6)
             self.assertEqual(verify(root / "optional-monitor.previous" / current.name)["schema_version"], 1)
             planned = rollback(target, plan=True)
             self.assertTrue(rollback(target, if_active_sha256=planned["active_sha256"],
@@ -336,7 +353,7 @@ class MonitorBundleTests(unittest.TestCase):
             self.assertTrue(update(modern, second_target,
                                    if_current_sha256=preview["current_sha256"],
                                    if_candidate_sha256=preview["candidate_sha256"])["updated"])
-            self.assertEqual(verify(second_target / modern.name)["schema_version"], 5)
+            self.assertEqual(verify(second_target / modern.name)["schema_version"], 6)
             planned = rollback(second_target, plan=True)
             self.assertTrue(rollback(second_target, if_active_sha256=planned["active_sha256"],
                                      if_rollback_sha256=planned["rollback_sha256"])["rolled_back"])
