@@ -1,5 +1,6 @@
 // src/kernels/cpu/pool.cpp - P2.S3: the CPU expert pool.  Read pool.hpp first; it explains the protocol.
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/kernels/cpu/host_profile.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -886,15 +887,33 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
 }
 
 void ExpertPool::run_phase(int mode, int n_tasks) {
+    auto* sink = host_expert_profile();
+    using Clock = std::chrono::steady_clock;
+    const auto stamp = [&] { return sink ? Clock::now() : Clock::time_point{}; };
+    const auto a = stamp();
     wait_parked("before a phase");
+    const auto b = stamp();
     mode_ = mode;
     njobs_ = n_tasks;
     const uint32_t e = begin_batch(n_tasks);
+    const auto c = stamp();
     if (host_works_) drain(-1, host_scratch_, e);
+    const auto d = stamp();
     wait_done(n_tasks);
+    const auto f = stamp();
     wait_parked("after a phase");
+    const auto g = stamp();
     hstate_.store(kIdle, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    const auto end = stamp();
+    if (sink) {
+        const auto ns = [](Clock::duration dt) { return std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count(); };
+        auto& p = sink->phases;
+        ++p.calls;
+        p.total_ns += ns(end-a);
+        p.park_before_ns += ns(b-a); p.publish_ns += ns(c-b); p.host_work_ns += ns(d-c);
+        p.wait_done_ns += ns(f-d); p.park_after_ns += ns(g-f);
+    }
 }
 
 void ExpertPool::run_split(ExpertJob* jobs, int n) {
@@ -958,6 +977,8 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
 
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
+    auto* profile = host_expert_profile();
+    const int64_t phase_before = profile ? profile->phases.total_ns : 0;
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
@@ -974,6 +995,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
                 if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
                 else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
         const auto c = std::chrono::steady_clock::now();
+        if (profile) profile->phases.ff_quant_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(c-b).count();
         mrows_ = (int64_t) nb * f.n_embd;
         mtasks_ = phase_tasks(mrows_);
         run_phase(6, mtasks_);
@@ -984,7 +1006,13 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
     }
     multi_bytes += (int64_t) n * (int64_t) f.bytes;
     mode_ = 0;
-    ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const auto end = std::chrono::steady_clock::now();
+    ms_drain_ += std::chrono::duration<double, std::milli>(end - t0).count();
+    if (profile) {
+        ++profile->phases.native_calls;
+        profile->phases.native_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(end-t0).count();
+        profile->phases.native_phase_ns += profile->phases.total_ns - phase_before;
+    }
 }
 
 void ExpertPool::run(ExpertJob* jobs, int n) {

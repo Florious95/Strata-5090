@@ -261,7 +261,7 @@ class PickSlot(unittest.TestCase):
         e.slot_busy = [True] * 3
         self.assertIsNone(e.pick_slot([7, 8]))
         e.slot_busy = [False] * 3
-        self.assertEqual(e.pick_slot([1, 2, 3]), 1)                 # a held prompt is never the WHOLE prompt
+        self.assertEqual(e.pick_slot([1, 2, 3]), 0)                 # LCP routes the shorter replay; native rewinds safely
 
     def test_a_rewritten_next_turn_goes_to_the_slot_of_its_chat(self):
         # #2518: two chats in two slots; each next turn renders the history again but not the reply it decoded or the

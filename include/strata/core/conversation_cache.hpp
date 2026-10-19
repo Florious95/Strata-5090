@@ -25,6 +25,7 @@ struct ConversationCheckpoint {
     std::vector<ConversationImageKey> imgs;
     std::vector<uint8_t> gdn, ple, tails, dead, block_pos;
     uint64_t used = 0; // upstream root-pinned/LRU checkpoint retention
+    int32_t rope_delta = 0; // RAM snapshot's next text position minus its KV cell
     // A shared-prefix pin (the request key pin=N): this checkpoint is the read-only prefix many suffix queries branch
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
@@ -110,6 +111,7 @@ inline ConversationCheckpointSplit conversation_checkpoints_split(std::vector<Co
         for (size_t k = 0; k < stages; ++k) {
             ConversationCheckpoint part;
             part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned;
+            part.rope_delta = c.rope_delta;
             out.parts[k].push_back(std::move(part));
         }
     }

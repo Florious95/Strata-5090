@@ -226,6 +226,19 @@ class ConversationCacheCard(unittest.TestCase):
             self.assertEqual(c.poll(str(log), log.stat().st_size)["parked"], 0)   # the engine started again
             self.assertEqual(c.poll(None, None)["parked"], 0)
 
+    def test_verbose_trace_gap_does_not_skip_native_cache_events(self):
+        from serve.server import ConvCacheLog
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / 'strata.log'
+            log.write_text(self.PARK + 'batch-round id=1\n' * 256 + self.RESTORE, encoding='utf-8')
+            c = ConvCacheLog()
+            c.READ_MAX = 256
+            state = c.poll(str(log), 0)
+            self.assertEqual((state['parks'], state['restores'], state['parked']), (1, 1, 2))
+            self.assertEqual(c.pos, log.stat().st_size)
+            self.assertEqual(c.poll(str(log), 0), state)
+
     def test_metrics(self):
         tok = ByteTokenizer()
         engine = MockEngine(tok, "Thought.</think>\nHello.", max_context=4096)

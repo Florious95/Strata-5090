@@ -134,6 +134,25 @@ class Lifeline(unittest.TestCase):
         self.assertTrue(self.wait_gone(info["child"]))
 
 
+class PortableIdentity(unittest.TestCase):
+    def test_process_status_changes_do_not_change_identity(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        from serve import lifeline
+        stamp = "Mon Oct 19 13:52:01 2026"
+        for status in ("R", "S", "S+", "Ss"):
+            with mock.patch.object(lifeline.subprocess, "run", return_value=SimpleNamespace(stdout=stamp + " " + status)):
+                self.assertEqual(lifeline._start_token(123), "s:" + stamp)
+
+    def test_zombie_and_missing_process_have_no_identity(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        from serve import lifeline
+        for output in ("", "Mon Oct 19 13:52:01 2026 Z", "Mon Oct 19 13:52:01 2026 Z+"):
+            with mock.patch.object(lifeline.subprocess, "run", return_value=SimpleNamespace(stdout=output)):
+                self.assertEqual(lifeline._start_token(123), "")
+
+
 if __name__ == "__main__":
     unittest.main()
 

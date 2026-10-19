@@ -17,6 +17,7 @@
 #include "strata/core/hit_hook.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/kernels/mrope.hpp"
 
 #include <cuda_runtime.h>
 
@@ -30,6 +31,15 @@ namespace strata::core {
 /// handoff between the GPU and the CPU expert pool.
 struct SessionState {
     int64_t max_cells = 0;
+    // Non-owning, stable per-slot image tables. KV cells remain unshifted; only RoPE
+    // positions change. Past the prompt every text row is cell + this slot's delta.
+    const int32_t* mrope_device = nullptr;
+    const int32_t* mrope_host = nullptr;
+    int64_t rope_tail_start = 0;
+    int32_t rope_delta = 0;
+    int32_t rotary_position(int64_t cell) const {
+        return kernels::mrope_text_position(cell, rope_tail_start, rope_delta, mrope_host);
+    }
 
     GdnBuffers gdn;                 ///< the 36 GDN layers share one set of scratch; their STATE is per layer
     float* gdn_state = nullptr;     ///< (n_gdn_layers, gdn_state_floats)

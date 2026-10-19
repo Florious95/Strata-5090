@@ -950,6 +950,22 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(dequant_wide_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(dequant_wide_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME dequant_wide_parity COMMAND dequant_wide_parity)
+    if(NOT STRATA_HIP_GFX906)
+      # Q5_K/Q6_K wide heads: all 9..12 columns, single/split oracles and replay,
+      # full 2560 x 248320 plus odd row tails; NVIDIA only, no model or fixtures.
+      add_executable(mmvq_k_wide_parity src/kernels/mmvq_k_wide_parity.cpp)
+      target_include_directories(mmvq_k_wide_parity PRIVATE ${_strata_gpu_include_directories})
+      target_link_libraries(mmvq_k_wide_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+      add_test(NAME mmvq_k_wide_parity COMMAND mmvq_k_wide_parity)
+      add_executable(nonfinite_wide_gpu tests/core/nonfinite_wide_gpu.cpp)
+      target_include_directories(nonfinite_wide_gpu PRIVATE include ${_strata_gpu_include_directories})
+      target_link_libraries(nonfinite_wide_gpu PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+      add_test(NAME nonfinite_wide_gpu COMMAND nonfinite_wide_gpu)
+      add_executable(batch_host_profile_test tests/core/batch_host_profile.cpp)
+      target_include_directories(batch_host_profile_test PRIVATE include ${_strata_gpu_include_directories})
+      target_link_libraries(batch_host_profile_test PRIVATE strata_warnings)
+      add_test(NAME batch_host_profile_test COMMAND batch_host_profile_test)
+    endif()
   endif()
   # programmatic dependent launch (pdl.hpp) in a captured verify-shaped chain: bitwise vs ordinary launches over
   # replays with poisoned buffers, and only kernel-to-kernel programmatic edges (GPU, synthetic, no model; the edges
@@ -1219,6 +1235,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
 
   # the QSA top-k the engine dispatches against the original kernel: identical ids on both sides of the register
   # kernel's reach, with tied and with equal scores (synthetic, no model)
+  add_executable(qsa_tile_gpu tests/core/qsa_tile_gpu.cpp)
+  target_include_directories(qsa_tile_gpu PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(qsa_tile_gpu PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME qsa_tile_gpu COMMAND qsa_tile_gpu)
+
+  add_executable(slot_mrope_gpu tests/core/slot_mrope_gpu.cpp)
+  target_include_directories(slot_mrope_gpu PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(slot_mrope_gpu PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME slot_mrope_gpu COMMAND slot_mrope_gpu)
+  set_tests_properties(slot_mrope_gpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
   add_executable(qsa_topk_parity src/kernels/qsa_topk_parity.cpp)
   target_include_directories(qsa_topk_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(qsa_topk_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
@@ -1432,7 +1459,8 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/hadamard.cpp)
+            src/kernels/cpu/host_profile.cpp src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp
+            src/kernels/cpu/hadamard.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
@@ -1475,6 +1503,11 @@ endif()
 set_property(SOURCE src/kernels/cpu/q2_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
 find_package(Threads REQUIRED)
 target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
+if(STRATA_BUILD_TESTS)
+  add_executable(ring_host_profile_test tests/core/ring_host_profile.cpp)
+  target_link_libraries(ring_host_profile_test PRIVATE strata_kernels_cpu)
+  add_test(NAME ring_host_profile_test COMMAND ring_host_profile_test)
+endif()
 
 # ---- plan v0.3 P6: the i-quant models' CPU experts (IQ2_XS / IQ3_XXS files) ----
 #
@@ -2012,6 +2045,12 @@ if(STRATA_NATIVE_EXPERTS)
           set_tests_properties(native_expert_parity_${_name} native_expert_parity_hadamard_${_name} PROPERTIES TIMEOUT 300)
         endforeach()
       endif()
+      add_test(NAME native_expert_parity_wide_iq2_xs
+        COMMAND native_expert_parity --synthetic-wide iq2_xs/iq4_nl)
+      set_tests_properties(native_expert_parity_wide_iq2_xs PROPERTIES TIMEOUT 120)
+      add_test(NAME native_expert_parity_wide_iq2_xs_q2_0
+        COMMAND native_expert_parity --synthetic-wide iq2_xs/q2_0)
+      set_tests_properties(native_expert_parity_wide_iq2_xs_q2_0 PROPERTIES TIMEOUT 120)
       # #290: the BF16 token embedding (--embd-gguf) gathered and dequantized bit for bit
       add_test(NAME native_expert_parity_bf16_embd COMMAND native_expert_parity --bf16-embd)
     endif()
@@ -2150,6 +2189,25 @@ endif()
 
 if(STRATA_BUILD_TESTS)
   enable_testing()
+  add_executable(slot_mrope_cpu tests/core/slot_mrope_cpu.cpp)
+  target_include_directories(slot_mrope_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME slot_mrope_cpu COMMAND slot_mrope_cpu)
+  add_executable(nonfinite_wide_mask tests/core/nonfinite_wide_mask.cpp)
+  target_include_directories(nonfinite_wide_mask PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME nonfinite_wide_mask COMMAND nonfinite_wide_mask)
+  add_executable(qsa_tile_guard tests/core/qsa_tile_guard.cpp)
+  target_include_directories(qsa_tile_guard PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME qsa_tile_guard COMMAND qsa_tile_guard)
+
+  add_executable(batch_segments_test tests/batch_segments.cpp)
+  target_include_directories(batch_segments_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME batch_segments_test COMMAND batch_segments_test)
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+    add_executable(batch_segment_gdn_test tests/batch_segment_gdn.cpp)
+    target_link_libraries(batch_segment_gdn_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME batch_segment_gdn_test COMMAND batch_segment_gdn_test)
+    set_tests_properties(batch_segment_gdn_test PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
   # Model-level checks may be absent from source distributions.
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
     add_subdirectory(tests)
