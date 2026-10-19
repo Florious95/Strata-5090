@@ -134,6 +134,31 @@ class Lifeline(unittest.TestCase):
         self.assertTrue(self.wait_gone(info["child"]))
 
 
+@unittest.skipUnless(POSIX, "asynchronous shell/nohup dispositions are POSIX")
+class StopDispositions(unittest.TestCase):
+    def test_inherited_ignored_sigint_is_restored_but_nohup_is_preserved(self):
+        from unittest import mock
+        from serve import lifeline
+        def disposition(sig):
+            return signal.SIG_IGN if sig in (signal.SIGINT, signal.SIGHUP) else signal.SIG_DFL
+        with mock.patch.object(lifeline.os, 'name', 'posix'), \
+                mock.patch.object(lifeline.signal, 'getsignal', side_effect=disposition), \
+                mock.patch.object(lifeline.signal, 'signal') as install:
+            lifeline.install_stop_handlers(lambda reason: None)
+        install.assert_any_call(signal.SIGINT, signal.default_int_handler)
+        self.assertFalse(any(call.args[0] == signal.SIGHUP for call in install.call_args_list))
+
+    def test_existing_custom_sigint_handler_is_not_replaced(self):
+        from unittest import mock
+        from serve import lifeline
+        custom = lambda signum, frame: None
+        with mock.patch.object(lifeline.os, 'name', 'posix'), \
+                mock.patch.object(lifeline.signal, 'getsignal', return_value=custom), \
+                mock.patch.object(lifeline.signal, 'signal') as install:
+            lifeline.install_stop_handlers(lambda reason: None)
+        self.assertFalse(any(call.args[0] == signal.SIGINT for call in install.call_args_list))
+
+
 class PortableIdentity(unittest.TestCase):
     def test_process_status_changes_do_not_change_identity(self):
         from types import SimpleNamespace

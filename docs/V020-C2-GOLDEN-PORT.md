@@ -49,6 +49,14 @@ Additional semantic fixes (not just marker deletion):
 - The upstream portable lifeline watcher included changing process status in its
   identity token. Excluding R/S/status flags while rejecting zombies restores
   kill-parent cleanup on macOS. Physical child-process and identity tests cover it.
+- A fatal-stack diagnostic proved the runtime smoke's apparent shutdown hang was
+  a live main loop, not a drain deadlock: background-shell children inherited
+  ignored SIGINT. Restore Python's default SIGINT handler only for that ignored
+  disposition, retain custom handlers and nohup's ignored SIGHUP. No timeout was
+  relaxed; the asynchronous physical foreground test covers stop/exit130.
+- The sampler leak test now tracks its own bound-loop thread and joins/asserts
+  that exact thread's exit; unrelated samplers ending can no longer invalidate
+  a process-global thread-name count. The leak requirement is retained.
 - The release's no-site CLI smoke expected a missing-profile event although the
   new dependency preflight runs first. It now verifies that actual actionable
   exit5 refusal. Runtime smoke accounting accepts platform skips but counts only
@@ -83,7 +91,9 @@ Additional semantic fixes (not just marker deletion):
 Use pinned requirements and Python 3.12. Full server discovery, helper contracts
 (Release + ASan/UBSan), portable host CTest targets, analyzer/tokenizer contracts,
 and mocked Linux NVFP4 setup tests are recorded separately in the delivery receipt.
-Controller results: server **944 tests / 929 pass / 15 skip / exit0**; six helper
+First green controller discovery: server **944 tests / 929 pass / 15 skip / exit0**;
+two stop-disposition regressions were subsequently added (final rerun is bound
+in the delivery receipt). Six helper
 programs each compile/run in Release and ASan/UBSan; portable CTest **17/17**;
 selected analyzer/tokenizer contracts **45 / 42 pass / 3 skip** plus four
 skip-accounting regressions; Linux-platform
