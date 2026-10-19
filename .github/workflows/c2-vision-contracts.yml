@@ -1,0 +1,56 @@
+name: C2 vision CPU contracts
+on:
+  pull_request:
+    paths:
+      - 'include/strata/core/**'
+      - 'include/strata/kernels/mrope.hpp'
+      - 'src/core/**'
+      - 'src/program/generate.cpp'
+      - 'tests/core/slot_mrope*'
+      - 'tests/core/batch_*'
+      - 'tests/program/prefill_plan_test.cpp'
+      - 'include/strata/program/prefill_plan.hpp'
+      - 'src/kernels/cpu/pool_plan_test.cpp'
+      - 'include/strata/kernels/cpu/pool_plan.hpp'
+      - 'serve/**'
+      - 'tools/*minimal*'
+      - '.github/workflows/c2-vision-contracts.yml'
+  workflow_dispatch:
+jobs:
+  cpu-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Pinned server test dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Production position helper and pointer scopes
+        run: |
+          c++ -std=c++20 -O2 -Iinclude tests/core/slot_mrope_cpu.cpp -o /tmp/slot_mrope_cpu
+          /tmp/slot_mrope_cpu
+          c++ -std=c++20 -O1 -g -fsanitize=address,undefined -Iinclude tests/core/slot_mrope_cpu.cpp -o /tmp/slot_mrope_sanitize
+          /tmp/slot_mrope_sanitize
+      - name: Planner, scheduling and wide scratch CPU contracts
+        run: |
+          for source in tests/core/batch_scratch_cpu.cpp tests/core/batch_rows_test.cpp tests/program/prefill_plan_test.cpp src/kernels/cpu/pool_plan_test.cpp src/core/batch_telemetry_test.cpp; do
+            name=$(basename "$source" .cpp)
+            c++ -std=c++20 -O2 -Iinclude "$source" -o "/tmp/$name"
+            "/tmp/$name"
+            c++ -std=c++20 -O1 -g -fsanitize=address,undefined -Iinclude "$source" -o "/tmp/$name-sanitize"
+            "/tmp/$name-sanitize"
+          done
+      - name: Disk format golden and refusal contracts
+        run: |
+          c++ -std=c++20 -O2 -Iinclude src/core/conversation_file_test.cpp src/core/conversation_file.cpp -o /tmp/conversation_file_test
+          /tmp/conversation_file_test
+      - name: Server protocol regressions (mock CPU, not native GPU)
+        run: python -m unittest discover -s serve -p 'test_*.py'
+      - name: NVFP4 setup format and asset policy (local mocked files, no downloads)
+        run: python -m unittest tools.test_setup_nvfp4
+      - name: Gold analyzers and tokenizer CPU contracts
+        env:
+          PYTHONPATH: tools:.
+        run: python -m unittest tools.test_batch_host_profile tools.test_batch_qsa_tile tools.test_batch_ring_profile tools.test_pool_plan tools.test_effort_end_args tools.test_tokenizer_plain_spans tools.test_strata_tokenizer tools.test_minimal_server_smoke

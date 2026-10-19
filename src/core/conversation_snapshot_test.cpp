@@ -193,6 +193,37 @@ void full_session(int fmt, int mode, int experts) {
           restored.live.dead==a.live.dead && restored.live.block_pos==a.live.block_pos &&
           equal(restored.kv[0],a.kv[0]) && equal(restored.kv[1],a.kv[1]),"whole-session A/B/A exactness including spare key");
     check(ss.ple_prev[0]==64 && ss.ple_prev[1]==65,"PLE token window reconstructed");
+    {
+        // a borrowed prefix (ConversationCache::borrows): the K/V of A's first tokens and A's checkpoint there, A
+        // untouched - the same bytes as restoring A whole and rewinding to that checkpoint
+        const int64_t at = (int64_t) a.checkpoints[0].ids.size();
+        check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore A whole");
+        check(conversation_checkpoint_restore(a.checkpoints[0],ss,g,err),"rewind it to its checkpoint");
+        ConversationKv want_main,want_draft,got_main,got_draft;
+        ConversationCheckpoint want_state,got_state;
+        want_state.ids=got_state.ids=a.checkpoints[0].ids;
+        check(conversation_kv_save(want_main,main.state,g,at,true,err) &&
+              conversation_kv_save(want_draft,draft.state,g,at,false,err) &&
+              conversation_checkpoint_save(want_state,ss,g,err),"capture the rewound prefix");
+        fill(201);   // another conversation in the session
+        const SavedConversation untouched=a;
+        check(conversation_snapshot_restore_prefix(a,(int64_t)a.live.ids.size()+1,ss,g,draft.state,err)==
+                  ConversationRestore::invalid &&
+              conversation_snapshot_restore_prefix(a,0,ss,g,draft.state,err)==ConversationRestore::invalid,
+              "a prefix outside the image is refused");
+        check(conversation_snapshot_restore_prefix(a,at,ss,g,draft.state,err)==ConversationRestore::restored,
+              "restore A's prefix only");
+        check(conversation_checkpoint_restore(a.checkpoints[0],ss,g,err),"mount the checkpoint over it");
+        check(conversation_kv_save(got_main,main.state,g,at,true,err) &&
+              conversation_kv_save(got_draft,draft.state,g,at,false,err) &&
+              conversation_checkpoint_save(got_state,ss,g,err),"capture the borrowed prefix");
+        check(equal(got_main,want_main) && equal(got_draft,want_draft),
+              "borrowed K/V equals the whole restore's prefix");
+        check(got_state.gdn==want_state.gdn && got_state.ple==want_state.ple && got_state.tails==want_state.tails &&
+              got_state.dead==want_state.dead && got_state.block_pos==want_state.block_pos,"the same running state");
+        check(untouched.live.ids==a.live.ids && equal(untouched.kv[0],a.kv[0]) && equal(untouched.kv[1],a.kv[1]),
+              "the parked image is unchanged");
+    }
     for (int64_t dirty : {65, 3, 0}) {
         check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore growth fixture base");
         ConversationKvReuse reuse{a.kv,65,dirty};
@@ -268,6 +299,22 @@ void full_session(int fmt, int mode, int experts) {
     cuda_check(cudaMemcpy(spare.data(),main.state.idx_pooled,sizes.dead,cudaMemcpyDeviceToHost));
     check(spare==a.checkpoints[0].dead,"checkpoint rebuilds spare row over a later completed block");
     check(ss.ple_prev[0]==2 && ss.ple_prev[1]==3,"checkpoint PLE token window");
+    auto rotary_cp=a.checkpoints[0]; rotary_cp.rope_delta=-3;
+    check(conversation_checkpoint_restore(rotary_cp,ss,g,err) && ss.rope_delta==-3,
+          "per-slot rotary offset restored with running state");
+    SavedConversation rotary_image;
+    check(conversation_snapshot_save(rotary_image,view,ss,g,draft.state,err) && rotary_image.live.rope_delta==-3,
+          "RAM snapshot retains rotary offset");
+    ss.rope_delta=0;
+    check(conversation_snapshot_restore(rotary_image,ss,g,draft.state,err)==ConversationRestore::restored && ss.rope_delta==-3,
+          "RAM round trip restores rotary offset");
+    rotary_cp.rope_delta=1;
+    check(!conversation_checkpoint_restore(rotary_cp,ss,g,err) && ss.rope_delta==-3,"positive offset rejected without mutation");
+    rotary_cp.rope_delta=-100;
+    check(!conversation_checkpoint_restore(rotary_cp,ss,g,err) && ss.rope_delta==-3,"offset beyond prefix rejected without mutation");
+    SessionFileIdentity rotary_id; size_t rotary_bytes=0;
+    check(!session_file_write("must-not-create-rotary-session",rotary_image,rotary_id,rotary_bytes,err) &&
+          err.find("rotary offsets")!=std::string::npos,"disk schema refuses dropping multimodal offset");
 }
 }
 
