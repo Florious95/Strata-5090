@@ -81,11 +81,15 @@ def smoke() -> dict:
 
     with tempfile.TemporaryDirectory(prefix="strata-minimal-cli-") as directory:
         missing = str(Path(directory) / "missing-config.json")
-        serve = _record(_run(str(ROOT / "strata.py"), "serve", "--profile", missing,
-                             "--offline", "--output", "jsonl"), 5)
-        if (serve.get("event") != "failed" or serve.get("exit_code") != 5 or
-                "cannot read run config" not in (serve.get("error") or {}).get("message", "")):
-            raise RuntimeError("missing run config did not fail before server startup")
+        # The release's entry-point dependency preflight precedes CLI/profile
+        # loading. With -S, prove its actionable refusal, not an unreachable
+        # missing-profile JSON event. Runtime-only CI covers profile validation.
+        serve = _run(str(ROOT / "strata.py"), "serve", "--profile", missing,
+                     "--offline", "--output", "jsonl")
+        if (serve.returncode != 5 or serve.stdout.strip() or
+                "missing packages the API server needs:" not in serve.stderr or
+                "python -m pip install -r requirements.txt" not in serve.stderr):
+            raise RuntimeError("missing runtime dependencies did not fail before server startup")
         code = _record(_run(str(ROOT / "strata.py"), "code", "run", "--prompt-file",
                             str(Path(directory) / "missing-prompt.txt"), "--policy", "review",
                             "--output", "jsonl"), 5)
@@ -98,7 +102,7 @@ def smoke() -> dict:
             "platform": platform.platform(), "python": platform.python_version(),
             "optional_packages_visible": {"rich": False, "textual": False},
             "commands": ["--help", "status --json", "monitor --once --output json",
-                         "serve --offline --output jsonl (missing config)",
+                         "serve --offline --output jsonl (missing runtime dependencies)",
                          "code run --output jsonl (missing harness)"],
             "telemetry_gets": len(paths), "non_gets": 0,
             "actual_engine_started": False, "passed": True}

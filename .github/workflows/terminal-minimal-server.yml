@@ -55,9 +55,10 @@ jobs:
 
           report = Path(os.environ['RUNNER_TEMP']) / 'minimal-server-smoke.json'
           python = str(Path(os.environ['RUNNER_TEMP']) / 'strata-runtime-venv' / 'bin' / 'python')
-          subprocess.run([python, 'tools/minimal_server_smoke.py',
-                          '--report', str(report)], check=True)
+          result = subprocess.run([python, 'tools/minimal_server_smoke.py',
+                                   '--report', str(report)], check=False)
           print(report.read_text())
+          result.check_returncode()
           PY
       - name: Run full server suite without terminal packages
         shell: bash

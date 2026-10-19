@@ -13,6 +13,7 @@ on:
       - 'src/kernels/cpu/pool_plan_test.cpp'
       - 'include/strata/kernels/cpu/pool_plan.hpp'
       - 'serve/**'
+      - 'tools/*minimal*'
       - '.github/workflows/c2-vision-contracts.yml'
   workflow_dispatch:
 jobs:
@@ -52,4 +53,4 @@ jobs:
       - name: Gold analyzers and tokenizer CPU contracts
         env:
           PYTHONPATH: tools:.
-        run: python -m unittest tools.test_batch_host_profile tools.test_batch_qsa_tile tools.test_batch_ring_profile tools.test_pool_plan tools.test_effort_end_args tools.test_tokenizer_plain_spans tools.test_strata_tokenizer
+        run: python -m unittest tools.test_batch_host_profile tools.test_batch_qsa_tile tools.test_batch_ring_profile tools.test_pool_plan tools.test_effort_end_args tools.test_tokenizer_plain_spans tools.test_strata_tokenizer tools.test_minimal_server_smoke

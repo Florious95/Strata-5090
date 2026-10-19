@@ -49,6 +49,11 @@ Additional semantic fixes (not just marker deletion):
 - The upstream portable lifeline watcher included changing process status in its
   identity token. Excluding R/S/status flags while rejecting zombies restores
   kill-parent cleanup on macOS. Physical child-process and identity tests cover it.
+- The release's no-site CLI smoke expected a missing-profile event although the
+  new dependency preflight runs first. It now verifies that actual actionable
+  exit5 refusal. Runtime smoke accounting accepts platform skips but counts only
+  executed passes toward its minimum; regression tests reject skip inflation and
+  nonzero exits. These changes do not change serving behavior.
 - Vision argument tests stub the spawn boundary instead of starting a real
   watcher around a fake process without a PID. The lease-failure test explicitly
   selects `fit_max_tokens=False`, preserving upstream's new default cap fitting.
@@ -80,7 +85,8 @@ Use pinned requirements and Python 3.12. Full server discovery, helper contracts
 and mocked Linux NVFP4 setup tests are recorded separately in the delivery receipt.
 Controller results: server **944 tests / 929 pass / 15 skip / exit0**; six helper
 programs each compile/run in Release and ASan/UBSan; portable CTest **17/17**;
-selected analyzer/tokenizer contracts **45 / 42 pass / 3 skip**; Linux-platform
+selected analyzer/tokenizer contracts **45 / 42 pass / 3 skip** plus four
+skip-accounting regressions; Linux-platform
 mocked NVFP4 setup **21/21**. The 43-test red-to-green subset also passes (one
 platform skip). Skipped tokenizer/SDK tests are not passes. The initial red log
 (939 tests, four failures/one error) is retained with the corrections above.
