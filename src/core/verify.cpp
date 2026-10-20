@@ -1287,7 +1287,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 err = std::string("verify shared expert: ") + e.what();
                 return false;
             }
-            if (sh_fork) cudaEventRecord(ev_join_, sh_cs_);
+            if (sh_fork) {
+                const auto ce = cudaEventRecord(ev_join_, sh_stream);
+                if (ce != cudaSuccess) {
+                    err = std::string("verify shared expert join record: ") + cudaGetErrorString(ce);
+                    return false;
+                }
+            }
         }
         if (strata::kernels::cpu::expert_layout().native) {
             // Shared experts read unrotated rows first. APR routed experts alone
@@ -2106,12 +2112,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return !e || e[0] != '0';
         }();
         const bool sh_fork = sh_stream_on() && !parallel && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr;
-        const bool sh_fork_late = sh_fork && sh_fork_late_env && !ar_on();
+        // Merged windows skip the late-fork site below: join the shared stream
+        // to this capture early, including a one-row table window (G == 1).
+        const bool sh_fork_late = sh_fork && shared_expert_fork_late(sh_fork_late_env, ar_on(), merged);
         cudaStream_t sh_stream = sh_fork ? sh_cs_ : cs;
-        if (sh_fork && !sh_fork_late) {
-            cudaEventRecord(ev_fork_, cs);
-            cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
-        }
+        if (sh_fork && !sh_fork_late && !branch(ev_fork_, cs, sh_cs_, "fork the shared expert early"))
+            return false;
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
@@ -2188,10 +2194,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 doorbell_publish_res(xm, ids_ + tb * K, layer_res, (int) g.n_expert, (int64_t) n * N, (int64_t) n * K,
                                      m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
             }
-            if (sh_fork_late) {
-                cudaEventRecord(ev_fork_, cs);
-                cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
-            }
+            if (sh_fork_late && !branch(ev_fork_, cs, sh_cs_, "fork the shared expert after publication"))
+                return false;
         }
         stamp(l, 17, grp);
         if (shared_after_ring) {
@@ -2311,7 +2315,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // Same condition as `sh_fork` above, which is per group and out of scope here: wait only when the fork
         // actually ran (a wait on an event never recorded is a no-op, but saying it outright reads better).
         if (sh_stream_on() && !parallel && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
-            cudaStreamWaitEvent(cs, ev_join_, 0);
+            const auto ce = cudaStreamWaitEvent(cs, ev_join_, 0);
+            if (ce != cudaSuccess) {
+                err = std::string("verify shared expert join wait: ") + cudaGetErrorString(ce);
+                return false;
+            }
         }
         if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
             try {

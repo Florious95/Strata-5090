@@ -66,6 +66,16 @@ DeviceWindow window(const std::vector<int>& owners,const std::vector<int>& width
 uint64_t recurrence(uint64_t state,int row) { return state*31+uint64_t(row+1); }
 }
 int main() {
+    // A shared stream must fork before its work is captured. Merged windows
+    // skip the non-merged late-doorbell site, so they must always fork early.
+    for (bool requested : {false,true}) for (bool resident : {false,true}) for (bool merged : {false,true}) {
+        const bool late=shared_expert_fork_late(requested,resident,merged);
+        CHECK(late == (requested && !resident && !merged));
+        CHECK(!late || !merged); // the only late-fork site must actually run
+        const bool early_fork=!late, doorbell_fork=late && !merged;
+        CHECK(early_fork != doorbell_fork); // exactly one fork before shared work
+        if (!merged) CHECK(late == (requested && !resident)); // preserve legacy policy
+    }
     // Writer capability must come from mutable canonical storage, never from an
     // attention reader by stripping const. Publishing a reader only adds const.
     static_assert(std::is_same_v<decltype(DeviceQsaSlot{}.pools.k_q4), uint8_t*>);

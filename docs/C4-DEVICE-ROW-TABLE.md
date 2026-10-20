@@ -33,6 +33,10 @@ The old arithmetic bodies serve the legacy and table entries. GDN commit accepts
 
 Device descriptor failures make a consumed window fatal before output collection/commit publication. There is no legacy retry of partially executed work.
 
+## Merged shared-stream capture boundary
+
+The merged controller publishes its complete expert window outside the per-group routing branch. Therefore it must not select the legacy late shared-expert fork: that fork is emitted only by the non-merged publication path. In a one-row table window with shared streaming enabled, skipping the early fork would leave the shared stream outside capture; joining its event can invalidate capture, with the later MoE combine reporting only the previous error. Merged windows now take the existing early-fork path. Non-merged late/early policy and all arithmetic bodies are unchanged. Shared join record/wait failures are checked at their source instead of surfacing at combine. A CPU policy regression covers all eight requested-late / effective-all-resident / merged combinations; native full-model capture is still a separate gate.
+
 ## WindowAuditV1 additions
 
 Existing route integers, scopes, lifecycle, HTTP slot/generation identity and resolver categories are unchanged. Additions:
