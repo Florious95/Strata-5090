@@ -3978,7 +3978,7 @@ void Verifier::reserve_solo_graph(int T) {
         ++count;
         if (solo_used_[b][v][t] < oldest) { oldest = solo_used_[b][v][t]; ob = b; ov = v; ot = t; }
     }
-    if (count >= std::clamp<size_t>(batch_graph_limit_, 1, 4) && ob >= 0) {
+    if (count >= slot_solo_graph_limit(batch_graph_limit_) && ob >= 0) {
         cudaGraphExecDestroy(graph(ob, ov, ot));
         graph(ob, ov, ot) = nullptr;
         solo_used_[ob][ov][ot] = 0;
@@ -4040,7 +4040,7 @@ Verifier::ScopedSoloBinding::~ScopedSoloBinding() {
 bool Verifier::prewarm_slot_solo(int T, std::string& err) {
     if (T < 1 || T > solo_commit_rows(max_t_)) { err = "slot solo: invalid prewarm width"; return false; }
     // One maximum-width target per owner, not every owner x width x variant.
-    // Subsequent shapes share a global <=4-target LRU. All static runtime setters
+    // Subsequent shapes share a global <=8-target LRU. All static runtime setters
     // must be complete before this READY-time capture. No target graph is run.
     for (int b = 0; b < 4; ++b) {
         ScopedSoloBinding binding(*this, b, err);

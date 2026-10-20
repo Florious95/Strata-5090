@@ -111,7 +111,7 @@ Audited native `DONE` appends `slot_id=N request_generation=G`. HTTP final `timi
 
 `STRATA_BATCH_SLOT_SOLO=1` is a separate default-off C4 experiment; see [C4-SLOT-SOLO.md](C4-SLOT-SOLO.md) for limits and graph ownership. Existing V1 event kinds, sequence rules, scopes, integer fields, HTTP identities and lifecycle are unchanged.
 
-Header `capabilities` additionally exports `slot_solo:bool`, `row_table:false`, `slot_solo_target_graph_limit:int` (0 OFF; 1..4 ON), and `slot_solo_commit_graph_limit:int` (0 OFF; 4 ON). These bound executable counts, not MiB.
+Header `capabilities` additionally exports `slot_solo:bool`, `row_table:false`, `slot_solo_target_graph_limit:int` (0 OFF; 1..8 ON, configured default 4), and `slot_solo_commit_graph_limit:int` (0 OFF; 4 ON). These bound executable counts, not MiB.
 
 Every native target window adds `dispatch.execution_path:string` (`legacy|slot_solo`), `graph_key_kind:string` (`legacy_layout|slot_solo`), `graph_key_rows:int` (actual rows), `graph_owner_slot:int` (Solo native owner; legacy -1), and `graph_address_epoch:uint64` (Solo owner-address/static-profile epoch >=1; legacy 0). A request generation does not change the address epoch. This is **not** a rows-only graph ABI. On Solo, all active/scheduled/row owners must be that owner, capacity stays four slots/12 scratch rows, and actual target width is <=8. Batched optimization flags are not set by capability alone; Solo reports its own captured head/attention/resolve metadata.
 

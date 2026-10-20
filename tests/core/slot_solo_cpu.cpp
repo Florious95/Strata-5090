@@ -21,6 +21,9 @@ int main() {
     require(parse_slot_solo("1", enabled) && enabled, "one is enabled");
     for (const char* invalid : {"", "true", "false", "01", "11", "1 ", "-1", "2"})
         require(!parse_slot_solo(invalid, enabled), "strict flag parsing");
+    for (std::size_t configured : {0u, 1u, 2u, 4u, 5u, 6u, 7u, 8u, 64u})
+        require(slot_solo_graph_limit(configured) == (configured < 1 ? 1 : configured > 8 ? 8 : configured),
+                "configured Solo limit reaches eight without changing default four");
     for (int slots : {1, 2, 4, 8}) for (int stride : {8, 12, 16})
         for (int active = 0; active <= slots; ++active) for (int owner = -1; owner <= slots; ++owner)
             for (int rows = 0; rows <= 16; ++rows) for (bool images : {false, true}) for (bool prefilling : {false, true}) {

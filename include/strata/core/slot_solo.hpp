@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstddef>
 #include <utility>
 
 namespace strata::core {
@@ -9,6 +10,12 @@ namespace strata::core {
 inline bool parse_slot_solo(const char* text, bool& enabled) {
     enabled = text && text[0] == '1' && text[1] == '\0';
     return !text || ((text[0] == '0' || text[0] == '1') && text[1] == '\0');
+}
+
+// Explicit GRAPH_LIMIT=8 must reach the Solo LRU as well as the legacy one.
+// Keep the configured default (4); cap explicit exploration at eight targets.
+inline constexpr std::size_t slot_solo_graph_limit(std::size_t limit) {
+    return std::clamp<std::size_t>(limit, 1, 8);
 }
 
 // Logical commit width is not the verifier's per-layer physical row stride.

@@ -9115,7 +9115,7 @@ int main(int argc, char** argv) {
             c.max_context = o.max_context; c.resident_requested = o.kv_resident;
             c.generalized = generalized; c.canonical = o.batch_slot_only; c.segmented = batch_fast;
             c.slot_solo = slot_solo;
-            c.solo_graph_limit = slot_solo ? std::clamp(batch_graph_limit, 1, 4) : 0;
+            c.solo_graph_limit = slot_solo ? (int) strata::core::slot_solo_graph_limit((size_t) batch_graph_limit) : 0;
             c.engine_version = STRATA_VERSION;
 #ifdef STRATA_SOURCE_SHA
             c.source_sha = STRATA_SOURCE_SHA;
@@ -10984,7 +10984,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata slot solo: prewarm failed: %s\n", err.c_str()); return 1;
             }
             std::fprintf(stderr, "strata slot solo: READY prewarm target_limit=%zu commit_limit=4 free_before=%llu free_after=%llu retained_bytes=%llu\n",
-                         std::clamp<size_t>((size_t)batch_graph_limit, 1, 4), (unsigned long long)before,
+                         strata::core::slot_solo_graph_limit((size_t)batch_graph_limit), (unsigned long long)before,
                          (unsigned long long)after, (unsigned long long)(before > after ? before - after : 0));
             if (after < (size_t)512 * 1024 * 1024) {
                 std::fprintf(stderr, "strata slot solo: less than 512 MiB after graph prewarm; raise --vram-reserve-mib\n");

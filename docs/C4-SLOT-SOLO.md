@@ -19,7 +19,7 @@ Use the **same accepted C4 configuration and same binary** for OFF/ON; change on
 
 ## Graph memory
 
-After all static setters and before INFO/READY, ON captures one maximum-width target and one commit per owner; it does not execute target graphs or warm every shape/variant. Subsequent on-demand target shapes and both residency variants share a global Solo LRU of `min(max(STRATA_BATCH_GRAPH_LIMIT,1),4)` target executables. Up to four owner commit graphs are additional. The existing legacy layout LRU is separate. These are **graph counts, not a guaranteed MiB budget**; there are no extra target sessions/KV/weights/scratch arenas.
+After all static setters and before INFO/READY, ON captures one maximum-width target and one commit per owner; it does not execute target graphs or warm every shape/variant. Subsequent on-demand target shapes and both residency variants share a global Solo LRU of `min(max(STRATA_BATCH_GRAPH_LIMIT,1),8)` target executables. The existing configured default remains four; an explicit limit of eight now retains eight rather than being silently truncated to four. Up to four owner commit graphs are additional. The existing legacy layout LRU is separate. These are **graph counts, not a guaranteed MiB budget**; there are no extra target sessions/KV/weights/scratch arenas.
 
 Startup logs actual prewarm free-before/free-after/retained-byte delta and refuses READY below 512 MiB. It does not silently lower expert capacity. Bench must qualify the entire dynamic-layout campaign with its >=300 MiB watchdog; a successful prewarm does not prove future driver allocation peaks are safe. Both arms retain identical reserve/cache capacity for attribution. Trace diagnosis and trace-free performance remain separate.
 
