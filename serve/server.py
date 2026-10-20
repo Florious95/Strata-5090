@@ -1108,7 +1108,12 @@ class StrataEngine:
         asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
         self.batch = int(self.info.get("batch_slots") or 0)
         slot_only = bool(int(self.info.get("slot_only") or 0))
-        if ("--batch-slot-only" in args) != slot_only or (slot_only and self.batch != 2):
+        canonical = bool(int(self.info.get("canonical_slots", self.info.get("slot_only")) or 0))
+        generalized = bool(int(self.info.get("batch_generalized") or 0))
+        asked_generalized = (env or {}).get("STRATA_BATCH_GENERALIZED", os.environ.get("STRATA_BATCH_GENERALIZED", "0")) == "1"
+        if (("--batch-slot-only" in args) != slot_only or (slot_only and self.batch != 2) or
+                (canonical and self.batch not in (2, 4, 8)) or (generalized and not canonical) or
+                generalized != asked_generalized):
             self.ended = True
             self.proc.kill()  # this constructor's own incompatible backend, never an unknown GPU process
             self.proc.wait(timeout=5)
@@ -1333,11 +1338,16 @@ class StrataEngine:
             self.last.update(offloaded=int(f[15]))
         for tok in f[16:]:                                # key=value fields after the positional ones (the prompt's
             key, eq, value = tok.partition("=")           # first chunk and its streamed expert blobs)
-            if eq and key in ("chunk", "experts_streamed"):
+            if eq and key in ("chunk", "experts_streamed", "slot_id", "request_generation"):
                 try:
                     self.last[key] = int(value)
                 except ValueError:
                     pass
+        if self.last.get("slot_id", -1) >= 0 and self.last.get("request_generation", 0) > 0:
+            self.last["slot_generations"] = [{k: self.last[k] for k in ("slot_id", "request_generation")}]
+        else:
+            self.last.pop("slot_id", None)
+            self.last.pop("request_generation", None)
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
@@ -1735,12 +1745,17 @@ class StrataEngine:
     SOLO_AGAIN_MAX = 2      # how often a request left alone in a slot goes back to the solo path
     SOLO_AGAIN_MIN_LEFT = 32  # ... only with at least this many tokens still allowed (max_tokens)
 
+    def _requires_slot_admission(self) -> bool:
+        info = self.info or {}
+        return bool(int(info.get("canonical_slots", info.get("slot_only")) or 0) or
+                    int(info.get("batch_window_audit") or 0))
+
     def _may_go_solo(self, left: int, times: int, embeddings) -> bool:
         """A request decoding in a slot that is alone now (no other slot busy, nobody waiting) goes back to the solo
         path with its MTP drafts: the engine continues it from the slot's sessions (its slot cache; INFO
         slot_cache=1).  STRATA_PARALLEL_SOLO=0 keeps it in the slot."""
         if (embeddings or times >= self.SOLO_AGAIN_MAX or left < self.SOLO_AGAIN_MIN_LEFT or
-                not (self.info or {}).get("slot_cache") or int((self.info or {}).get("slot_only") or 0) or
+                not (self.info or {}).get("slot_cache") or self._requires_slot_admission() or
                 os.environ.get("STRATA_PARALLEL_SOLO") == "0"):
             return False
         with self.slot_cv:
@@ -1768,6 +1783,7 @@ class StrataEngine:
         out: list[int] = []
         pending: list[int] = []
         clock, clock_before = _TokenGaps(), self.last
+        native_legs = []  # native slot/generation identities, including BYIELD/retry legs of this HTTP request
         prompt, left = list(ids), int(max_new)
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
@@ -1790,7 +1806,7 @@ class StrataEngine:
                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
-                if alone and left > 1 and not int((self.info or {}).get("slot_only") or 0):
+                if alone and left > 1 and not self._requires_slot_admission():
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     self._last_done = None                  # (#879: this request's DONE decides below)
                     deadline = getattr(cancel, "_strata_queue_deadline", None)
@@ -1979,6 +1995,7 @@ class StrataEngine:
                         self._park_slot(slot)
                         slot = None
                         continue
+                    native_legs = merge_slot_generations(native_legs, (self.last or {}).get("slot_generations", []))
                     cont = bool(self._ctl_result and self._ctl_result[1])
                     phase = "slot" if cont else "none"
                     while pending:
@@ -2106,7 +2123,9 @@ class StrataEngine:
             if carry and isinstance(self.last, dict):
                 self.last = add_carry(carry, self.last)
             if self.last is not clock_before and isinstance(self.last, dict):
-                self.last = {**self.last, **clock.receipt()}
+                native_legs = merge_slot_generations(native_legs, self.last.get("slot_generations", []))
+                identity = {**native_legs[-1], "slot_generations": native_legs} if native_legs else {}
+                self.last = {**self.last, **clock.receipt(), **identity}
             if holding:
                 self.ctl.release()
             if admit_wait:
@@ -2174,8 +2193,14 @@ class StrataEngine:
         # An intact canonical prefix can be resumed without a checkpoint rewind; prefer it in a tie.
         best = max(free, key=lambda b: (prefixes[b],
                    0 < len(self.slot_held[b]) < len(prompt) and prefixes[b] == len(self.slot_held[b])))
-        # Preserve the group-balancing threshold; cache affinity never reserves a busy slot.
-        if prefixes[best] >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
+        # The opt-in streaming experiment must seed unused owners before reusing a
+        # tiny shared chat header. Keep meaningful LCP affinity (including rewritten
+        # 29K tails); apply this identically to the audited OFF and ON arms.
+        seed_empty = (any(not self.slot_held[b] for b in free) and
+                      any((getattr(self, "info", None) or {}).get(k) == "1"
+                          for k in ("batch_generalized", "batch_window_audit")))
+        minimum = self.SLOT_PREFIX_MIN if self.slot_groups > 1 or seed_empty else 1
+        if prefixes[best] >= minimum:
             return best
         # with --batch-groups: the group with the fewest busy slots first, so the requests spread over the
         # pipeline's stages (two requests in one group leave the other stage idle); then empty, then least recent
@@ -5335,6 +5360,16 @@ def add_carry(carry: dict, last: dict) -> dict:
     return out
 
 
+def merge_slot_generations(*groups) -> list[dict]:
+    """Keep all native request legs in order; never infer an identity from a server slot reservation."""
+    out = []
+    for group in groups:
+        for pair in group:
+            if not out or pair != out[-1]:
+                out.append(dict(pair))
+    return out
+
+
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:
     """One request's `timings` in llama.cpp's names (what its clients show as speed), from the engine's own clock
     (StrataEngine.last): prompt_n is what was read, cache_n what the conversation cache already held.  None when the
@@ -5357,6 +5392,7 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
             # the speculative drafts, as llama.cpp names them (from PR #83, @mikicvi): only when the engine reported them
             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
                if last.get("drafts_offered") is not None else {}),
+            **{k: last[k] for k in ("slot_id", "request_generation", "slot_generations") if k in last},
             **{k: last[k] for k in ("token_gap_source", "token_gap_tokens", "token_gap_count", "token_gap_p95_ms",
                                     "token_gap_first_ns", "token_gap_last_ns", "token_gaps_ms")
                if k in last}}
@@ -5367,6 +5403,9 @@ def request_stats(segments: list[dict]) -> dict:
     if not segments:
         return {}
     result = dict(segments[-1])
+    identities = merge_slot_generations(*(s.get("slot_generations", []) for s in segments))
+    if identities:
+        result.update(identities[-1], slot_generations=identities)
     if len(segments) > 1 and all("token_gaps_ms" in s for s in segments):
         gaps = []
         previous = None
@@ -5732,7 +5771,8 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
             yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop,
                                                                        "stop_sequence": x.get("stop_sequence")},
                                     "usage": {"input_tokens": len(ids) - reused, "cache_read_input_tokens": reused,
-                                              "output_tokens": x["completion_tokens"]}}
+                                              "output_tokens": x["completion_tokens"]},
+                                    **({"timings": x["timings"]} if (x.get("timings") or {}).get("slot_generations") else {})}
             yield "message_stop", {"type": "message_stop"}
 
 
@@ -5764,6 +5804,8 @@ def anthropic_collect(events) -> dict:
             msg["stop_reason"] = e["delta"]["stop_reason"]
             msg["stop_sequence"] = e["delta"].get("stop_sequence")
             msg["usage"].update(e["usage"])
+            if "timings" in e:
+                msg["timings"] = e["timings"]
     msg["content"] = blocks
     return msg
 

@@ -21,6 +21,27 @@ if(STRATA_ENABLE_SYCL)
   return()
 endif()
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
+# Native audit identity is configured from this checkout, never guessed from a branch name.
+find_package(Git QUIET)
+set(STRATA_SOURCE_SHA "")
+set(STRATA_SOURCE_DIRTY -1)
+if(GIT_FOUND)
+  execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse --verify HEAD
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" OUTPUT_VARIABLE STRATA_SOURCE_SHA
+    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE strata_git_sha_rc)
+  if(strata_git_sha_rc EQUAL 0)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" diff --quiet HEAD --
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" RESULT_VARIABLE strata_git_dirty_rc)
+    if(strata_git_dirty_rc EQUAL 0)
+      set(STRATA_SOURCE_DIRTY 0)
+    elseif(strata_git_dirty_rc EQUAL 1)
+      set(STRATA_SOURCE_DIRTY 1)
+    endif()
+  else()
+    set(STRATA_SOURCE_SHA "")
+  endif()
+endif()
+add_compile_definitions(STRATA_SOURCE_SHA="${STRATA_SOURCE_SHA}" STRATA_SOURCE_DIRTY=${STRATA_SOURCE_DIRTY})
 # issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
 # be read back to the exact source line
 if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
@@ -255,6 +276,9 @@ target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
 if(STRATA_BUILD_TESTS)
+  add_executable(window_audit_cpu tests/core/window_audit_cpu.cpp)
+  target_include_directories(window_audit_cpu PRIVATE include)
+  add_test(NAME window_audit_cpu COMMAND window_audit_cpu)
   add_executable(batch_telemetry_test src/core/batch_telemetry_test.cpp)
   target_include_directories(batch_telemetry_test PRIVATE include)
   add_test(NAME batch_telemetry_test COMMAND batch_telemetry_test)

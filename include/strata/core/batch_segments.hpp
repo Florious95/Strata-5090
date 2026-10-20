@@ -42,8 +42,17 @@ inline int adaptive_c2_row_limit(int limit, int maximum, int useful, int kept,
 
 // Preserve complete causal segments while bounding each execution group to the
 // existing eight-row kernels. Zero means no second group, -1 means unsupported.
-inline int segment_group_boundary(const int* slots, int count, bool parallel_two_slots = false) {
+inline int segment_group_boundary(const int* slots, int count, bool parallel_two_slots = false,
+                                  bool parallel_segments = false) {
     if (count <= 8) {
+        if (parallel_segments) {
+            int best = 0;
+            for (int i = 1; i < count; ++i)
+                if (slots[i - 1] != slots[i] &&
+                    (best == 0 || (i * 2 - count) * (i * 2 - count) < (best * 2 - count) * (best * 2 - count)))
+                    best = i;
+            return best;   // complete slot segments; two execution groups are not two requests
+        }
         if (!parallel_two_slots || count < 2) return 0;
         int cut = 1;
         while (cut < count && slots[cut] == slots[0]) ++cut;
@@ -55,6 +64,47 @@ inline int segment_group_boundary(const int* slots, int count, bool parallel_two
     for (int i = 8; i > 0; --i)
         if (slots[i - 1] != slots[i] && count - i <= 8) return i;
     return -1;
+}
+
+// Trim only spare proposal rows to fit two <=8-column dense groups. Preserve
+// slot order, one pending input per live slot, and rotate which slot yields a
+// spare row. A capacity-valid layout such as [6,6,4] is not itself packable.
+// Returns the packed row count, or -1 for invalid input. Inactive widths are 0.
+inline int pack_segment_rows(int* widths, int count, int first) {
+    if (!widths || count < 1 || count > kBatchMaxRows || first < 0 || first >= count) return -1;
+    int total = 0, active = 0;
+    for (int i = 0; i < count; ++i) {
+        if (widths[i] < 0 || widths[i] > 8) return -1;
+        total += widths[i];
+        active += widths[i] > 0;
+    }
+    if (total > kBatchMaxRows || active > 16) return -1;
+    if (total <= 8) return total;
+    int cut = -1, loss = kBatchMaxRows + 1, left = 0, live_left = 0;
+    for (int i = 0; i < count - 1; ++i) {
+        left += widths[i];
+        live_left += widths[i] > 0;
+        if (!live_left || ! (active - live_left) || live_left > 8 || active - live_left > 8) continue;
+        const int trim = (left > 8 ? left - 8 : 0) + (total - left > 8 ? total - left - 8 : 0);
+        if (trim < loss) { cut = i + 1; loss = trim; }
+    }
+    if (cut < 0) return -1;
+    for (int side = 0; side < 2; ++side) {
+        const int begin = side == 0 ? 0 : cut, end = side == 0 ? cut : count;
+        int rows = 0;
+        for (int i = begin; i < end; ++i) rows += widths[i];
+        while (rows > 8) {
+            bool changed = false;
+            for (int j = 0; j < count && rows > 8; ++j) {
+                const int i = (first + j) % count;
+                if (i >= begin && i < end && widths[i] > 1) {
+                    --widths[i]; --rows; --total; changed = true;
+                }
+            }
+            if (!changed) return -1;
+        }
+    }
+    return total;
 }
 
 // The pooled scorer's MQ=8 path can share keys only within a full-Q4,

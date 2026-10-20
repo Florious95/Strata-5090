@@ -97,22 +97,40 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
     int lookups = 0;
     for (int q = 0; q < n_q; ++q) {
         const int width = steps[q * kStepCount + kStepWidth];
+        if (width < 0 || width > cap) { atomicExch(m.ctl + 3, 1); continue; }
         const int32_t* qi = ids + (long long) q * cap;
         for (int i = threadIdx.x; i < width; i += RT) {
+            if (qi[i] < 0 || qi[i] / page_size >= m.n_blocks) { atomicExch(m.ctl + 3, 1); continue; }
             const int b = qi[i] / page_size;
             if (i > 0 && qi[i - 1] / page_size == b) continue;   // ids are ascending: one lookup per block
             ++lookups;
             const int sl = m.page_table[b];
             if (sl >= 0) {
+                if (sl >= m.n_slots) { atomicExch(m.ctl + 3, 1); continue; }
                 m.slot_stamp[sl] = epoch;
                 m.slot_ref[sl] = 1;
             } else if (sl == -1 && atomicCAS(&m.page_table[b], -1, -2) == -1) {
-                m.miss_block[atomicAdd(&s_nmiss, 1)] = b;
+                const int miss = atomicAdd(&s_nmiss, 1);
+                if (miss < m.n_slots) m.miss_block[miss] = b;
+                else { m.page_table[b] = -1; atomicExch(m.ctl + 3, 1); }
             }
         }
     }
     if (lookups > 0) atomicAdd(&s_lookups, lookups);   // (#783, stuchapin909) most threads see none: skip the shared atomic
     __syncthreads();
+    // Overflow must stop before either miss array is indexed again, and before
+    // attention could read an unresolved page. A later status flag alone is not
+    // a memory-safety guard. Unlike assert, this remains enabled in Release.
+    if (m.ctl[3]) {
+        if (threadIdx.x == 0) {
+#if defined(__HIPCC__)
+            __builtin_trap();
+#else
+            asm volatile("trap;");
+#endif
+        }
+        return;
+    }
     // 2. one victim per miss: a clock sweep from the hand. A slot this call uses (stamp == epoch) is never taken;
     //    a referenced one loses its bit as the hand passes it and is taken on the next pass.
     const int need = s_nmiss, n = (int) m.n_slots;
@@ -139,8 +157,21 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
         hand = (int) (((long long) hand + cut) % n);
         __syncthreads();
     }
+    // A legal union fits without evicting a page this call uses. Fail before
+    // publishing a partial mapping if no such victim set exists.
+    if (got < need) {
+        if (threadIdx.x == 0) {
+            m.ctl[3] = 1;
+#if defined(__HIPCC__)
+            __builtin_trap();
+#else
+            asm volatile("trap;");
+#endif
+        }
+        return;
+    }
     // 3. re-point the table; the copy kernel fills the slots
-    const int placed = got < need ? got : need;
+    const int placed = need;
     for (int k = threadIdx.x; k < need; k += RT) {
         const int b = m.miss_block[k];
         if (k >= placed) { m.page_table[b] = -1; continue; }   // overflow: never happens with a legal n_slots

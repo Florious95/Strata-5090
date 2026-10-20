@@ -233,6 +233,7 @@ public:
     int n_slots() const { return (int) slots_.size(); }
     // Set once before any graph capture. Native single-stage speculative batches
     // can share one expert dispatch while keeping dense tiles within eight rows.
+    void set_batch_generalized(bool enabled) { batch_generalized_ = enabled; }
     void set_batch_expert_merge(bool enabled) { batch_expert_merge_ = enabled; }
     bool batch_experts_merged() const { return last_batch_ && batch_expert_merged_; }
     int batch_dense_groups() const { return last_batch_ ? (batch_dense_boundary_ > 0 ? 2 : 1) : 0; }
@@ -245,6 +246,9 @@ public:
     int batch_qsa_tile_calls() const { return last_batch_ ? last_head_.qsa_tiles : 0; }
     int batch_qsa_tile_rows() const { return last_batch_ ? last_head_.qsa_rows : 0; }
     int batch_qsa_scalar_rows() const { return last_batch_ ? last_head_.qsa_scalar : 0; }
+    int batch_qsa_scalar_resolves() const { return last_batch_ ? last_head_.qsa_scalar_resolves : 0; }
+    int batch_qsa_union_resolves() const { return last_batch_ ? last_head_.qsa_union_resolves : 0; }
+    bool batch_graph_cache_hit() const { return batch_graph_cache_hit_; }
     bool batch_host_profile_enabled() const { return host_prof_on_; }
     const BatchHostProfile& batch_host_profile() const { return host_prof_; }
     bool batch_ring_profile_enabled() const { return ring_prof_on_; }
@@ -422,7 +426,11 @@ private:
     int batch_hist_len_[kBatchMaxRows] = {};
     std::map<std::vector<int>, cudaGraphExec_t> exec_bm_, commit_bm_;   ///< full row layout avoids slot-ID collisions
     // Cached native GPU dispatch metadata, restored on every graph replay.
-    struct HeadDispatch { int type = -1; bool wide = false; int qsa_tiles = 0, qsa_rows = 0, qsa_scalar = 0; };
+    struct HeadDispatch {
+        int type = -1; bool wide = false;
+        int qsa_tiles = 0, qsa_rows = 0, qsa_scalar = 0;
+        int qsa_scalar_resolves = 0, qsa_union_resolves = 0;
+    };
     HeadDispatch record_head_, last_head_;
     std::map<std::vector<int>, HeadDispatch> bm_head_;   ///< actual captured head dispatch per layout
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU)
@@ -436,6 +444,7 @@ private:
         k.push_back(batch_dense_boundary_);
         k.push_back(batch_dense_parallel_ ? 1 : 0);
         k.push_back(batch_shared_after_ring_ ? 1 : 0);
+        k.push_back(batch_generalized_ ? 1 : 0);
         return k;
     }
     static std::vector<int> batch_key(const int* rows, int S, int hbase) {
@@ -451,6 +460,8 @@ private:
     bool batch_shared_after_ring_ = false;
     bool batch_expert_merge_ = false;
     bool batch_expert_merged_ = false;
+    bool batch_generalized_ = false;
+    bool batch_graph_cache_hit_ = false;
     // batch_launch / batch_poll (with external serving, batch_serve runs on another thread: running and the served
     // layer count are atomics, set by batch_launch before running)
     std::atomic<bool> b_running_{false};
