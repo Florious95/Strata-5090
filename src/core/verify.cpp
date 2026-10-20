@@ -625,6 +625,7 @@ Verifier::~Verifier() {
     for (auto& e : exec_nr_)
         if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
+    for (int b = 0; b < 4; ++b) destroy_solo_graphs(b);
     for (auto& kv : exec_bm_)
         if (kv.second) cudaGraphExecDestroy(kv.second);
     for (auto& kv : commit_bm_)
@@ -2025,6 +2026,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 11, grp);
                 // KV streaming: the n selections' blocks resident (device-side, inside the graph)
                 qsa_kv_resolve(st, *g_, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
+                if (st.kv_mode == 1) {
+                    if (n > 1) ++record_head_.qsa_union_resolves;
+                    else ++record_head_.qsa_scalar_resolves;
+                }
+                record_head_.qsa_scalar += n;
                 stamp(l, 12, grp);
                 if (qbr) join(0);   // the query, for attention
                 const QsaAttnPools pools = qsa_attn_pools(st);
@@ -2543,6 +2549,11 @@ void Verifier::refresh_ar() {
 bool Verifier::capture(int T, std::string& err) {
     if (T < 1 || T > std::min(max_t_, strata::kernels::kVerifyMaxT)) { err = "verify: capture width out of range"; return false; }
     cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[T] : exec_[T];
+    if (solo_slot_ >= 0) {
+        batch_graph_cache_hit_ = exec_t != nullptr;
+        reserve_solo_graph(T);
+        solo_used_[solo_slot_][ar_off_ ? 1 : 0][T] = ++solo_tick_;
+    }
     if (exec_t != nullptr) return true;
     {   // said before the capture: a process that exits inside it (#1275: Windows, 313 MiB free) leaves this line as the trace
         size_t free_b = 0, total_b = 0;
@@ -2668,6 +2679,7 @@ bool Verifier::capture(int T, std::string& err) {
     const bool made = instantiate_evicting(exec_t, graph, {}, "verify: instantiate: ", err);
     cudaGraphDestroy(graph);
     if (!made) return false;
+    if (solo_slot_ >= 0) solo_head_[solo_slot_][ar_off_ ? 1 : 0][T] = record_head_;
     const cudaError_t ue = cudaGraphUpload(exec_t, cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
     std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
@@ -2682,6 +2694,7 @@ bool Verifier::capture_commit(std::string& err) {
     SessionState& ss = *ss_;
     const QsaShapes s = shapes_of(g);
     const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ID = g.idx_key_dim, MT = max_t_;
+    const int logical_rows = solo_commit_rows(max_t_); // scratch layer stride remains MT (e.g. 12)
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
@@ -2718,7 +2731,7 @@ bool Verifier::capture_commit(std::string& err) {
                     ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats, (int64_t) gdn_floats,
                     (int64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size, qkv_L_ + (size_t) gdn_index * MT * C,
                     MT * C, h_L_ + (size_t) gdn_index * MT * C, MT * C, gate_L_ + (size_t) gdn_index * MT * HV,
-                    beta_L_ + (size_t) gdn_index * MT * HV, MT * HV, (int) C, (int) g.ssm_k_heads, (int) HV, (int) MT,
+                    beta_L_ + (size_t) gdn_index * MT * HV, MT * HV, (int) C, (int) g.ssm_k_heads, (int) HV, logical_rows,
                     (int) n_gdn, commit_, cs_);
         }
         // the QSA layers' tail restore + indexer append, one launch for all of them (one block per layer)
@@ -2744,7 +2757,7 @@ bool Verifier::capture_commit(std::string& err) {
             }
             if (ok && fits && nq > 0) {
                 native_qsa_indexer_append_steps_layers(idx_raw_L_ + (size_t) qsa_index * MT * ID, MT * ID, commit_ + 2, 1,
-                                                       (int) MT, 0, EPS, il, nq, s, mc, rope_scaling(), cs_);
+                                                       logical_rows, 0, EPS, il, nq, s, mc, rope_scaling(), cs_);
                 qsa_batched = true;
             }
         }
@@ -2763,7 +2776,7 @@ bool Verifier::capture_commit(std::string& err) {
                 gdn_conv_commit(conv, qkv, (int) C, commit_, cs_);
                 gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C, (int) C, gate_L_ + (size_t) gdn_index * MT * HV,
                                     beta_L_ + (size_t) gdn_index * MT * HV, z_, (const float*) wnm->data, EPS, y_dummy_,
-                                    (int) g.ssm_k_heads, (int) HV, std::min((int) MT, kVerifyMaxT), commit_, cs_, (int) MT);
+                                    (int) g.ssm_k_heads, (int) HV, logical_rows, commit_, cs_, (int) MT);
                 ++gdn_index;
             } else {
                 const QsaState& st = ss.qsa_states[qsa_index];
@@ -2772,10 +2785,10 @@ bool Verifier::capture_commit(std::string& err) {
                 copy_from_mapped(st.idx_tail, tail_snap_ + (size_t) qsa_index * TS, TS, cs_);
                 const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                 if (!g_no_batch_kv) {
-                    native_qsa_indexer_append_steps(idx_raw_L_ + (size_t) qsa_index * MT * ID, commit_ + 2, 1, (int) MT, 0,
+                    native_qsa_indexer_append_steps(idx_raw_L_ + (size_t) qsa_index * MT * ID, commit_ + 2, 1, logical_rows, 0,
                                                     (const float*) wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs_);
                 } else {
-                    for (int64_t t = 0; t < MT; ++t)
+                    for (int64_t t = 0; t < logical_rows; ++t)
                         native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
                                                   (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                   rope_scaling(), cs_);
@@ -2949,6 +2962,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     using namespace strata::kernels;
     const OnDevice on_device(device_);
     last_batch_ = false;
+    last_slot_solo_ = false;
     if (T < 1 || T > std::min(max_t_, strata::kernels::kVerifyMaxT)) { err = "verify: window size out of range"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     const ModelGeometry& g = *g_;
@@ -3889,6 +3903,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     *(volatile uint32_t*) h_flagB_ = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = S;
+    last_slot_solo_ = false;
     for (int t = 0; t < S; ++t) last_rows_[t] = rows[t];
     row_base_ = hbase;   // the graphs' key (and nothing else) reads it until the next stage_batch
     last_batch_ = true;
@@ -3905,6 +3920,166 @@ bool Verifier::run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolM
     int rows[8] = {};
     for (int t = 0; t < S && t < 8; ++t) rows[t] = t;
     return run_slot_rows(rows, S, tokens, pos, pool, user, out, err);
+}
+
+void Verifier::destroy_solo_graphs(int owner) {
+    auto& bank = solo_graphs_[owner];
+    for (auto& e : bank.exec) { if (e) cudaGraphExecDestroy(e); e = nullptr; }
+    for (auto& e : bank.exec_nr) { if (e) cudaGraphExecDestroy(e); e = nullptr; }
+    if (bank.commit) cudaGraphExecDestroy(bank.commit);
+    bank.commit = nullptr;
+    for (int v = 0; v < 2; ++v) for (int t = 0; t < 9; ++t) solo_used_[owner][v][t] = 0;
+}
+
+std::vector<uintptr_t> Verifier::solo_profile(int owner) const {
+    const auto& sx = *slots_[(size_t) owner];
+    std::vector<uintptr_t> key;
+    auto ptr = [&](const void* p) { key.push_back(reinterpret_cast<uintptr_t>(p)); };
+    // Captured sequence addresses, not contents. Reset/park/restore may change
+    // contents at these addresses without invalidating a graph. Reallocation may not.
+    ptr(&sx); ptr(sx.gdn_state); ptr(sx.qsa_states); ptr(sx.block_arena);
+    ptr(sx.ple_hist); ptr(sx.ple.hist); ptr(sx.ple.table); ptr(sx.ple.scratch);
+    ptr(wt_); ptr(head_ && head_->loaded() ? head_->weights() : nullptr);
+    ptr(hits_.cache_base); ptr(hits_.d_res); ptr(hits_.slot_off);
+    const auto& cv = strata::kernels::cvec();
+    ptr(cv.dir); ptr(cv.s); ptr(cv.on);
+    key.insert(key.end(), {(uintptr_t) cv.mode, (uintptr_t) cv.first, (uintptr_t) cv.last});
+    for (int64_t l = 0; l < g_->n_layers; ++l) key.push_back(cv.covers(l));
+    key.insert(key.end(), {(uintptr_t) sx.max_cells, (uintptr_t) sx.qsa_alloc,
+                          (uintptr_t) sx.ple.ready(), (uintptr_t) split_, (uintptr_t) always_publish_});
+    for (int64_t i = 0; i < sx.qsa_alloc; ++i) {
+        const auto& q = sx.qsa_states[sx.qsa_ord0 + i];
+        ptr(q.k_pool); ptr(q.v_pool); ptr(q.k_q); ptr(q.v_q); ptr(q.k_scale); ptr(q.v_scale);
+        ptr(q.k_q4); ptr(q.v_q4); ptr(q.page_table);
+        ptr(q.idx_tail); ptr(q.idx_dead); ptr(q.idx_pooled); ptr(q.idx_block_pos);
+        ptr(q.cos_tab); ptr(q.sin_tab);
+        ptr(q.map.slot_block); ptr(q.map.slot_stamp); ptr(q.map.slot_ref); ptr(q.map.ctl);
+        ptr(q.map.miss_block); ptr(q.map.miss_slot);
+        ptr(q.host.k_pool); ptr(q.host.v_pool); ptr(q.host.k_q); ptr(q.host.v_q);
+        ptr(q.host.k_scale); ptr(q.host.v_scale); ptr(q.host.k_q4); ptr(q.host.v_q4);
+        key.insert(key.end(), {(uintptr_t) q.kv_mode, (uintptr_t) q.n_slots, (uintptr_t) q.max_cells});
+    }
+    return key;
+}
+
+void Verifier::reserve_solo_graph(int T) {
+    // Bound on-demand target graphs across all four owners AND both residency
+    // variants, independently of the legacy batch LRU. Four owner commit graphs
+    // are additional persistent graphs, not four new verifier scratch arenas.
+    auto graph = [&](int b, int v, int t) -> cudaGraphExec_t& {
+        if (b == solo_slot_) return v ? exec_nr_[t] : exec_[t];
+        return v ? solo_graphs_[b].exec_nr[t] : solo_graphs_[b].exec[t];
+    };
+    if (graph(solo_slot_, ar_off_ ? 1 : 0, T)) return;
+    size_t count = 0; uint64_t oldest = UINT64_MAX;
+    int ob = -1, ov = 0, ot = 0;
+    for (int b = 0; b < 4; ++b) for (int v = 0; v < 2; ++v) for (int t = 1; t <= 8; ++t) {
+        if (!graph(b, v, t)) continue;
+        ++count;
+        if (solo_used_[b][v][t] < oldest) { oldest = solo_used_[b][v][t]; ob = b; ov = v; ot = t; }
+    }
+    if (count >= slot_solo_graph_limit(batch_graph_limit_) && ob >= 0) {
+        cudaGraphExecDestroy(graph(ob, ov, ot));
+        graph(ob, ov, ot) = nullptr;
+        solo_used_[ob][ov][ot] = 0;
+    }
+}
+
+Verifier::ScopedSoloBinding::ScopedSoloBinding(Verifier& v, int owner, std::string& err) {
+    if (owner < 0) return; // disabled/legacy: no synchronization or graph work
+    if (owner >= 4 || v.slots_.size() != 4 || v.max_t_ != 12 || v.solo_slot_ >= 0 ||
+        v.batch_rec_ || v.admission_sampling_ || v.b_running_.load() || v.staged_ || v.prelaunched_ || v.next_ ||
+        v.lb_ != 0 || v.le_ != v.g_->n_layers || v.slots_[owner]->mrope_device) {
+        err = "slot solo: unsupported or busy verifier binding"; return;
+    }
+    const OnDevice on(v.device_);
+    if (!v.wait_commit(err) || cudaStreamSynchronize(v.cs_) != cudaSuccess ||
+        (v.copy_ && cudaStreamSynchronize(v.copy_) != cudaSuccess)) {
+        if (err.empty()) err = "slot solo: cannot drain before binding";
+        return;
+    }
+    const auto profile = v.solo_profile(owner);
+    if (profile != v.solo_profile_[owner]) {
+        v.destroy_solo_graphs(owner);
+        v.solo_profile_[owner] = profile;
+        ++v.solo_epoch_[owner];
+    }
+    anchor_ = v.ss_; publish_ = v.always_publish_;
+    v.solo_graphs_[owner].exchange(v.exec_, v.exec_nr_, v.commit_exec_, v.groups_);
+    v.ss_ = v.slots_[owner]; v.solo_slot_ = owner;
+    v.always_publish_ = true; // T=1 must still use the common accepted-prefix commit
+    v_ = &v;
+}
+
+bool Verifier::ScopedSoloBinding::finish(std::string& err) {
+    if (!v_) return true;
+    auto& v = *v_;
+    const OnDevice on(v.device_);
+    if (!v.wait_commit(err)) return false;
+    for (cudaStream_t stream : {v.cs_, v.sh_cs_, v.dense_cs_, v.copy_, v.side_, v.side2_, v.df_side_[0], v.df_side_[1]})
+        if (stream && cudaStreamSynchronize(stream) != cudaSuccess) { err = "slot solo: cannot drain before unbinding"; return false; }
+    v.solo_graphs_[v.solo_slot_].exchange(v.exec_, v.exec_nr_, v.commit_exec_, v.groups_);
+    v.ss_ = anchor_; v.always_publish_ = publish_; v.solo_slot_ = -1;
+    v.copy_used_ = false; v.staged_ = false;
+    v_ = nullptr;
+    return true;
+}
+
+Verifier::ScopedSoloBinding::~ScopedSoloBinding() {
+    if (!v_) return;
+    // An error after partial target/commit consumption is fatal. Release blocked
+    // host doorbells before draining; never fall back and execute this window twice.
+    v_->release_gpu_waits(5000);
+    std::string ignored;
+    // If CUDA itself cannot drain, leave the terminal binding in place. Its
+    // handles still have exactly one owner; Verifier teardown retries the fence.
+    // Never restore an anchor while device work might still reference the owner.
+    (void) finish(ignored);
+}
+
+bool Verifier::prewarm_slot_solo(int T, std::string& err) {
+    if (T < 1 || T > solo_commit_rows(max_t_)) { err = "slot solo: invalid prewarm width"; return false; }
+    // One maximum-width target per owner, not every owner x width x variant.
+    // Subsequent shapes share a global <=8-target LRU. All static runtime setters
+    // must be complete before this READY-time capture. No target graph is run.
+    for (int b = 0; b < 4; ++b) {
+        ScopedSoloBinding binding(*this, b, err);
+        if (!binding) return false;
+        refresh_ar();
+        if (!capture(T, err) || !capture_commit(err) || !binding.finish(err)) return false;
+    }
+    return true;
+}
+
+bool Verifier::run_slot_solo(int owner, int T, const int32_t* tokens, const int64_t* pos,
+                              PoolMultiFn pool, void* user, int32_t* out, std::string& err) {
+    // Legacy detailed host/ring phase bins are instrumented in run_slot_rows,
+    // not run(). Never expose the previous legacy window as this Solo window.
+    if (host_prof_on_) host_prof_ = {};
+    if (ring_prof_on_) ring_prof_ = {};
+    if (owner != solo_slot_ || T < 1 || T > solo_commit_rows(max_t_) || !tokens || !pos || !out) {
+        err = "slot solo: no matching scoped binding or invalid rows"; return false;
+    }
+    for (int t = 0; t < T; ++t) {
+        if (pos[t] < 0 || pos[t] > INT32_MAX || pos[t] != pos[0] + t) {
+            err = "slot solo: invalid causal positions"; return false;
+        }
+    }
+    // run() owns the target computation, not request sampling. The existing
+    // per-row sampler below is the sole authoritative draw, with this slot's
+    // parameters/history and absolute-position counter, just like batch rows.
+    const bool sampling = head_sampling_;
+    head_sampling_ = false;
+    const bool ok = run(T, tokens, pos[0], pool, user, out, err);
+    head_sampling_ = sampling;
+    if (!ok) return false;
+    for (int t = 0; t < T; ++t) { last_rows_[t] = owner; last_pos_b_[t] = pos[t]; }
+    if (!sample_rows(T, err)) return false;
+    for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    last_slot_solo_ = true; last_solo_owner_ = owner;
+    solo_groups_ = groups_[T];
+    last_head_ = solo_head_[owner][ar_off_ ? 1 : 0][T];
+    return true;
 }
 
 bool Verifier::run_admission_slot(int slot, int T, const int32_t* tokens, int64_t pos0,
@@ -4147,7 +4322,7 @@ bool Verifier::sample_rows(int S, std::string& err) {
     for (int t = 0; t < S; ++t) {
         strata::kernels::SamplerParams sp = admission_sampling_ ? sampling_ : slot_sp_[(size_t) last_rows_[t]];
         const int hn = admission_sampling_ ? (hist_d_ ? hist_len_ : 0) : batch_hist_len_[t];
-        if ((sp.greedy || sp.temperature <= 0.0f) && hn == 0) continue;
+        if (!row_needs_sampling(sp.greedy, sp.temperature, hn, sp.logit_bias)) continue;
         sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
         if (!admission_sampling_ && hn == 0) sp.penalty_last_n = 0;
         const int32_t* history = hn > 0 ? (admission_sampling_ ? hist_d_ + (int64_t) t * hn : batch_hist_[t]) : nullptr;

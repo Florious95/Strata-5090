@@ -3061,6 +3061,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata: STRATA_BATCH_GENERALIZED must be 0 or 1\n"); return 2;
     }
     const bool generalized = generalized_env && generalized_env[0] == '1';
+    bool slot_solo = false;
+    if (!strata::core::parse_slot_solo(std::getenv("STRATA_BATCH_SLOT_SOLO"), slot_solo)) {
+        std::fprintf(stderr, "strata: STRATA_BATCH_SLOT_SOLO must be 0 or 1\n"); return 2;
+    }
+    if (slot_solo && (!generalized || o.batch != 4 || o.batch_rows != 12 ||
+                      o.max_context != 262144 || o.kv_resident != 20480 || o.spec > 8)) {
+        std::fprintf(stderr, "strata: slot solo needs generalized C4, rows12, spec<=8, context262144, resident20480\n");
+        return 2;
+    }
     const char* audit_path = std::getenv("STRATA_BATCH_AUDIT");
     const bool audit_requested = audit_path && *audit_path;
     int batch_graph_limit = 64;
@@ -9105,6 +9114,8 @@ int main(int argc, char** argv) {
             c.slots = o.batch; c.max_rows = std::max(o.spec, batch_capacity);
             c.max_context = o.max_context; c.resident_requested = o.kv_resident;
             c.generalized = generalized; c.canonical = o.batch_slot_only; c.segmented = batch_fast;
+            c.slot_solo = slot_solo;
+            c.solo_graph_limit = slot_solo ? (int) strata::core::slot_solo_graph_limit((size_t) batch_graph_limit) : 0;
             c.engine_version = STRATA_VERSION;
 #ifdef STRATA_SOURCE_SHA
             c.source_sha = STRATA_SOURCE_SHA;
@@ -10965,6 +10976,21 @@ int main(int argc, char** argv) {
                                  (long long) (later_reserve + 768 - sf_mib));
             }
         }
+        if (slot_solo) {
+            size_t before = 0, after = 0, total = 0;
+            if (cudaMemGetInfo(&before, &total) != cudaSuccess ||
+                !ver.prewarm_slot_solo(std::min(o.spec, o.batch_spec), err) ||
+                cudaMemGetInfo(&after, &total) != cudaSuccess) {
+                std::fprintf(stderr, "strata slot solo: prewarm failed: %s\n", err.c_str()); return 1;
+            }
+            std::fprintf(stderr, "strata slot solo: READY prewarm target_limit=%zu commit_limit=4 free_before=%llu free_after=%llu retained_bytes=%llu\n",
+                         strata::core::slot_solo_graph_limit((size_t)batch_graph_limit), (unsigned long long)before,
+                         (unsigned long long)after, (unsigned long long)(before > after ? before - after : 0));
+            if (after < (size_t)512 * 1024 * 1024) {
+                std::fprintf(stderr, "strata slot solo: less than 512 MiB after graph prewarm; raise --vram-reserve-mib\n");
+                return 1;
+            }
+        }
         // what the server's Monitor tab shows (servers before 0.1.8 skip unknown lines until READY)
         {
             size_t free_b = 0, total_b = 0;
@@ -11020,6 +11046,7 @@ int main(int argc, char** argv) {
                                        " canonical_slots=" + std::to_string(o.batch_slot_only ? 1 : 0) +
                                        " batch_graph_limit=" + std::to_string(batch_mtp || batch_fast || audit_requested ? batch_graph_limit : 0) +
                                        " batch_generalized=" + std::to_string(generalized ? 1 : 0) +
+                                       " batch_slot_solo=" + std::to_string(slot_solo ? 1 : 0) +
                                        " batch_window_audit=" + std::to_string(window_audit.enabled() ? 1 : 0) +
                                         " slot_vision=" + std::to_string(o.batch_slot_only && o.vision ? 1 : 0) +
                                        " slot_spill_lazy=" + std::to_string(o.batch_slot_only ? 1 : 0) +
@@ -11297,6 +11324,11 @@ int main(int argc, char** argv) {
             d.qsa_scalar = ver.batch_qsa_scalar_rows();
             d.scalar_resolves = ver.batch_qsa_scalar_resolves(); d.union_resolves = ver.batch_qsa_union_resolves();
             d.graph_hit = ver.batch_graph_cache_hit();
+            d.execution_path = ver.last_slot_solo() ? "slot_solo" : "legacy";
+            d.graph_key_kind = ver.last_slot_solo() ? "slot_solo" : "legacy_layout";
+            d.graph_key_rows = (int) w.row_slots.size();
+            d.graph_owner_slot = ver.graph_owner_slot();
+            d.graph_address_epoch = ver.graph_address_epoch();
             d.kv_mode = bslot_ss[0][0]->qsa_states[bslot_ss[0][0]->qsa_primary()].kv_mode;
         };
         auto finish_audit_window = [&](strata::core::AuditWindow& w, const int* keep, bool segmented) {
@@ -11873,6 +11905,13 @@ int main(int argc, char** argv) {
             const double wait0 = ver.ms_wait, pool0 = ver.ms_pool;
             const int64_t hit0 = drive.d.cache_hits, miss0 = drive.d.multi_misses, pcie0 = drive.d.pcie_experts;
             const auto native_route_before = strata::core::AuditRoute::read(drive.d);
+            int active_slots = 0;
+            for (const auto& sl : bs) active_slots += sl.active ? 1 : 0;
+            // Prefill can run this scheduler between chunks. Such calls retain
+            // the legacy path; Solo binds only a decode-only owner window.
+            const bool use_slot_solo = strata::core::slot_solo_eligible(
+                slot_solo, (int) bs.size(), std::max(o.spec, batch_capacity), active_slots,
+                rows[0], S, bs[(size_t) rows[0]].img, batch_prefilling);
             if (o.batch_slot_only) {
                 for (int t = 0; t < S; t += widths[t]) {
                     const auto& sl = bs[(size_t) rows[t]];
@@ -11892,7 +11931,7 @@ int main(int argc, char** argv) {
                         ver.set_batch_row_history(t + j, hn > 0 ? d_hist + base + (size_t) j * hn : nullptr, hn);
                 }
             }
-            const bool host_trace = ver.batch_host_profile_enabled();
+            const bool host_trace = ver.batch_host_profile_enabled() && !use_slot_solo;
             const Clock::time_point hcall0 = host_trace ? Clock::now() : Clock::time_point{};
             auto audit_window = begin_audit_window(rows, S, pos);
             for (size_t a = 0; a < audit_window.slots.size(); ++a) {
@@ -11900,7 +11939,12 @@ int main(int argc, char** argv) {
                 for (size_t j = 0; j < a; ++j) first += audit_window.slots[j].rows;
                 audit_window.slots[a].useful = useful[first];
             }
-            if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err, batch_fast) || drive.d.failed) {
+            strata::core::Verifier::ScopedSoloBinding solo_binding(ver, use_slot_solo ? rows[0] : -1, err);
+            if (use_slot_solo && !solo_binding) { std::printf("ERR %s\n", err.c_str()); return false; }
+            const bool ran = use_slot_solo ?
+                ver.run_slot_solo(rows[0], S, tok, pos, win_pool_fn, win_pool_user, outb, err) :
+                ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err, batch_fast);
+            if (!ran || drive.d.failed) {
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                 return false;
             }
@@ -11909,7 +11953,7 @@ int main(int argc, char** argv) {
             strata::core::BatchHostProfile batch_hp;
             if (host_trace) batch_hp = ver.batch_host_profile(); // immutable snapshot before drafting/callbacks
             std::optional<strata::kernels::cpu::RingHostProfile> batch_rp;
-            if (ver.batch_ring_profile_enabled()) batch_rp = ver.batch_ring_profile();
+            if (ver.batch_ring_profile_enabled() && !use_slot_solo) batch_rp = ver.batch_ring_profile();
             // Native token-expert occurrences, not deduplicated jobs/fetches.
             const auto native_route = strata::core::AuditRoute::read(drive.d).since(native_route_before);
             const int64_t hits = native_route.hits, routed = native_route.routed;
@@ -11938,7 +11982,9 @@ int main(int argc, char** argv) {
                                      (long long) cpu_entries, (long long) offload_entries);
                 }
             }
-            if (!(batch_fast ? ver.commit_segment_prefixes(keeps, err) : ver.commit_slots(err))) {
+            if (!(use_slot_solo ? ver.commit(keeps[0], err) :
+                  batch_fast ? ver.commit_segment_prefixes(keeps, err) : ver.commit_slots(err)) ||
+                !solo_binding.finish(err)) {
                 std::printf("ERR %s\n", err.c_str());
                 return false;
             }
