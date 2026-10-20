@@ -37,6 +37,10 @@ Device descriptor failures make a consumed window fatal before output collection
 
 The merged controller publishes its complete expert window outside the per-group routing branch. Therefore it must not select the legacy late shared-expert fork: that fork is emitted only by the non-merged publication path. In a one-row table window with shared streaming enabled, skipping the early fork would leave the shared stream outside capture; joining its event can invalidate capture, with the later MoE combine reporting only the previous error. Merged windows now take the existing early-fork path. Non-merged late/early policy and all arithmetic bodies are unchanged. Shared join record/wait failures are checked at their source instead of surfacing at combine. A CPU policy regression covers all eight requested-late / effective-all-resident / merged combinations. The asset-free `batch_shared_stream_gpu` target first requires the old missing-fork topology to reject capture, ends that invalid capture safely, then plans eight production-helper captures and 40 dynamic-value replays across real main/shared streams. It is a dedicated topology gate, not full-model arithmetic or performance qualification.
 
+## Optional RAM history when reusing an idle slot
+
+`--conversation-cache-mib 0` (or zero cache slots) explicitly disables parked conversation snapshots, not canonical hot-slot state or Host-backed Q4 streaming. Replacing/rewinding an inactive completed slot must then skip optional parking before any pointer/metadata exchange. Existing token IDs and checkpoints remain available to the normal same-owner checkpoint-donor path; normal admission reset/reconstruction evicts them at the appropriate point. BGEN continues to reject active owners. With RAM history enabled, successful full-live snapshot verification and real save-error handling remain strict; this change does not turn enabled-cache failures into success or claim unlimited history retention.
+
 ## WindowAuditV1 additions
 
 Existing route integers, scopes, lifecycle, HTTP slot/generation identity and resolver categories are unchanged. Additions:

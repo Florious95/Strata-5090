@@ -11367,7 +11367,11 @@ int main(int argc, char** argv) {
         };
         auto park_slot = [&](int b, size_t held, std::string& e) -> bool {
             BSlot& sl = bs[(size_t) b];
-            if (!o.batch_slot_only || !sl.cached || sl.tainted || sl.ids.empty()) return true;
+            // BGEN has already rejected active owners. With RAM history
+            // disabled, keep the idle donor intact for the normal rewind/reset
+            // path; no snapshot or temporary canonical binding is required.
+            if (!o.batch_slot_only ||
+                !conversations.slot_park_required(sl.cached, sl.tainted, !sl.ids.empty())) return true;
             auto* old_session = serve_session;
             auto* old_drafter = serve_drafter;
             serve_session = bslot_ss[0][(size_t) b];
@@ -11384,7 +11388,7 @@ int main(int argc, char** argv) {
                 probe.push_back(-1); // an unconsumed tail lets best() match the complete saved live state
                 const auto saved = conversations.best(probe, live_imgs, cvec_cached);
                 ok = saved.live && saved.tokens == (int64_t) live.size();
-            } else if (!conversations.enabled()) ok = false;
+            }
             if (!ok && e.empty()) e = "slot-only completed state could not be parked in the RAM cache";
             std::swap(live, sl.ids);
             std::swap(checks, sl.checks);
