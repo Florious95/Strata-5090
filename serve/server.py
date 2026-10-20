@@ -2197,7 +2197,7 @@ class StrataEngine:
         # tiny shared chat header. Keep meaningful LCP affinity (including rewritten
         # 29K tails); apply this identically to the audited OFF and ON arms.
         seed_empty = (any(not self.slot_held[b] for b in free) and
-                      any((getattr(self, "info", None) or {}).get(k) == "1"
+                      any(str((getattr(self, "info", None) or {}).get(k, "")).lower() in ("1", "true")
                           for k in ("batch_generalized", "batch_window_audit")))
         minimum = self.SLOT_PREFIX_MIN if self.slot_groups > 1 or seed_empty else 1
         if prefixes[best] >= minimum:

@@ -1,6 +1,9 @@
 """Native audit identity survives HTTP formatting; no engine/GPU is started."""
+import sys
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from unittest.mock import Mock
 
 import responses
@@ -61,6 +64,56 @@ class WindowAuditIdentityTests(unittest.TestCase):
         engine.info = {"batch_generalized": "1"}
         engine.slot_held = [prompt[:12], [-2], [-3], [-4]]  # no empty owners: keep even a short useful prefix
         self.assertEqual(engine.pick_slot(prompt), 0)
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX fake executable fixture")
+    def test_real_info_parser_seeds_all_four_owners_and_keeps_long_lcp(self):
+        for generalized in (False, True):
+            with self.subTest(generalized=generalized), tempfile.TemporaryDirectory() as directory:
+                script = Path(directory) / "fake-native-info.py"
+                script.write_text(
+                    f'#!{sys.executable}\n'
+                    f'print("INFO batch_slots=4 slot_cache=1 canonical_slots={int(generalized)} '
+                    f'batch_generalized={int(generalized)} batch_window_audit=1", flush=True)\n'
+                    'print("READY 262144 stop", flush=True)\n'
+                    'import sys\n'
+                    'for line in sys.stdin:\n'
+                    '    if line.strip() == "QUIT": break\n')
+                script.chmod(0o700)
+                engine = server.StrataEngine(str(script), ["--batch", "4"],
+                                             env={"STRATA_BATCH_GENERALIZED": str(int(generalized))})
+                try:
+                    flag = "batch_generalized" if generalized else "batch_window_audit"
+                    self.assertIs(type(engine.info[flag]), int)  # exercise the production INFO conversion
+                    self.assertEqual(engine.info[flag], 1)
+                    self.assertTrue(engine._requires_slot_admission())
+                    prompt, owners = list(range(30001)), []
+                    for lane in range(4):
+                        chosen = engine.pick_slot(prompt)
+                        self.assertNotIn(chosen, owners)  # a 12-token shared header must not capture the next cold lane
+                        owners.append(chosen)
+                        engine.slot_held[chosen] = prompt[:12] + [-lane - 1]
+                    self.assertEqual(set(owners), {0, 1, 2, 3})
+                    engine.slot_held[2] = prompt[:29000] + [-100]
+                    engine.slot_held[3] = []
+                    self.assertEqual(engine.pick_slot(prompt), 2)  # do not break the 29K cache fix
+                finally:
+                    engine.close()
+
+    def test_seed_flags_accept_wire_ints_and_legacy_strings_not_false_values(self):
+        engine = self.engine()
+        engine.batch = 2
+        engine.slot_order = [0, 1]
+        engine.slot_busy = [False, False]
+        engine.slot_group = [0, 0]
+        engine.slot_used = [0, 0]
+        engine.slot_held = [[1, 2], []]
+        for flag in ("batch_generalized", "batch_window_audit"):
+            for value in (1, "1", True, "true", "True"):
+                engine.info = {flag: value}
+                self.assertEqual(engine.pick_slot([1, 2, 3]), 1, (flag, value))
+            for value in (0, "0", False, "false", None, ""):
+                engine.info = {flag: value}
+                self.assertEqual(engine.pick_slot([1, 2, 3]), 0, (flag, value))
 
     def test_parallel_last_identity_is_thread_local(self):
         engine, barrier, results = self.engine(), threading.Barrier(2), []
