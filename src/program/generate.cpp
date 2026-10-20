@@ -3063,6 +3063,11 @@ int main(int argc, char** argv) {
     const bool generalized = generalized_env && generalized_env[0] == '1';
     const char* audit_path = std::getenv("STRATA_BATCH_AUDIT");
     const bool audit_requested = audit_path && *audit_path;
+    int batch_graph_limit = 64;
+    if (!strata::core::parse_batch_graph_limit(std::getenv("STRATA_BATCH_GRAPH_LIMIT"),
+                                             generalized || audit_requested, batch_graph_limit)) {
+        std::fprintf(stderr, "strata: STRATA_BATCH_GRAPH_LIMIT must be a decimal integer in 1..64\n"); return 2;
+    }
     strata::core::WindowAudit window_audit;
     const bool slot_only_cli = o.batch_slot_only;
     if (generalized && (!o.serve || (o.batch != 2 && o.batch != 4 && o.batch != 8) || o.vision ||
@@ -8940,7 +8945,7 @@ int main(int argc, char** argv) {
                     gs.ver.set_remote_expert_opt(remote_opt.get());
                     // --batch-mtp: every stage runs the same 2-rows-per-slot windows as the first (up to kVerifyMaxT
                     // rows, the hand-off's size) and bounds its captured batch layouts like the first (below)
-                    if (batch_mtp) gs.ver.set_batch_graph_limit(64);
+                    if (batch_mtp) gs.ver.set_batch_graph_limit((size_t) batch_graph_limit);
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
                                        batch_mtp ? strata::kernels::kVerifyMaxT
                                                  : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err);
@@ -9023,7 +9028,11 @@ int main(int argc, char** argv) {
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
         ver.set_batch_generalized(generalized);
         ver.set_batch_expert_merge(batch_fast && o.batch_expert_merge);
-        if (batch_mtp || batch_fast) ver.set_batch_graph_limit(64);
+        if (batch_mtp || batch_fast) {
+            ver.set_batch_graph_limit((size_t) batch_graph_limit);
+            if (generalized || audit_requested)
+                std::fprintf(stderr, "strata: batch graph cache limit=%d layout pairs (not a MiB budget)\n", batch_graph_limit);
+        }
         const int batch_capacity = batch_fast ? std::min(o.batch_rows, o.batch * o.batch_spec) :
                                    batch_mtp ? strata::kernels::kVerifyMaxT : std::min(o.batch, (int) strata::kernels::kVerifyMaxT);
         size_t slot_bind_before = 0, slot_bind_total = 0;
@@ -11009,6 +11018,7 @@ int main(int argc, char** argv) {
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                        " slot_only=" + std::to_string(slot_only_cli ? 1 : 0) +
                                        " canonical_slots=" + std::to_string(o.batch_slot_only ? 1 : 0) +
+                                       " batch_graph_limit=" + std::to_string(batch_graph_limit) +
                                        " batch_generalized=" + std::to_string(generalized ? 1 : 0) +
                                        " batch_window_audit=" + std::to_string(window_audit.enabled() ? 1 : 0) +
                                         " slot_vision=" + std::to_string(o.batch_slot_only && o.vision ? 1 : 0) +

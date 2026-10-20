@@ -3820,13 +3820,30 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
         return false;
     host_prof_.evict_ns = host_stamp_ns() - hevict;
     bm_used_[key] = ++bm_tick_;
+    // Diagnostic arm only: observed device-free changes, NOT attributed graph
+    // bytes or a transient peak measurement. No queries/logging on replay.
+    static const bool graph_stats = env_on("STRATA_BATCH_GRAPH_STATS");
+    const bool measure_graph = graph_stats && !batch_graph_cache_hit_;
+    size_t gf0 = 0, gf1 = 0, gf2 = 0, gt = 0;
+    bool graph_mem_ok = measure_graph && cudaMemGetInfo(&gf0, &gt) == cudaSuccess;
     const int64_t hcapture = host_stamp_ns();
     if (!capture_batch(rows, S, hbase, err)) return false;
     const int64_t hcommit = host_stamp_ns();
+    if (measure_graph) graph_mem_ok = (cudaMemGetInfo(&gf1, &gt) == cudaSuccess) && graph_mem_ok;
     host_prof_.capture_exec_ns = hcommit - hcapture;
     if (!capture_commit_batch(rows, S, hbase, err)) return false;
     const int64_t hdata = host_stamp_ns();
     host_prof_.capture_commit_ns = hdata - hcommit;
+    if (measure_graph) {
+        graph_mem_ok = (cudaMemGetInfo(&gf2, &gt) == cudaSuccess) && graph_mem_ok;
+        if (graph_mem_ok)
+            std::fprintf(stderr, "strata batch graph memory: layouts=%zu limit=%zu rows=%d "
+                                 "free_before_bytes=%zu free_after_exec_bytes=%zu free_after_commit_bytes=%zu "
+                                 "observed_pair_delta_bytes=%lld\n", exec_bm_.size(), batch_graph_limit_, S,
+                         gf0, gf1, gf2, (long long) gf0 - (long long) gf2);
+        else
+            std::fprintf(stderr, "strata batch graph memory: device-free query unavailable\n");
+    }
     const Clock::time_point t0 = Clock::now();
     const QsaShapes s = shapes_of(g);
     for (int t = 0; t < S; ++t) {

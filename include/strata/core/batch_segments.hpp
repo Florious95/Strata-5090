@@ -7,6 +7,23 @@ namespace strata::core {
 
 inline constexpr int kBatchMaxRows = 16;
 
+// Bound graph-pair retention before CUDA OOM. Both audited A/B arms use the
+// same small default; ordinary serving retains the existing 64-layout policy.
+inline bool parse_batch_graph_limit(const char* text, bool experiment, int& out) {
+    out = experiment ? 4 : 64;
+    if (!text) return true;
+    if (!*text) return false;
+    int value = 0;
+    for (const char* p = text; *p; ++p) {
+        if (*p < '0' || *p > '9') return false;
+        value = value * 10 + (*p - '0');
+        if (value > 64) return false;
+    }
+    if (value < 1) return false;
+    out = value;
+    return true;
+}
+
 // The native interleaved quantizer accepts 1..8 columns, even when the
 // verifier owns more plain row images. Each dense group gets its own image.
 inline constexpr int batch_il_scratch_rows(int verifier_rows) {
