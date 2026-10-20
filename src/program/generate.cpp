@@ -11931,7 +11931,7 @@ int main(int argc, char** argv) {
                         ver.set_batch_row_history(t + j, hn > 0 ? d_hist + base + (size_t) j * hn : nullptr, hn);
                 }
             }
-            const bool host_trace = ver.batch_host_profile_enabled();
+            const bool host_trace = ver.batch_host_profile_enabled() && !use_slot_solo;
             const Clock::time_point hcall0 = host_trace ? Clock::now() : Clock::time_point{};
             auto audit_window = begin_audit_window(rows, S, pos);
             for (size_t a = 0; a < audit_window.slots.size(); ++a) {
@@ -11953,7 +11953,7 @@ int main(int argc, char** argv) {
             strata::core::BatchHostProfile batch_hp;
             if (host_trace) batch_hp = ver.batch_host_profile(); // immutable snapshot before drafting/callbacks
             std::optional<strata::kernels::cpu::RingHostProfile> batch_rp;
-            if (ver.batch_ring_profile_enabled()) batch_rp = ver.batch_ring_profile();
+            if (ver.batch_ring_profile_enabled() && !use_slot_solo) batch_rp = ver.batch_ring_profile();
             // Native token-expert occurrences, not deduplicated jobs/fetches.
             const auto native_route = strata::core::AuditRoute::read(drive.d).since(native_route_before);
             const int64_t hits = native_route.hits, routed = native_route.routed;

@@ -37,6 +37,8 @@ Startup logs actual prewarm free-before/free-after/retained-byte delta and refus
 
 Header capabilities add `slot_solo` (bool), `row_table=false`, `slot_solo_target_graph_limit` (integer; 0 when OFF), `slot_solo_commit_graph_limit` (4 when ON, otherwise 0). `dense_parallel` and merged remain false on Solo. Head/resolve metadata comes from the actual owner/shape/residency graph; no batched-head flag is inferred from env eligibility. The ordinary Solo attention entry uses scalar attention rows plus union/scalar resolve counts, not a falsely attributed QSA tile count.
 
+Legacy detailed `batch-host` / ring phase traces are instrumented in `run_slot_rows()`, not Solo `run()`. Their bins are cleared and those two detailed trace records are **suppressed for Solo** instead of reusing a prior legacy window or inventing phase timings. WindowAuditV1, batch trace summary, native route/emission counts and external request timing remain available. Do not interpret absent detailed Solo phase bins as zero host work.
+
 ## Qualification gates
 
 CPU: strict flags/dispatch geometry including prefill exclusion, noncopyable graph-bank ownership and arbitrary-owner exchange/restore, cap/stride boundary, sampler predicate, audit serialization, existing planner/scheduler/server/tokenizer regressions. Host syntax or ASan success is **not CUDA or GPU qualification**.

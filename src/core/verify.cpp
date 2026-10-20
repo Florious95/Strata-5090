@@ -4053,6 +4053,10 @@ bool Verifier::prewarm_slot_solo(int T, std::string& err) {
 
 bool Verifier::run_slot_solo(int owner, int T, const int32_t* tokens, const int64_t* pos,
                               PoolMultiFn pool, void* user, int32_t* out, std::string& err) {
+    // Legacy detailed host/ring phase bins are instrumented in run_slot_rows,
+    // not run(). Never expose the previous legacy window as this Solo window.
+    if (host_prof_on_) host_prof_ = {};
+    if (ring_prof_on_) ring_prof_ = {};
     if (owner != solo_slot_ || T < 1 || T > solo_commit_rows(max_t_) || !tokens || !pos || !out) {
         err = "slot solo: no matching scoped binding or invalid rows"; return false;
     }
