@@ -9028,7 +9028,7 @@ int main(int argc, char** argv) {
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
         ver.set_batch_generalized(generalized);
         ver.set_batch_expert_merge(batch_fast && o.batch_expert_merge);
-        if (batch_mtp || batch_fast) {
+        if (batch_mtp || batch_fast || audit_requested) {
             ver.set_batch_graph_limit((size_t) batch_graph_limit);
             if (generalized || audit_requested)
                 std::fprintf(stderr, "strata: batch graph cache limit=%d layout pairs (not a MiB budget)\n", batch_graph_limit);
@@ -11018,7 +11018,7 @@ int main(int argc, char** argv) {
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                        " slot_only=" + std::to_string(slot_only_cli ? 1 : 0) +
                                        " canonical_slots=" + std::to_string(o.batch_slot_only ? 1 : 0) +
-                                       " batch_graph_limit=" + std::to_string(batch_graph_limit) +
+                                       " batch_graph_limit=" + std::to_string(batch_mtp || batch_fast || audit_requested ? batch_graph_limit : 0) +
                                        " batch_generalized=" + std::to_string(generalized ? 1 : 0) +
                                        " batch_window_audit=" + std::to_string(window_audit.enabled() ? 1 : 0) +
                                         " slot_vision=" + std::to_string(o.batch_slot_only && o.vision ? 1 : 0) +
