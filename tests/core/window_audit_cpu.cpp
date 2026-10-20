@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 using namespace strata::core;
 int checks = 0;
@@ -79,6 +80,7 @@ int main(int argc, char** argv) {
     zero.generation = 1; zero.position = 258000; zero.emitted = 2; zero.finish = "length";
     AuditSlot one = zero; one.id = 1; one.keep = 1; one.emitted = 1;
     w.slots = {zero, one};
+    w.dispatch.graph_key_rows = 4;
     w.dispatch.head_type = 13; w.dispatch.qsa_scalar = 48; w.dispatch.kv_mode = 1;
     w.dispatch.scalar_resolves = 24; w.dispatch.union_resolves = 12;
     require(writer.window(w), "write native window");
@@ -87,6 +89,37 @@ int main(int argc, char** argv) {
     require(writer.begin_admission(0) && writer.generation(0) == 2, "reuse increments native generation");
     require(writer.end_admission(0, false, "cancel", false), "pre-admission cancel can drain");
     require(writer.close(), "flush footer");
+    {
+        std::ifstream in(path);
+        const std::string contents((std::istreambuf_iterator<char>(in)), {});
+        require(contents.find("\"execution_path\":\"legacy\",\"graph_key_kind\":\"legacy_layout\",\"graph_key_rows\":4,\"graph_owner_slot\":-1,\"graph_address_epoch\":0") != std::string::npos,
+                "legacy graph identity is explicit, not guessed from rows");
+    }
+    {
+        const std::string solo_path = path + ".solo";
+        AuditConfig four = c;
+        four.slots = 4; four.effective_resident = {20480, 20480, 20480, 20480};
+        four.slot_solo = true; four.solo_graph_limit = 4;
+        WindowAudit solo;
+        require(solo.open(solo_path.c_str(), four) && solo.begin_admission(2), "solo arbitrary native owner claims");
+        require(solo.end_admission(0, true, nullptr, true), "solo admission preserves native generation");
+        AuditWindow one_slot;
+        one_slot.active = {2}; one_slot.row_slots = {2, 2, 2};
+        AuditSlot slot = zero; slot.id = 2; slot.rows = slot.useful = 3; slot.keep = slot.emitted = 2;
+        one_slot.slots = {slot}; one_slot.route = {1440, 1368, 72, 0, 0};
+        auto& d = one_slot.dispatch;
+        d.canonical = d.generalized = true; d.execution_path = d.graph_key_kind = "slot_solo";
+        d.graph_key_rows = 3; d.graph_owner_slot = 2; d.graph_address_epoch = 1;
+        require(solo.window(one_slot), "solo window uses ordinary integer and generation accounting");
+        require(solo.finish_slot(2, "length") && solo.close(), "solo lifecycle/footer closes");
+        std::ifstream in(solo_path);
+        const std::string contents((std::istreambuf_iterator<char>(in)), {});
+        require(contents.find("\"slot_solo\":true,\"row_table\":false,\"slot_solo_target_graph_limit\":4,\"slot_solo_commit_graph_limit\":4") != std::string::npos,
+                "header exposes experimental graph capability and count bounds");
+        require(contents.find("\"execution_path\":\"slot_solo\",\"graph_key_kind\":\"slot_solo\",\"graph_key_rows\":3,\"graph_owner_slot\":2,\"graph_address_epoch\":1") != std::string::npos,
+                "solo graph identity serializes exact owner/rows/epoch");
+        require(std::filesystem::remove(solo_path), "remove owned solo artifact");
+    }
     for (int mode = 0; mode < 4; ++mode) {
         const std::string bad_path = path + ".negative-" + std::to_string(mode);
         WindowAudit bad;

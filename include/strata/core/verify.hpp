@@ -21,6 +21,8 @@
 // selection, native indexer) and a profile-filled VRAM expert tier with its residency table on the device.
 #pragma once
 
+#include "strata/core/slot_solo.hpp"
+
 #include <cstdio>
 #include <array>
 #include "strata/core/batch_segments.hpp"
@@ -236,18 +238,18 @@ public:
     void set_batch_generalized(bool enabled) { batch_generalized_ = enabled; }
     void set_batch_expert_merge(bool enabled) { batch_expert_merge_ = enabled; }
     bool batch_experts_merged() const { return last_batch_ && batch_expert_merged_; }
-    int batch_dense_groups() const { return last_batch_ ? (batch_dense_boundary_ > 0 ? 2 : 1) : 0; }
+    int batch_dense_groups() const { return last_batch_ ? (batch_dense_boundary_ > 0 ? 2 : 1) : last_slot_solo_ ? solo_groups_ : 0; }
     bool batch_dense_parallel() const { return last_batch_ && batch_dense_parallel_; }
     bool batch_shared_after_ring() const { return last_batch_ && batch_shared_after_ring_; }
     // Actual dispatch captured in the graph replayed by the last batch, not env
     // eligibility. Cached layouts restore their own metadata; no GPU readback.
-    int batch_head_type() const { return last_batch_ ? last_head_.type : -1; }
-    bool batch_head_wide_active() const { return last_batch_ && last_head_.wide; }
-    int batch_qsa_tile_calls() const { return last_batch_ ? last_head_.qsa_tiles : 0; }
-    int batch_qsa_tile_rows() const { return last_batch_ ? last_head_.qsa_rows : 0; }
-    int batch_qsa_scalar_rows() const { return last_batch_ ? last_head_.qsa_scalar : 0; }
-    int batch_qsa_scalar_resolves() const { return last_batch_ ? last_head_.qsa_scalar_resolves : 0; }
-    int batch_qsa_union_resolves() const { return last_batch_ ? last_head_.qsa_union_resolves : 0; }
+    int batch_head_type() const { return last_batch_ || last_slot_solo_ ? last_head_.type : -1; }
+    bool batch_head_wide_active() const { return (last_batch_ || last_slot_solo_) && last_head_.wide; }
+    int batch_qsa_tile_calls() const { return last_batch_ || last_slot_solo_ ? last_head_.qsa_tiles : 0; }
+    int batch_qsa_tile_rows() const { return last_batch_ || last_slot_solo_ ? last_head_.qsa_rows : 0; }
+    int batch_qsa_scalar_rows() const { return last_batch_ || last_slot_solo_ ? last_head_.qsa_scalar : 0; }
+    int batch_qsa_scalar_resolves() const { return last_batch_ || last_slot_solo_ ? last_head_.qsa_scalar_resolves : 0; }
+    int batch_qsa_union_resolves() const { return last_batch_ || last_slot_solo_ ? last_head_.qsa_union_resolves : 0; }
     bool batch_graph_cache_hit() const { return batch_graph_cache_hit_; }
     bool batch_host_profile_enabled() const { return host_prof_on_; }
     const BatchHostProfile& batch_host_profile() const { return host_prof_; }
@@ -264,6 +266,28 @@ public:
     /// and head-sampling suppression while using the slot graph; commit with commit_slots().
     bool run_admission_slot(int slot, int T, const int32_t* tokens, int64_t pos0,
                             PoolMultiFn pool, void* user, int32_t* out, std::string& err);
+    // Dispatcher-owned lifetime: binding MUST span run, row-local sampling,
+    // acceptance and commit. finish() drains before restoring the anchor. An
+    // unfinished scope is fatal-error cleanup, never a retry on the legacy path.
+    class ScopedSoloBinding {
+    public:
+        ScopedSoloBinding(Verifier& v, int owner, std::string& err);
+        ~ScopedSoloBinding();
+        ScopedSoloBinding(const ScopedSoloBinding&) = delete;
+        ScopedSoloBinding& operator=(const ScopedSoloBinding&) = delete;
+        explicit operator bool() const { return v_ != nullptr; }
+        bool finish(std::string& err);
+    private:
+        Verifier* v_ = nullptr;
+        SessionState* anchor_ = nullptr;
+        bool publish_ = false;
+    };
+    bool run_slot_solo(int owner, int T, const int32_t* tokens, const int64_t* pos,
+                       PoolMultiFn pool, void* user, int32_t* out, std::string& err);
+    bool prewarm_slot_solo(int T, std::string& err);
+    bool last_slot_solo() const { return last_slot_solo_; }
+    int graph_owner_slot() const { return last_slot_solo_ ? last_solo_owner_ : -1; }
+    uint64_t graph_address_epoch() const { return last_slot_solo_ ? solo_epoch_[last_solo_owner_] : 0; }
     /// Experimental single-stage causal segments, at most max_t total rows.
     /// Repeated slot IDs must be contiguous, with consecutive absolute positions.
     bool commit_segment_prefixes(const int* keep, std::string& err);
@@ -432,6 +456,15 @@ private:
         int qsa_scalar_resolves = 0, qsa_union_resolves = 0;
     };
     HeadDispatch record_head_, last_head_;
+    SoloGraphBank<cudaGraphExec_t> solo_graphs_[4];
+    HeadDispatch solo_head_[4][2][9];
+    uint64_t solo_used_[4][2][9] = {}, solo_tick_ = 0, solo_epoch_[4] = {};
+    std::vector<uintptr_t> solo_profile_[4];
+    int solo_slot_ = -1, last_solo_owner_ = -1, solo_groups_ = 0;
+    bool last_slot_solo_ = false;
+    void reserve_solo_graph(int T);
+    void destroy_solo_graphs(int owner);
+    std::vector<uintptr_t> solo_profile(int owner) const;
     std::map<std::vector<int>, HeadDispatch> bm_head_;   ///< actual captured head dispatch per layout
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU)
     uint64_t bm_tick_ = 0;

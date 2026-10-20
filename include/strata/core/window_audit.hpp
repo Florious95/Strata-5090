@@ -74,6 +74,10 @@ struct AuditDispatch {
     bool shared_after_ring = false, head_wide = false, graph_hit = false;
     int dense_groups = 1, head_type = -1, qsa_tiles = 0, qsa_rows = 0, qsa_scalar = 0;
     int kv_mode = 0, scalar_resolves = 0, union_resolves = 0;
+    const char* execution_path = "legacy";
+    const char* graph_key_kind = "legacy_layout";
+    int graph_key_rows = 0, graph_owner_slot = -1;
+    uint64_t graph_address_epoch = 0;
 };
 struct AuditWindow {
     std::vector<int> active, row_slots;
@@ -85,7 +89,8 @@ struct AuditConfig {
     int slots = 0, max_rows = 0;
     int64_t max_context = 0, resident_requested = 0;
     std::vector<int64_t> effective_resident;
-    bool generalized = false, canonical = false, segmented = false;
+    bool generalized = false, canonical = false, segmented = false, slot_solo = false;
+    int solo_graph_limit = 0;
     std::string engine_version, source_sha;
     int source_dirty = -1;
 };
@@ -151,6 +156,9 @@ public:
              (c.source_dirty < 0 ? "null" : boolean(c.source_dirty != 0)) + "},\"capabilities\":{" +
              "\"generalized\":" + boolean(c.generalized) + ",\"canonical_admission\":" + boolean(c.canonical) +
              ",\"segmented_verify\":" + boolean(c.segmented) + ",\"streaming\":" + boolean(streaming) +
+             ",\"slot_solo\":" + boolean(c.slot_solo) + ",\"row_table\":false" +
+             ",\"slot_solo_target_graph_limit\":" + num(c.solo_graph_limit) +
+             ",\"slot_solo_commit_graph_limit\":" + num(c.slot_solo ? 4 : 0) +
              ",\"max_rows\":" + num(c.max_rows) + ",\"max_dense_groups\":2,\"audit_all_batch_paths\":true}," +
              "\"provenance\":{\"counter_schema\":\"expert-dispatch-occurrences-v1\",\"route_sources\":{" +
              "\"routed\":\"ExpertDispatch.experts\",\"hits\":\"ExpertDispatch.cache_hits\"," +
@@ -266,7 +274,10 @@ public:
             ",\"qsa_scalar_rows\":" + num(d.qsa_scalar) + ",\"kv_mode\":" + num(d.kv_mode) +
             ",\"kv_resolve_strategy\":" + quote(strategy) + ",\"kv_resolve_calls\":{\"scalar_per_row\":" +
             num(d.scalar_resolves) + ",\"union_per_slot\":" + num(d.union_resolves) + "},\"graph_cache_hit\":" +
-            boolean(d.graph_hit) + ",\"fallback_reason\":" + (d.generalized ? "null" : quote("reference-policy")) + "}}";
+            boolean(d.graph_hit) + ",\"execution_path\":" + quote(d.execution_path) +
+            ",\"graph_key_kind\":" + quote(d.graph_key_kind) + ",\"graph_key_rows\":" + num(d.graph_key_rows) +
+            ",\"graph_owner_slot\":" + num(d.graph_owner_slot) + ",\"graph_address_epoch\":" + num(d.graph_address_epoch) +
+            ",\"fallback_reason\":" + (d.generalized ? "null" : quote("reference-policy")) + "}}";
         totals("target_decode", w.route, true, emitted);
         return write(s, 1);
     }
