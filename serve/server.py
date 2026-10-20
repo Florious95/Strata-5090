@@ -1153,6 +1153,8 @@ class StrataEngine:
         # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
         # the slot that has its start (the engine checks it again); when the slot was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
+        self.slot_keys = [None] * self.batch          # retained-state affinity, not authorization
+        self.slot_request_keys = [None] * self.batch  # provisional admission/decoding owner
         self.slot_used = [0.0] * self.batch
         self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
         # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
@@ -1745,6 +1747,11 @@ class StrataEngine:
     SOLO_AGAIN_MAX = 2      # how often a request left alone in a slot goes back to the solo path
     SOLO_AGAIN_MIN_LEFT = 32  # ... only with at least this many tokens still allowed (max_tokens)
 
+    def _slot_experiment(self) -> bool:
+        info = getattr(self, "info", None) or {}
+        return any(str(info.get(k, "")).lower() in ("1", "true")
+                   for k in ("batch_generalized", "batch_window_audit"))
+
     def _requires_slot_admission(self) -> bool:
         info = self.info or {}
         return bool(int(info.get("canonical_slots", info.get("slot_only")) or 0) or
@@ -1784,6 +1791,9 @@ class StrataEngine:
         pending: list[int] = []
         clock, clock_before = _TokenGaps(), self.last
         native_legs = []  # native slot/generation identities, including BYIELD/retry legs of this HTTP request
+        cache_key = getattr(cancel, "_strata_prompt_cache_key", None) if self._slot_experiment() else None
+        def pick():
+            return self.pick_slot(prompt, cache_key) if cache_key is not None else self.pick_slot(prompt)
         prompt, left = list(ids), int(max_new)
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
@@ -1806,7 +1816,7 @@ class StrataEngine:
                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
-                if alone and left > 1 and not self._requires_slot_admission():
+                if alone and left > 1 and cache_key is None and not self._requires_slot_admission():
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     self._last_done = None                  # (#879: this request's DONE decides below)
                     deadline = getattr(cancel, "_strata_queue_deadline", None)
@@ -1831,9 +1841,10 @@ class StrataEngine:
                         if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
                                 self._shorter_waiting(len(prompt))):
                             with self.slot_cv:          # the slot the part read will wait in
-                                reserved = self.pick_slot(prompt)
+                                reserved = pick()
                                 if reserved is not None:
                                     self.slot_busy[reserved] = True
+                                    self.slot_request_keys[reserved] = cache_key
                                     self.slot_claims.add(reserved)
                             if reserved is not None:
                                 self._send(f"BYIELD {reserved}")
@@ -1854,6 +1865,7 @@ class StrataEngine:
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
                         slot, reserved = reserved, None     # gave way: the read goes on in that slot (below)
+                        self.slot_keys[slot] = cache_key
                     elif reserved is not None:              # it did not give way: the slot is free again
                         with self.slot_cv:
                             self.slot_busy[reserved] = False
@@ -1882,9 +1894,10 @@ class StrataEngine:
                             if deadline is not None and time.monotonic() >= deadline:
                                 raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
                             with self.slot_cv:
-                                slot = self.pick_slot(prompt)
+                                slot = pick()
                                 if slot is not None:
                                     self.slot_busy[slot] = True
+                                    self.slot_request_keys[slot] = cache_key
                                     self.slot_claims.add(slot)
                                     if admit_wait:
                                         admit_wait = False
@@ -1897,7 +1910,7 @@ class StrataEngine:
                                 self.ctl.release()
                                 holding = False
                             with self.slot_cv:
-                                if self.pick_slot(prompt) is None:
+                                if pick() is None:
                                     if (ENGINE_STALL_S or 0) > 0 and time.monotonic() - admit_since >= ENGINE_STALL_S:
                                         # the stall check of #1317 only watches a request on the control lines; one
                                         # waiting here is covered by looking for a slot nobody owns, and by saying so
@@ -1908,7 +1921,7 @@ class StrataEngine:
                                                   f"for a free slot (busy: {busy}, in use: {sorted(self.slot_claims)}, "
                                                   f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
                                     self._reap_orphan_slots()
-                                if self.pick_slot(prompt) is None:
+                                if pick() is None:
                                     wait_remaining = deadline - time.monotonic() if deadline is not None else 1.0
                                     self.slot_cv.wait(timeout=min(1.0, max(0, wait_remaining)))
                             if cancel.is_set():
@@ -1995,6 +2008,7 @@ class StrataEngine:
                         self._park_slot(slot)
                         slot = None
                         continue
+                    self.slot_keys[slot] = cache_key  # successful BADM/YIELDED, not a speculative server reservation
                     native_legs = merge_slot_generations(native_legs, (self.last or {}).get("slot_generations", []))
                     cont = bool(self._ctl_result and self._ctl_result[1])
                     phase = "slot" if cont else "none"
@@ -2036,7 +2050,7 @@ class StrataEngine:
                                 stop_sent = True
                             continue
                         yield t
-                        if not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
+                        if cache_key is None and not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
                                                                                   embeddings):
                             self._send(f"BSTOP {slot}")         # alone now: on with the drafts (below)
                             going_solo = True
@@ -2163,13 +2177,32 @@ class StrataEngine:
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
     TURN_ID = 248045        # <|im_start|>: the engine's default --turn-token (its turn checkpoint sits at the last one)
 
-    def pick_slot(self, prompt: list[int]) -> int | None:
+    def pick_slot(self, prompt: list[int], cache_key: str | None = None) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): longest token LCP, including a rewritten reply tail
         or a prompt shorter than the held state; native checkpoints still decide the safe resume. Else empty/LRU, so
         conversations other slots hold stay for their next turns.  None: every slot is busy."""
+        if not hasattr(self, "slot_keys"):  # older CPU collaborators skip the constructor
+            self.slot_keys, self.slot_request_keys = [None] * self.batch, [None] * self.batch
+        for b in range(self.batch):
+            if not self.slot_busy[b]:
+                self.slot_request_keys[b] = None
+                if not self.slot_held[b]:
+                    self.slot_keys[b] = None
+        if cache_key is not None and any(self.slot_busy[b] and cache_key in
+                                        (self.slot_keys[b], self.slot_request_keys[b]) for b in range(self.batch)):
+            return None  # never duplicate an in-flight conversation onto another owner
         free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None
+        if cache_key is not None:
+            if self.slot_groups > 1 or getattr(self, "slot_gs", 0) > 1:
+                raise ValueError("prompt_cache_key slot binding requires one batch group")
+            bound = [b for b in free if self.slot_keys[b] == cache_key]
+            if bound:
+                return bound[0]  # native token/checkpoint/image checks still validate actual reuse
+            empty = [b for b in free if not self.slot_held[b]]
+            if empty:
+                return empty[0]  # independent keys can share arbitrarily long template/data prefixes
         gs = getattr(self, "slot_gs", 0)
         if gs > 1:
             # pipelined groups of several slots: the engine keeps no idle slot below a busy one as a conversation cache
@@ -2196,9 +2229,7 @@ class StrataEngine:
         # The opt-in streaming experiment must seed unused owners before reusing a
         # tiny shared chat header. Keep meaningful LCP affinity (including rewritten
         # 29K tails); apply this identically to the audited OFF and ON arms.
-        seed_empty = (any(not self.slot_held[b] for b in free) and
-                      any(str((getattr(self, "info", None) or {}).get(k, "")).lower() in ("1", "true")
-                          for k in ("batch_generalized", "batch_window_audit")))
+        seed_empty = any(not self.slot_held[b] for b in free) and self._slot_experiment()
         minimum = self.SLOT_PREFIX_MIN if self.slot_groups > 1 or seed_empty else 1
         if prefixes[best] >= minimum:
             return best
@@ -4544,6 +4575,13 @@ class Service:
         # Internal response metadata cannot be supplied by a client.
         if req is not None:
             req.pop("_strata_image_refs", None)
+            key = req.get("prompt_cache_key")
+            binding = isinstance(getattr(self, "engine", None), StrataEngine) and self.engine._slot_experiment()
+            if key is not None and binding:
+                if not isinstance(key, str) or not 1 <= len(key) <= 64:
+                    raise ValueError("prompt_cache_key must be a nonempty string of at most 64 characters")
+                if cancel is not None:
+                    cancel._strata_prompt_cache_key = hashlib.sha256(key.encode("utf-8")).hexdigest()
         # Lease cache files across tool precheck, tokenization and combined-file creation, including failures.
         scope = self.vision.lease() if hasattr(self.vision, "lease") else contextlib.nullcontext(None)
         with scope as lease:

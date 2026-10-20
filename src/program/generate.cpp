@@ -3067,7 +3067,7 @@ int main(int argc, char** argv) {
     const bool slot_only_cli = o.batch_slot_only;
     if (generalized && (!o.serve || (o.batch != 2 && o.batch != 4 && o.batch != 8) || o.vision ||
                         o.kv != "q4_0" || o.mtp.empty() || o.batch_spec < 2 || o.spec < 2 ||
-                        o.batch_spec_fixed || o.pipeline_windows || o.kv_grow || o.adapt_async || o.batch_groups > 1)) {
+                        o.batch_spec_fixed || o.pipeline_windows > 0 || o.kv_grow || o.adapt_async || o.batch_groups > 1)) {
         std::fprintf(stderr, "strata: generalized batching needs 2/4/8 text slots, Q4 KV, MTP, variable segments, "
                              "one group, no KV grow/pipeline/async adaptation\n"); return 2;
     }

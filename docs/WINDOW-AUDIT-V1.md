@@ -24,6 +24,16 @@ Rows include the pending input. Two execution groups are **not** two requests. P
 
 Audit mode prevents server solo `GEN` fallbacks in **both** arms so all output has a native slot/generation owner. Both generalized and audited reference arms also seed an unused owner before reusing only a tiny (<512 token) common header. A meaningful longest-token-prefix, including rewritten 29K reply tails, still wins; if no owner is empty, even a short prefix retains affinity. This is an explicit experimental serving regime, not a claim that OFF + audit is byte-for-byte identical to historical default server scheduling. Remove historical bootstrap overlays when testing this policy, or document an identical overlay on both arms.
 
+### Independent conversation affinity during the experiment
+
+In a process reporting `INFO batch_generalized=1` or `batch_window_audit=1`, optional HTTP `prompt_cache_key` selects a retained physical owner. Supply a **unique stable string per independent conversation** (1..64 characters), identically in both arms and across warmup, follow-up and EOS requests. The server hashes it internally; it is not emitted in the native audit or inserted into prompt tokens. A new key fills an idle, genuinely empty owner first even when independent prompts share 51K tokens. A known key returns to its retained idle owner; while that key is admitted or reserved, another request with it waits rather than duplicating it on another slot. After all owners fill, normal LCP/LRU eviction remains possible.
+
+Releasing the busy flag does not erase a binding while its KV remains retained. Before each slot lookup, idle empty state invalidates its binding and stale provisional reservation; process restart resets all bindings. Publishing a new retained binding requires successful native admission. The key is a routing hint, not authentication or permission to reuse mismatching KV: native token/image/checkpoint validation remains authoritative. Unkeyed requests retain the LCP policy above. Multiple batch groups are not supported by keyed experimental routing.
+
+This reinterpretation is **only for the opt-in experiment**. In ordinary serving, upstream clients may intentionally share `prompt_cache_key` between parent/subagent requests; the default service does not validate or reinterpret that standard cache-group field as a unique conversation identity. Use independent lane keys explicitly for the experiment. Internal continuation legs retain the same request metadata. C1 without batch slots does not gain a fabricated native owner.
+
+The early generalized option guard rejects only positive explicit `--pipeline-windows`; the default sentinel `-1` resolves to zero for batching later in option resolution. `--pipeline-windows 0` remains a valid explicit setting.
+
 ## Wire contract
 
 Each line is one JSON object with required envelope:
