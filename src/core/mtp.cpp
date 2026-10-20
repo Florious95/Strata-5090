@@ -1,5 +1,6 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
+#include "strata/core/mtp_batch.hpp"
 #include "strata/core/pin_budget.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -1876,20 +1877,19 @@ int MtpDrafter::chain_poll(std::string& err) {
 
 bool MtpDrafter::draft_batch(const std::vector<DraftRound>& batch, std::string& err) {
     if (batch.empty()) return true;
-    if (batch.size() > 4 || !batch[0].drafter) { err = "mtp batch: invalid membership"; return false; }
+    if (const char* why = mtp_batch_membership_error(batch)) { err = why; return false; }
     const OnDevice on_device(batch[0].drafter->device_);
     const auto started = Clock::now();
-    int limits[4]{}, counts[4]{};
-    int32_t prev[4][2]{};
+    MtpBatchScratch scratch;
+    auto& limits = scratch.limits;
+    auto& counts = scratch.counts;
+    auto& prev = scratch.prev;
     // No graph launches until all ownership, shape and capture checks succeed.
     for (size_t i = 0; i < batch.size(); ++i) {
         const auto& r = batch[i];
         if (!r.drafter || r.drafter->device_ != batch[0].drafter->device_ || !r.tokens || !r.drafts ||
             r.count < 1 || r.count > r.drafter->max_t_ || r.accepted < 0 || r.accepted >= r.count) {
             err = "mtp batch: invalid round"; return false;
-        }
-        for (size_t j = 0; j < i; ++j) if (batch[j].drafter == r.drafter) {
-            err = "mtp batch: duplicate drafter"; return false;
         }
         auto& d = *r.drafter;
         limits[i] = std::min(d.max_t_ - 1, d.max_drafts_);
@@ -1912,7 +1912,7 @@ bool MtpDrafter::draft_batch(const std::vector<DraftRound>& batch, std::string& 
         SessionState* ss = d.ple_ss_ ? d.ple_ss_ : d.ss_;
         if (token < 0 || !ss || !ss->ple.ready() || !ss->ple.table) return;
         uint32_t rows[strata::kernels::PLE_N_HEADS];
-        strata::kernels::ngram_rows(&token, prev[i], 1, ss->ple.consts, rows);
+        strata::kernels::ngram_rows(&token, prev[i].data(), 1, ss->ple.consts, rows);
         prev[i][0] = prev[i][1]; prev[i][1] = token;
         ss->ple.table->prefetch_rows(rows);
     };
@@ -1931,7 +1931,9 @@ bool MtpDrafter::draft_batch(const std::vector<DraftRound>& batch, std::string& 
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     for (int step = 0; ; ++step) {
-        bool active[4]{}, any = false;
+        auto& active = scratch.active;
+        active.fill(false);
+        bool any = false;
         for (size_t i = 0; i < batch.size(); ++i) {
             const auto& r = batch[i]; auto& d = *r.drafter;
             if (step >= limits[i] || (step && (counts[i] != step ||
