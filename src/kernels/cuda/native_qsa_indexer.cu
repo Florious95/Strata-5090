@@ -22,6 +22,7 @@
 #include "strata/core/geometry.hpp"
 #include "strata/kernels/mrope.hpp"
 #include <cuda_runtime.h>
+#include "strata/kernels/batch_device_ops.hpp"
 #include <cuda_fp16.h>
 #include <atomic>
 #include <cmath>
@@ -128,6 +129,27 @@ __global__ void append(const float* __restrict__ raw, const int32_t* __restrict_
     append_body<TAB>(raw, pos_dev, pos_stride, n_steps, pos_base, gamma, epsilon, tail, dead, pooled, block_pos, max_cells,
                      theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, mtab, rt);
 }
+template <bool TAB>
+__global__ void batch_indexer_kernel(DeviceBatchView view, int qi, int begin, int end,
+    const float* raw, const int32_t* steps, const float* gamma, float eps,
+    float theta_scale, RopeKernelArgs k, RopeTab rt, bool committing) {
+    const auto* seg = batch_device_segment(view, blockIdx.x, begin, end, committing);
+    if (!seg) return;
+    const auto* q = batch_device_qsa(view, *seg, qi);
+    if (!q) return;
+    for (int i = threadIdx.x; i < (R - 1) * D; i += blockDim.x) {
+        if (committing) q->idx_tail[i] = q->tail_snapshot[i];
+        else q->tail_snapshot[i] = q->idx_tail[i];
+    }
+    __syncthreads();
+    const int n = committing ? view.commit->keep_by_segment[blockIdx.x] : seg->length;
+    append_body<TAB>(raw + (size_t)seg->first * D,
+        steps + (size_t)seg->first * kStepCount + kStepPos, kStepCount, n, 0,
+        gamma, eps, q->idx_tail, q->idx_dead, q->idx_pooled, q->idx_block_pos,
+        (int)q->max_cells, theta_scale, k.freq_scale, k.corr_low, k.corr_high,
+        k.ext_factor, k.attn_factor, nullptr, rt);
+}
+
 // engine-latency: the commit's appends of several QSA layers in one launch, one block per layer (blockIdx.x); each block
 // first restores its layer's tail from the window's snapshot (the commit's copy_from_mapped), then runs append's body
 template <bool TAB>
@@ -263,6 +285,24 @@ bool overlaps(Span a, Span b) {
     return x < y + b.n && y < x + a.n;
 }
 } // namespace
+
+void batch_device_indexer(DeviceBatchView v, int qi, int begin, int end, const float* raw,
+    const int32_t* steps, const float* gamma, float eps, const QsaShapes& s,
+    const RopeScaling& scaling, bool committing, void* stream) {
+    if (s.idx_dim != D || s.idx_block != R || s.n_rot != ROT || !stream || mrope_table())
+        throw std::invalid_argument("batch device indexer requires Flash text geometry and explicit stream");
+    const float theta = powf((float)scaling.freq_base, -2.0f / ROT);
+    const auto k = scaling.kernel_args(ROT);
+    const auto rt = rope_table_for(scaling);
+    if (rt.cos)
+        batch_indexer_kernel<true><<<kDeviceBatchSlots, THREADS, 0, (cudaStream_t)stream>>>(
+            v, qi, begin, end, raw, steps, gamma, eps, theta, k, rt, committing);
+    else
+        batch_indexer_kernel<false><<<kDeviceBatchSlots, THREADS, 0, (cudaStream_t)stream>>>(
+            v, qi, begin, end, raw, steps, gamma, eps, theta, k, rt, committing);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
 
 void native_qsa_indexer_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_qsa_indexer_enabled() { return enabled.load(std::memory_order_relaxed); }

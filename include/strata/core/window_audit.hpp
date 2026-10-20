@@ -76,7 +76,9 @@ struct AuditDispatch {
     int kv_mode = 0, scalar_resolves = 0, union_resolves = 0;
     const char* execution_path = "legacy";
     const char* graph_key_kind = "legacy_layout";
-    int graph_key_rows = 0, graph_owner_slot = -1;
+    int graph_key_rows = 0, graph_owner_slot = -1, graph_key_cut = 0;
+    uint32_t graph_key_profile = 0;
+    int table_score_launches = 0, table_score_segments = 0, table_attn_launches = 0, table_attn_rows = 0;
     uint64_t graph_address_epoch = 0;
 };
 struct AuditWindow {
@@ -89,7 +91,7 @@ struct AuditConfig {
     int slots = 0, max_rows = 0;
     int64_t max_context = 0, resident_requested = 0;
     std::vector<int64_t> effective_resident;
-    bool generalized = false, canonical = false, segmented = false, slot_solo = false;
+    bool generalized = false, canonical = false, segmented = false, slot_solo = false, row_table = false;
     int solo_graph_limit = 0;
     std::string engine_version, source_sha;
     int source_dirty = -1;
@@ -156,7 +158,7 @@ public:
              (c.source_dirty < 0 ? "null" : boolean(c.source_dirty != 0)) + "},\"capabilities\":{" +
              "\"generalized\":" + boolean(c.generalized) + ",\"canonical_admission\":" + boolean(c.canonical) +
              ",\"segmented_verify\":" + boolean(c.segmented) + ",\"streaming\":" + boolean(streaming) +
-             ",\"slot_solo\":" + boolean(c.slot_solo) + ",\"row_table\":false" +
+             ",\"slot_solo\":" + boolean(c.slot_solo) + ",\"row_table\":" + boolean(c.row_table) +
              ",\"slot_solo_target_graph_limit\":" + num(c.solo_graph_limit) +
              ",\"slot_solo_commit_graph_limit\":" + num(c.slot_solo ? 4 : 0) +
              ",\"max_rows\":" + num(c.max_rows) + ",\"max_dense_groups\":2,\"audit_all_batch_paths\":true}," +
@@ -277,6 +279,10 @@ public:
             boolean(d.graph_hit) + ",\"execution_path\":" + quote(d.execution_path) +
             ",\"graph_key_kind\":" + quote(d.graph_key_kind) + ",\"graph_key_rows\":" + num(d.graph_key_rows) +
             ",\"graph_owner_slot\":" + num(d.graph_owner_slot) + ",\"graph_address_epoch\":" + num(d.graph_address_epoch) +
+            ",\"graph_key_cut\":" + num(d.graph_key_cut) + ",\"graph_key_profile\":" + num(d.graph_key_profile) +
+            ",\"row_table_qsa_calls\":{\"score_launches\":" + num(d.table_score_launches) +
+            ",\"score_segments\":" + num(d.table_score_segments) + ",\"attention_launches\":" + num(d.table_attn_launches) +
+            ",\"attention_rows\":" + num(d.table_attn_rows) + "}" +
             ",\"fallback_reason\":" + (d.generalized ? "null" : quote("reference-policy")) + "}}";
         totals("target_decode", w.route, true, emitted);
         return write(s, 1);

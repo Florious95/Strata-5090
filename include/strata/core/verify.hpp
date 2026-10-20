@@ -20,6 +20,7 @@
 // Requires the default native decode configuration (native projections, fused GR, fused GDN, fast attention and
 // selection, native indexer) and a profile-filled VRAM expert tier with its residency table on the device.
 #pragma once
+#include "strata/core/batch_device_layout.hpp"
 
 #include "strata/core/slot_solo.hpp"
 
@@ -251,6 +252,10 @@ public:
     int batch_qsa_scalar_resolves() const { return last_batch_ || last_slot_solo_ ? last_head_.qsa_scalar_resolves : 0; }
     int batch_qsa_union_resolves() const { return last_batch_ || last_slot_solo_ ? last_head_.qsa_union_resolves : 0; }
     bool batch_graph_cache_hit() const { return batch_graph_cache_hit_; }
+    int row_table_score_launches() const { return last_row_table_ ? last_head_.table_scores : 0; }
+    int row_table_score_segments() const { return last_row_table_ ? last_head_.table_segments : 0; }
+    int row_table_attention_launches() const { return last_row_table_ ? last_head_.table_attn : 0; }
+    int row_table_attention_rows() const { return last_row_table_ ? last_head_.table_rows : 0; }
     bool batch_host_profile_enabled() const { return host_prof_on_; }
     const BatchHostProfile& batch_host_profile() const { return host_prof_; }
     bool batch_ring_profile_enabled() const { return ring_prof_on_; }
@@ -264,6 +269,11 @@ public:
                        int32_t* out, std::string& err, bool segmented = false);
     /// Direct admission/teacher-forced reads on one canonical slot. Keeps scalar sampling/history
     /// and head-sampling suppression while using the slot graph; commit with commit_slots().
+    bool prepare_row_table(std::string& err) { return !row_table_ || init_device_table(err); }
+    bool row_table_enabled() const { return row_table_; }
+    bool last_row_table() const { return last_row_table_; }
+    uint64_t row_table_epoch() const { return row_table_epoch_; }
+    bool set_slot_request_generation(int slot, uint64_t generation, std::string& err);
     bool run_admission_slot(int slot, int T, const int32_t* tokens, int64_t pos0,
                             PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     // Dispatcher-owned lifetime: binding MUST span run, row-local sampling,
@@ -287,7 +297,11 @@ public:
     bool prewarm_slot_solo(int T, std::string& err);
     bool last_slot_solo() const { return last_slot_solo_; }
     int graph_owner_slot() const { return last_slot_solo_ ? last_solo_owner_ : -1; }
-    uint64_t graph_address_epoch() const { return last_slot_solo_ ? solo_epoch_[last_solo_owner_] : 0; }
+    uint64_t graph_address_epoch() const { return last_slot_solo_ ? solo_epoch_[last_solo_owner_] : last_row_table_ ? row_table_epoch_ : 0; }
+    int graph_key_cut() const { return last_row_table_ ? batch_dense_boundary_ : 0; }
+    uint32_t graph_key_profile() const {
+        return last_row_table_ && h_window_ ? h_window_->profile : 0;
+    }
     /// Experimental single-stage causal segments, at most max_t total rows.
     /// Repeated slot IDs must be contiguous, with consecutive absolute positions.
     bool commit_segment_prefixes(const int* keep, std::string& err);
@@ -454,6 +468,7 @@ private:
         int type = -1; bool wide = false;
         int qsa_tiles = 0, qsa_rows = 0, qsa_scalar = 0;
         int qsa_scalar_resolves = 0, qsa_union_resolves = 0;
+        int table_scores = 0, table_segments = 0, table_attn = 0, table_rows = 0;
     };
     HeadDispatch record_head_, last_head_;
     SoloGraphBank<cudaGraphExec_t> solo_graphs_[4];
@@ -470,8 +485,30 @@ private:
     uint64_t bm_tick_ = 0;
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
     int last_rows_[kBatchMaxRows] = {};                ///< the slots of the last batch window's rows
+    bool row_table_ = false, batch_table_active_ = false, last_row_table_ = false;
+    void* device_table_arena_ = nullptr;
+    strata::kernels::DeviceBatchView device_batch_;
+    strata::kernels::DeviceSlotTable table_snapshot_;
+    strata::kernels::DeviceWindowLayout *h_window_ = nullptr, *m_window_ = nullptr;
+    strata::kernels::DeviceCommitLayout *h_device_commit_ = nullptr, *m_device_commit_ = nullptr;
+    uint32_t *h_table_status_ = nullptr, *m_table_status_ = nullptr;
+    uint64_t row_table_epoch_ = 1, row_table_sequence_ = 0;
+    uint32_t device_execution_profile() const {
+        return 0x100u | (ar_off_ ? 1u : 0u) | (batch_expert_merged_ ? 2u : 0u) |
+            (batch_dense_parallel_ ? 4u : 0u) | (batch_shared_after_ring_ ? 8u : 0u) |
+            (batch_generalized_ ? 16u : 0u);
+    }
+    std::array<uint64_t, 4> slot_generation_ = {}, owner_address_epoch_ = {1, 1, 1, 1};
+    std::vector<uintptr_t> table_owner_profile_[4];
+    bool init_device_table(std::string& err);
+    bool stage_device_window(const int* rows, int S, int hbase, const int64_t* pos, std::string& err);
+    bool device_table_status(std::string& err) const;
+    bool capture_device_commit(cudaGraphExec_t& ex, const std::vector<int>& key, std::string& err);
+    void current_table_qsa_counts(const int* rows, int S);
     std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
-        std::vector<int> k = batch_key(rows, S, hbase);
+        // All mutable owner pointers and complete segments are runtime device
+        // inputs. The family has frozen geometry/addresses and explicit profile.
+        std::vector<int> k = batch_table_active_ ? std::vector<int>{-2, S} : batch_key(rows, S, hbase);
         k.push_back(ar_off_ ? 1 : 0);
         k.push_back(batch_expert_merged_ ? 1 : 0);
         k.push_back(batch_dense_boundary_);

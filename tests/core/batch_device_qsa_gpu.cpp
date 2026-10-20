@@ -1,0 +1,212 @@
+// Synthetic full-Q4 Host/map/indexer/selection/attention contract, no weights.
+// CLOCK placement is not compared bitwise: concurrent miss-list order is not an
+// arithmetic contract. Each selected logical page must equal authoritative Host.
+#include "strata/core/batch_device_layout.hpp"
+#include "strata/kernels/batch_device_ops.hpp"
+#include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/native_qsa_indexer.hpp"
+#include "strata/kernels/qsa_select.hpp"
+#include "strata/kernels/qsa.hpp"
+#include <cuda_runtime.h>
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <vector>
+namespace k = strata::kernels;
+namespace c = strata::core;
+void ck(cudaError_t e, const char* what) {
+    if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e)); std::exit(2); }
+}
+void require(bool ok, const char* what) { if (!ok) { std::fprintf(stderr,"FAIL %s\n",what);std::exit(1); } }
+template<class T> struct Buffer {
+    T* p = nullptr; size_t size;
+    explicit Buffer(size_t n) : size(n) { ck(cudaMalloc((void**)&p,n*sizeof(T)),"alloc");zero(); }
+    ~Buffer() { cudaFree(p); }
+    Buffer(const Buffer&) = delete;
+    void zero() { ck(cudaMemset(p,0,size*sizeof(T)),"zero"); }
+    void upload(const std::vector<T>& v) { require(v.size()==size,"upload shape");ck(cudaMemcpy(p,v.data(),size*sizeof(T),cudaMemcpyHostToDevice),"upload"); }
+    void object(const T& value) { require(size==1,"object shape");ck(cudaMemcpy(p,&value,sizeof(T),cudaMemcpyHostToDevice),"object"); }
+    std::vector<T> download() const { std::vector<T> v(size);ck(cudaMemcpy(v.data(),p,size*sizeof(T),cudaMemcpyDeviceToHost),"download");return v; }
+};
+struct Host {
+    uint8_t *p=nullptr,*device=nullptr;size_t size;
+    Host(size_t n,int owner,int plane):size(n) {
+        ck(cudaHostAlloc((void**)&p,n,cudaHostAllocMapped),"Host alloc");
+        ck(cudaHostGetDevicePointer((void**)&device,p,0),"Host map");
+        for(size_t i=0;i<n;i+=18) { p[i]=0;p[i+1]=0x28;for(int j=2;j<18;++j)p[i+j]=uint8_t(0x78+owner*17+plane*5+(i/18)%13); }
+    }
+    ~Host(){cudaFreeHost(p);} Host(const Host&)=delete;
+};
+float rf(uint32_t& s){s^=s<<13;s^=s>>17;s^=s<<5;return float(int32_t(s))/2147483648.0f;}
+constexpr int Cells=262144, Slots=5120, Blocks=Cells/4, Rows=12, PBytes=4*2*144;
+const k::QsaShapes Shape=k::qsa_real_shapes();
+const int Cap=(int)k::qsa_selection_width(k::kTopkMaxCells,Shape), MaxBlocks=Blocks+2;
+const size_t Stride=k::qsa_decode_attn_scratch_floats(Cap,Shape);
+struct Owner {
+    Host hk,hv;
+    Buffer<uint8_t> kp{size_t(Slots)*PBytes},vp{size_t(Slots)*PBytes};
+    Buffer<int32_t> page{Blocks},block{Slots},stamp{Slots},ref{Slots},ctl{k::kKvCtlInts},miss{Slots},where{Slots};
+    Buffer<float> tail{384},dead{128},pooled{size_t(MaxBlocks)*128},snap{384};Buffer<int32_t> idxpos{1};
+    k::DeviceQsaSlot q{};
+    Owner(int b):hk(size_t(Cells)*2*144,b,0),hv(size_t(Cells)*2*144,b,1) {
+        q.pools.k_q4=kp.p;q.pools.v_q4=vp.p;q.pools.page_table=page.p;
+        q.host.k_q4=hk.device;q.host.v_q4=hv.device;
+        q.map={page.p,block.p,stamp.p,ref.p,ctl.p,miss.p,where.p,Blocks,Slots};
+        q.idx_tail=tail.p;q.idx_dead=dead.p;q.idx_pooled=pooled.p;q.idx_block_pos=idxpos.p;
+        q.tail_snapshot=snap.p;q.max_cells=Cells;q.address_epoch=1;q.flags=7;
+        uint32_t seed=0x27193+b*1337;
+        std::vector<float> x(pooled.size);for(auto& f:x)f=rf(seed);pooled.upload(x);
+        x.resize(128);for(auto& f:x)f=rf(seed);dead.upload(x);
+    }
+    void reset(cudaStream_t stream) {
+        k::kv_stream_reset(q.map,stream);
+        ck(cudaMemsetAsync(kp.p,0,kp.size,stream),"reset K");
+        ck(cudaMemsetAsync(vp.p,0,vp.size,stream),"reset V");
+        ck(cudaMemsetAsync(tail.p,0,tail.size*4,stream),"reset tail");
+        ck(cudaMemsetAsync(idxpos.p,0,4,stream),"reset block pos");
+    }
+    void check_map() {
+        const auto pt=page.download(),sb=block.download();
+        for(int b=0;b<Blocks;++b) require(pt[b]>=-1 && pt[b]<Slots &&
+            (pt[b]<0 || sb[pt[b]]==b),"complete page map bijection, no pending claim");
+        for(int s=0;s<Slots;++s) require(sb[s]>=-1 && sb[s]<Blocks &&
+            (sb[s]<0 || pt[sb[s]]==s),"complete slot map inverse");
+    }
+    void check_pages(const std::vector<int32_t>& ids,const std::vector<int32_t>& steps,const k::WindowSegment& s) {
+        const auto pt=page.download(),sb=block.download();const auto keys=kp.download(),values=vp.download();
+        for(int r=s.first;r<s.first+s.length;++r)for(int j=0;j<steps[r*k::kStepCount+k::kStepWidth];++j) {
+            const int b=ids[size_t(r)*Cap+j]/4,slot=pt[b];
+            require(slot>=0&&slot<Slots&&sb[slot]==b,"selected page mapping bijection");
+            require(!std::memcmp(keys.data()+size_t(slot)*PBytes,hk.p+size_t(b)*PBytes,PBytes),"resident K equals logical Host page");
+            require(!std::memcmp(values.data()+size_t(slot)*PBytes,hv.p+size_t(b)*PBytes,PBytes),"resident V equals logical Host page");
+        }
+    }
+};
+struct Work {
+    Buffer<float> raw{Rows*128},queries{Rows*512},query{Rows*24*256},key{Rows*2*256},value{Rows*2*256};
+    Buffer<float> scores{size_t(Rows)*MaxBlocks},scratch{Rows*Stride},out{Rows*24*256};
+    Buffer<int32_t> steps{Rows*k::kStepCount},ids{size_t(Rows)*Cap};
+    void inputs(uint32_t seed,const std::vector<int32_t>& st) {
+        auto fill=[&](Buffer<float>& b,float scale){std::vector<float>x(b.size);for(auto&f:x)f=scale*rf(seed);b.upload(x);};
+        fill(raw,0.2f);fill(queries,0.1f);fill(query,0.1f);fill(key,0.2f);fill(value,0.2f);
+        steps.upload(st);ck(cudaMemset(scores.p,0x7f,scores.size*4),"score poison");
+        ck(cudaMemset(ids.p,0x7f,ids.size*4),"ID poison");ck(cudaMemset(out.p,0x7f,out.size*4),"out poison");
+    }
+};
+template<class T> void equal(const Buffer<T>& a,const Buffer<T>& b,const char* name) {
+    const auto x=a.download(),y=b.download();
+    if(std::memcmp(x.data(),y.data(),x.size()*sizeof(T))) {
+        size_t i=0;while(i<x.size()&&!std::memcmp(&x[i],&y[i],sizeof(T)))++i;
+        std::fprintf(stderr,"bit mismatch %s element=%zu\n",name,i);std::exit(1);
+    }
+}
+void legacy_target(std::array<std::unique_ptr<Owner>,4>& owners,Work& w,const k::DeviceWindowLayout& d,
+                   Buffer<float>& gamma,const k::RopeScaling& rope,cudaStream_t stream) {
+    for(uint32_t i=0;i<d.segments;++i) {
+        const auto&s=d.segment[i];auto&o=*owners[s.slot];
+        ck(cudaMemcpyAsync(o.snap.p,o.tail.p,384*4,cudaMemcpyDeviceToDevice,stream),"tail snapshot");
+        k::kv_append_q4_steps(o.kp.p,o.vp.p,o.page.p,w.steps.p+size_t(s.first)*k::kStepCount,
+            k::kStepCount,s.length,w.key.p+size_t(s.first)*512,w.value.p+size_t(s.first)*512,Shape,stream,&o.q.host);
+        k::QsaIndexerBuffers ib{o.tail.p,o.dead.p,o.pooled.p,o.idxpos.p};
+        k::native_qsa_indexer_append_steps(w.raw.p+s.first*128,w.steps.p+s.first*k::kStepCount+k::kStepPos,
+            k::kStepCount,s.length,0,gamma.p,1e-6f,ib,Shape,Cells,rope,stream);
+        k::qsa_block_scores(o.pooled.p,o.dead.p,w.queries.p+s.first*512,w.steps.p+s.first*k::kStepCount,
+            s.length,MaxBlocks,Shape,w.scores.p+size_t(s.first)*MaxBlocks,stream);
+        k::qsa_block_topk(w.scores.p+size_t(s.first)*MaxBlocks,w.steps.p+s.first*k::kStepCount,
+            s.length,MaxBlocks,Cap,Shape,w.ids.p+size_t(s.first)*Cap,stream);
+        k::kv_stream_resolve(o.q.map,o.q.pools,o.q.host,k::kKvQ4,w.ids.p+size_t(s.first)*Cap,
+            w.steps.p+s.first*k::kStepCount,s.length,Cap,Shape,stream);
+        k::qsa_decode_attn_batch(w.query.p+s.first*24*256,o.q.pools,w.ids.p+size_t(s.first)*Cap,
+            w.steps.p+s.first*k::kStepCount,Cap,Shape,w.scratch.p+s.first*Stride,w.out.p+s.first*24*256,s.length,stream);
+    }
+}
+void table_target(k::DeviceBatchView view,Work& w,int rows,int cut,Buffer<float>& gamma,
+                  const k::RopeScaling& rope,cudaStream_t stream) {
+    const int bound[3]={0,cut?cut:rows,rows};
+    for(int group=0;group<(cut?2:1);++group) {
+        const int a=bound[group],b=bound[group+1];
+        k::batch_device_kv_append(view,0,a,b,w.steps.p,w.key.p,w.value.p,Shape,stream);
+        k::batch_device_indexer(view,0,a,b,w.raw.p,w.steps.p,gamma.p,1e-6f,Shape,rope,false,stream);
+        k::batch_device_scores(view,0,a,b,w.queries.p,w.steps.p,MaxBlocks,w.scores.p,Shape,stream);
+        k::qsa_block_topk(w.scores.p+size_t(a)*MaxBlocks,w.steps.p+a*k::kStepCount,b-a,MaxBlocks,Cap,Shape,w.ids.p+size_t(a)*Cap,stream);
+        k::batch_device_kv_resolve(view,0,a,b,w.ids.p,w.steps.p,Cap,Shape,stream);
+        k::batch_device_attention(view,0,a,b,w.query.p,w.ids.p,w.steps.p,Cap,Shape,w.scratch.p,w.out.p,stream);
+    }
+}
+int main() {
+#if defined(STRATA_USE_HIP) || defined(STRATA_GPU_METAL)
+    return 77;
+#endif
+    int devices=0;
+    if(cudaGetDeviceCount(&devices)!=cudaSuccess || devices<1) return 77;
+    size_t free_bytes=0,total_bytes=0;ck(cudaMemGetInfo(&free_bytes,&total_bytes),"memory info");
+    if(free_bytes<(8ull<<30)+(512ull<<20)) {
+        std::fprintf(stderr,"SKIP: preserving 8 GiB reserve with 512 MiB fixture allowance\n");return 77;
+    }
+    require(k::batch_device_scores_supported(),"normal score profile required");
+    std::array<std::unique_ptr<Owner>,4> ref,got;
+    for(int b=0;b<4;++b){ref[b]=std::make_unique<Owner>(b);got[b]=std::make_unique<Owner>(b);}
+    Work a,b;Buffer<float> gamma{128};gamma.upload(std::vector<float>(128,1.0f));
+    Buffer<k::DeviceSlotTable> table{1};Buffer<k::DeviceWindowLayout> window{1};
+    Buffer<k::DeviceCommitLayout> commit{1};Buffer<uint64_t> epoch{1};Buffer<uint32_t> status{1};epoch.object(1);
+    k::DeviceSlotTable host{};for(int s=0;s<4;++s){host.target[s].address_epoch=1;host.qsa[0][s]=got[s]->q;}table.object(host);
+    k::DeviceBatchView view{table.p,window.p,commit.p,epoch.p,status.p};
+    cudaStream_t stream{};ck(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking),"stream");
+    const k::RopeScaling rope{};
+    const std::vector<std::vector<std::pair<int,int>>> cases={{{0,6},{3,6}},{{3,3},{1,3},{0,3},{2,3}},
+        {{1,6},{2,6}},{{2,3},{0,3},{3,3},{1,3}},{{0,4},{2,4},{3,4}},{{3,8},{1,4}},{{2,4},{0,8}}};
+    std::map<std::pair<int,int>,cudaGraphExec_t> graphs;
+    int fixtures=0,replays=0;
+    for(int round=0;round<2;++round)for(const auto& layout:cases) {
+        int owner[Rows]{};int64_t positions[Rows]{};std::vector<int32_t> steps(Rows*k::kStepCount);int r=0;
+        for(const auto& [slot,len]:layout)for(int j=0;j<len;++j,++r) {
+            owner[r]=slot;positions[r]=round?258000+slot*17+j:31+slot*7+j;
+            k::qsa_step_fill(steps.data()+r*k::kStepCount,positions[r],Shape);
+        }
+        const int cut=c::segment_group_boundary(owner,Rows,true,true);
+        k::DeviceWindowLayout d;std::string error;
+        require(c::make_device_window(owner,positions,Rows,cut,{1,2,3,4},{1,1,1,1},fixtures+1,1,1,d,error),error.c_str());
+        int keep[4]{};for(uint32_t i=0;i<d.segments;++i)keep[d.segment[i].slot]=1+(fixtures+i)%d.segment[i].length;
+        k::DeviceCommitLayout cd;require(c::make_device_commit(d,keep,cd,error),error.c_str());
+        window.object(d);commit.object(cd);status.zero();a.inputs(0x1234+fixtures,steps);b.inputs(0x1234+fixtures,steps);
+        for(int s=0;s<4;++s){ref[s]->reset(stream);got[s]->reset(stream);}
+        ck(cudaDeviceSynchronize(),"reset and input sync");
+        const auto key=std::make_pair(Rows,cut);auto& graph=graphs[key];
+        if(!graph) {
+            cudaGraph_t raw{};ck(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal),"capture");
+            table_target(view,b,Rows,cut,gamma,rope,stream);
+            ck(cudaStreamEndCapture(stream,&raw),"end capture");ck(cudaGraphInstantiate(&graph,raw,0),"instantiate");ck(cudaGraphDestroy(raw),"graph destroy");
+        } else ++replays;
+        legacy_target(ref,a,d,gamma,rope,stream);ck(cudaGraphLaunch(graph,stream),"replay");ck(cudaStreamSynchronize(stream),"target sync");
+        require(status.download()[0]==0,"descriptor status");equal(a.scores,b.scores,"scores+inactive poison");equal(a.ids,b.ids,"IDs+inactive poison");equal(a.out,b.out,"attention+inactive poison");
+        const auto result=b.out.download();for(int i=0;i<Rows*24*256;++i)require(std::isfinite(result[i]),"finite attention");
+        const auto ids=b.ids.download();
+        for(uint32_t i=0;i<d.segments;++i){ref[d.segment[i].slot]->check_pages(ids,steps,d.segment[i]);got[d.segment[i].slot]->check_pages(ids,steps,d.segment[i]);}
+        for(int s=0;s<4;++s) {
+            ref[s]->check_map();got[s]->check_map();
+            const auto x=ref[s]->ctl.download(),y=got[s]->ctl.download();
+            require(x[0]==y[0] && x[2]==y[2] && x[3]==0 && y[3]==0,"resolver epoch/misses/no overflow");
+            for(int i=4;i<10;++i)require(x[i]==y[i],"integer resolver miss/lookup/call totals");
+            equal(ref[s]->tail,got[s]->tail,"target tail owner");equal(ref[s]->dead,got[s]->dead,"target dead owner");
+            equal(ref[s]->pooled,got[s]->pooled,"target pooled owner");equal(ref[s]->idxpos,got[s]->idxpos,"target block position owner");
+            require(!std::memcmp(ref[s]->hk.p,got[s]->hk.p,ref[s]->hk.size),"all Host K including inactive owners");
+            require(!std::memcmp(ref[s]->hv.p,got[s]->hv.p,ref[s]->hv.size),"all Host V including inactive owners");
+        }
+        for(uint32_t i=0;i<d.segments;++i){const auto&s=d.segment[i];auto&o=*ref[s.slot];
+            ck(cudaMemcpyAsync(o.tail.p,o.snap.p,384*4,cudaMemcpyDeviceToDevice,stream),"restore tail");
+            k::QsaIndexerBuffers ib{o.tail.p,o.dead.p,o.pooled.p,o.idxpos.p};
+            k::native_qsa_indexer_append_steps(a.raw.p+s.first*128,a.steps.p+s.first*k::kStepCount+k::kStepPos,
+                k::kStepCount,keep[s.slot],0,gamma.p,1e-6f,ib,Shape,Cells,rope,stream);
+        }
+        k::batch_device_indexer(view,0,0,Rows,b.raw.p,b.steps.p,gamma.p,1e-6f,Shape,rope,true,stream);
+        ck(cudaStreamSynchronize(stream),"commit sync");require(status.download()[0]==0,"commit status");
+        for(int s=0;s<4;++s){equal(ref[s]->tail,got[s]->tail,"commit tail owner");equal(ref[s]->dead,got[s]->dead,"commit dead owner");equal(ref[s]->pooled,got[s]->pooled,"commit pooled owner");equal(ref[s]->idxpos,got[s]->idxpos,"commit block position owner");}
+        ++fixtures;
+    }
+    for(auto& [key,g]:graphs)ck(cudaGraphExecDestroy(g),"exec destroy");ck(cudaStreamDestroy(stream),"stream destroy");
+    std::printf("PASS table Q4: %d fixtures, %zu rows-cut graph families, %d reused graphs; full logical 256K, Host/map/IDs/attention/commit, no weights\n",fixtures,graphs.size(),replays);
+}

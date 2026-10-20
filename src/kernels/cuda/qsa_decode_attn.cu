@@ -1,5 +1,6 @@
 // src/kernels/cuda/qsa_decode_attn.cu - see include/strata/kernels/qsa_decode_attn.hpp.
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/batch_device_ops.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/sm120_series.hpp"
 #include "strata/core/geometry.hpp"
@@ -1038,6 +1039,20 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
                                                                 n_chunks, (int) cap, stride);
 }
 
+template <bool LANE_CELL>
+__global__ void __launch_bounds__(THREADS) batch_device_attn_kernel(
+    DeviceBatchView v, int qi, int begin, int end, const float* query,
+    const int32_t* ids, const int32_t* steps, int heads, int page, float scale,
+    float* acc, float* m, float* l, int chunks, int cap, long long stride) {
+    const int row = begin + blockIdx.z;
+    const auto* seg = batch_device_row(v, row, begin, end);
+    if (!seg) return;
+    const auto* q = batch_device_qsa(v, *seg, qi);
+    if (!q) return;
+    attn_chunk_body<2, LANE_CELL, false, false>(query, q->pools, ids, steps,
+        heads, page, scale, acc, m, l, chunks, cap, stride);
+}
+
 // qsa_decode_attn_batch's merge pass over the partials launch_chunks_batch wrote; `v2` names the merge kernel
 void launch_merge_batch(const int32_t* steps, int64_t cap, const QsaShapes& s, const float* scratch, float* attn,
                         int64_t n_q, int v2, cudaStream_t st) {
@@ -1050,6 +1065,35 @@ void launch_merge_batch(const int32_t* steps, int64_t cap, const QsaShapes& s, c
 }
 
 }  // namespace
+
+void batch_device_attention(DeviceBatchView v, int qi, int begin, int end, const float* query,
+    const int32_t* ids, const int32_t* steps, int64_t cap, const QsaShapes& s,
+    float* scratch, float* attn, void* stream) {
+    const auto st = (cudaStream_t)stream;
+    const int chunks = (cap + CHUNK - 1) / CHUNK;
+    const long long stride = qsa_decode_attn_scratch_floats(cap, s);
+    float* acc = scratch + (size_t)begin * stride;
+    float* m = acc + (size_t)chunks * s.n_head * HD;
+    float* l = m + (size_t)chunks * s.n_head;
+    const dim3 grid(chunks, s.n_head_kv, end - begin);
+    const float scale = 1.0f / sqrtf((float)s.head_dim);
+    if (lane_cell_attn())
+        batch_device_attn_kernel<true><<<grid, THREADS, 0, st>>>(v, qi, begin, end,
+            query + (size_t)begin * s.n_head * HD, ids + (size_t)begin * cap,
+            steps + (size_t)begin * kStepCount, s.n_head_kv, s.page_size,
+            scale, acc, m, l, chunks, cap, stride);
+    else
+        batch_device_attn_kernel<false><<<grid, THREADS, 0, st>>>(v, qi, begin, end,
+            query + (size_t)begin * s.n_head * HD, ids + (size_t)begin * cap,
+            steps + (size_t)begin * kStepCount, s.n_head_kv, s.page_size,
+            scale, acc, m, l, chunks, cap, stride);
+    launch_merge_batch(steps + (size_t)begin * kStepCount, cap, s, acc,
+        attn + (size_t)begin * s.n_head * HD, end - begin, attn_merge_v2(), st);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        std::fprintf(stderr, "batch device attention: %s\n", cudaGetErrorString(error)); std::exit(1);
+    }
+}
 
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {

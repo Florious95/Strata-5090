@@ -3,6 +3,7 @@
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/batch_device_ops.hpp"
 #include "strata/core/geometry.hpp"
 #include "strata/core/emulate.hpp"
 #include "strata/kernels/q8_1_finite.hpp"   // #606: q8_1_ds
@@ -283,7 +284,7 @@ __device__ __forceinline__ void gdn_q8_1_store(GdnQ81* __restrict__ xq, size_t i
 }
 
 template <bool ALL_OUT, bool Q>
-__global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __restrict__ state,
+__device__ __forceinline__ void gdn_step_norm_multi_body(float* __restrict__ state,
                                                                      const float* __restrict__ hbuf, int C,
                                                                      const float* __restrict__ gate,
                                                                      const float* __restrict__ beta,
@@ -379,6 +380,102 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
 #pragma unroll
         for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
     }
+}
+
+// Both entry points retain the complete original arithmetic body.
+template <bool ALL_OUT, bool Q>
+__global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(
+    float* state, const float* hbuf, int C, const float* gate, const float* beta,
+    const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
+    const int32_t* n_keep, int t_out_begin, GdnQ81* xq, GdnGroups grp = {}) {
+    gdn_step_norm_multi_body<ALL_OUT, Q>(state, hbuf, C, gate, beta, z, gamma, eps,
+                                       y, h_k, h_v, T, n_keep, t_out_begin, xq, grp);
+}
+
+__device__ float* batch_gdn_state(DeviceBatchView v, const WindowSegment& seg,
+                                   int gi, BatchGdnShape g) {
+    const auto& owner = v.table->target[seg.slot];
+    if (!owner.gdn_base || gi < owner.gdn_ord0 || gi >= 36) {
+        batch_device_fail(v, kBatchBadOwner); return nullptr;
+    }
+    return owner.gdn_base + (int64_t)(gi - owner.gdn_ord0) * g.state_stride;
+}
+__global__ void __launch_bounds__(S) batch_gdn_conv_kernel(
+    DeviceBatchView v, int begin, int end, int gi, BatchGdnShape g,
+    const float* qkv, const float* weights, float* h, float eps) {
+    const int row = begin + blockIdx.y;
+    const auto* seg = batch_device_row(v, row, begin, end);
+    if (!seg) return;
+    float* state = batch_gdn_state(v, *seg, gi, g);
+    if (!state) return;
+    gdn_conv_l2_body(blockIdx.x, row - seg->first, state + g.conv_offset,
+                    qkv + (size_t)seg->first * g.channels, weights,
+                    h + (size_t)seg->first * g.channels, g.channels, 2 * g.key_heads, eps, 0, false);
+}
+__global__ void __launch_bounds__(S * RG) batch_gdn_step_kernel(
+    DeviceBatchView v, int begin, int end, int gi, BatchGdnShape g,
+    const float* h, const float* gate, const float* beta, const float* z,
+    const float* gamma, float* y, float eps) {
+    const auto* seg = batch_device_segment(v, blockIdx.y, begin, end);
+    if (!seg) return;
+    float* state = batch_gdn_state(v, *seg, gi, g);
+    if (!state) return;
+    const size_t f = seg->first;
+    gdn_step_norm_multi_body<true, false>(state, h + f * g.channels, g.channels,
+        gate + f * g.value_heads, beta + f * g.value_heads, z + f * S * g.value_heads,
+        gamma, eps, y + f * S * g.value_heads, g.key_heads, g.value_heads,
+        seg->length, nullptr, 0, nullptr);
+}
+__global__ void batch_gdn_commit_kernel(DeviceBatchView v, int gi, BatchGdnShape g,
+                                       const float* h, const float* gate, const float* beta) {
+    const auto* seg = batch_device_segment(v, blockIdx.z, 0, kDeviceBatchRows, true);
+    if (!seg) return;
+    float* state = batch_gdn_state(v, *seg, gi, g);
+    if (!state) return;
+    const size_t f = seg->first;
+    gdn_step_commit_body(state, h + f * g.channels, g.channels, gate + f * g.value_heads,
+                        beta + f * g.value_heads, g.key_heads, g.value_heads,
+                        v.commit->keep_by_segment[blockIdx.z]);
+}
+__global__ void batch_conv_commit_kernel(DeviceBatchView v, int gi, BatchGdnShape g,
+                                        const float* qkv) {
+    const auto* seg = batch_device_segment(v, blockIdx.y, 0, kDeviceBatchRows, true);
+    if (!seg) return;
+    float* state = batch_gdn_state(v, *seg, gi, g);
+    if (!state) return;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= g.channels) return;
+    float* hist = state + g.conv_offset;
+    const float* x = qkv + (size_t)seg->first * g.channels;
+    const int n = v.commit->keep_by_segment[blockIdx.y];
+    float seq[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int src = n + j;
+        seq[j] = src < 3 ? hist[c * 3 + src] : x[(size_t)(src - 3) * g.channels + c];
+    }
+#pragma unroll
+    for (int j = 0; j < 3; ++j) hist[c * 3 + j] = seq[j];
+}
+__global__ void batch_ple_copy_kernel(DeviceBatchView v, int row, float* history,
+                                     int64_t floats, bool to_slot) {
+    const auto* seg = batch_device_row(v, row, 0, kDeviceBatchRows);
+    if (!seg) return;
+    float* owner = v.table->target[seg->slot].ple_hist;
+    if (!owner) { batch_device_fail(v, kBatchBadOwner); return; }
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < floats;
+         i += (int64_t)gridDim.x * blockDim.x) {
+        if (to_slot) owner[i] = history[i]; else history[i] = owner[i];
+    }
+}
+__global__ void batch_ple_commit_kernel(DeviceBatchView v, const float* snapshots, int64_t floats) {
+    const auto* seg = batch_device_segment(v, blockIdx.y, 0, kDeviceBatchRows, true);
+    if (!seg) return;
+    float* owner = v.table->target[seg->slot].ple_hist;
+    if (!owner) { batch_device_fail(v, kBatchBadOwner); return; }
+    const float* src = snapshots + (int64_t)(seg->first + v.commit->keep_by_segment[blockIdx.y] - 1) * floats;
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < floats;
+         i += (int64_t)gridDim.x * blockDim.x) owner[i] = src[i];
 }
 
 // S25 (STRATA_GDN_SPLIT=1): the same recurrence with each head's 128 state columns over 4 blocks of 32 columns
@@ -1232,6 +1329,43 @@ __global__ void wait_flag_ge_stamped_kernel(const volatile uint32_t* flag, uint3
     if (t_out != nullptr) *t_out = strata_now_ns();
 }
 }  // namespace
+
+bool batch_device_gdn_supported() {
+    const char* split = std::getenv("STRATA_GDN_SPLIT");
+    const char* commit = std::getenv("STRATA_GDN_COMMIT_SPLIT");
+    const char* debug = std::getenv("STRATA_DBG_GDN");
+    return !(split && split[0] == '1') && !(commit && commit[0] == '0') &&
+           !(debug && debug[0] == '1');
+}
+void batch_device_gdn_conv(DeviceBatchView v, int begin, int end, int gi, BatchGdnShape g,
+                           const float* qkv, const float* weights, float* h, float eps, void* stream) {
+    batch_gdn_conv_kernel<<<dim3(g.channels / S, end - begin), S, 0, (cudaStream_t)stream>>>(
+        v, begin, end, gi, g, qkv, weights, h, eps);
+    check("batch device GDN conv");
+}
+void batch_device_gdn_step(DeviceBatchView v, int begin, int end, int gi, BatchGdnShape g,
+                           const float* h, const float* gate, const float* beta, const float* z,
+                           const float* gamma, float* y, float eps, void* stream) {
+    batch_gdn_step_kernel<<<dim3(g.value_heads, kDeviceBatchSlots), dim3(S, RG), 0, (cudaStream_t)stream>>>(
+        v, begin, end, gi, g, h, gate, beta, z, gamma, y, eps);
+    check("batch device GDN target");
+}
+void batch_device_gdn_commit(DeviceBatchView v, int gi, BatchGdnShape g, const float* qkv,
+                             const float* h, const float* gate, const float* beta, void* stream) {
+    const auto st = (cudaStream_t)stream;
+    batch_gdn_commit_kernel<<<dim3(g.value_heads, S / 32, kDeviceBatchSlots), dim3(32, RG), 0, st>>>(
+        v, gi, g, h, gate, beta);
+    batch_conv_commit_kernel<<<dim3((g.channels + 255) / 256, kDeviceBatchSlots), 256, 0, st>>>(v, gi, g, qkv);
+    check("batch device GDN commit");
+}
+void batch_device_ple_copy(DeviceBatchView v, int row, float* history, int64_t floats, bool to_slot, void* stream) {
+    batch_ple_copy_kernel<<<32, 256, 0, (cudaStream_t)stream>>>(v, row, history, floats, to_slot);
+    check("batch device PLE copy");
+}
+void batch_device_ple_commit(DeviceBatchView v, const float* snapshots, int64_t floats, void* stream) {
+    batch_ple_commit_kernel<<<dim3(32, kDeviceBatchSlots), 256, 0, (cudaStream_t)stream>>>(v, snapshots, floats);
+    check("batch device PLE commit");
+}
 
 void wait_handoff(const uint32_t* flag, uint32_t value, uint32_t* err, unsigned long long timeout_ns, void* stream) {
     wait_handoff_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, err, timeout_ns);
