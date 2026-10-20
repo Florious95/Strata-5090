@@ -1269,7 +1269,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # the QSA top-k the engine dispatches against the original kernel: identical ids on both sides of the register
   # kernel's reach, with tied and with equal scores (synthetic, no model)
   if(STRATA_ENABLE_CUDA)
-    foreach(_table_test IN ITEMS batch_device_table_gpu batch_device_qsa_gpu)
+    foreach(_table_test IN ITEMS batch_device_table_gpu batch_device_qsa_gpu batch_shared_stream_gpu)
       add_executable(${_table_test} tests/core/${_table_test}.cpp)
       target_include_directories(${_table_test} PRIVATE ${_strata_gpu_include_directories})
       target_link_libraries(${_table_test} PRIVATE strata_kernels ${_strata_gpu_runtime_target})
