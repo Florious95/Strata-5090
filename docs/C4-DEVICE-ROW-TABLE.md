@@ -23,7 +23,7 @@ A segmented graph is keyed by `(R, cut, frozen execution profile)`, not owner ID
 
 ## State and address lifetime
 
-`DeviceSlotTable` is non-owning. GDN, PLE, QSA pools, complete Q4 Host K/V, CLOCK-map arrays, indexer state, RoPE pointers and indexer-tail snapshots still belong to their canonical slots. No new SessionState, KV pool, weights or verifier arena is created.
+`DeviceSlotTable` is non-owning. GDN, PLE, QSA pools, complete Q4 Host K/V, CLOCK-map arrays, indexer state, RoPE pointers and indexer-tail snapshots still belong to their canonical slots. No new SessionState, KV pool, weights or verifier arena is created. `DeviceQsaPools` borrows writable Q4 pointers directly from `QsaState`; append and Host-to-VRAM resolve require that writer capability. Attention receives only its explicit `read_only()` view. A const descriptor freezes pointer identities, not the owned cache contents. No const reader is cast back to a writer.
 
 The ABI payload is 14,400 bytes: table 14,016 + window 352 + commit 32. The requested device allocation is 14,416 bytes including epoch/control alignment; separate mapped status and staging request 388 pinned bytes (not a claim about OS page-rounded physical allocation). Target and commit graph storage is additional and must be measured.
 
@@ -56,5 +56,14 @@ Legacy same-slot tile counters are zero on the new table path. They must not be 
 ## Required evidence before qualification
 
 Passed CPU ABI/layout/accounting checks are not GPU parity. Compile CUDA 13.3 / sm120; run dedicated synthetic table tests and existing GPU contracts, including full Q4 Host/map/union attention, all owner permutations, changed segment counts at the same key, accepted prefixes, inactive-owner poison and graph replays. Compare OFF/ON output token bits and post-commit canonical state, not only tokens. Also compare the default OFF build against the parent where possible: sharing a factored arithmetic body is not by itself historical-binary parity.
+
+Dedicated test targets (written, not a claim of GPU execution):
+
+```sh
+cmake --build build --target batch_device_table_gpu batch_device_qsa_gpu
+ctest --test-dir build --output-on-failure -R '^batch_device_(table|qsa)_gpu$'
+```
+
+Both must really execute and return zero; a return-77 CTest skip is not qualification. The GDN/PLE fixture exercises fixed-graph owner/segment changes and accepted-prefix commits. The QSA fixture plans 135 windows, widths 1..8, position 0, page/selection boundaries, 258K and terminal position 262141. Independent fixtures reset Host, pools, maps and indexer state. Follow windows retain accepted state, pre-resolve future append pages and compare resident append before a later resolve could conceal a missing mirror. CLOCK physical slot order is not compared bitwise; logical bijections, selected page bytes, integer counters and attention outputs are checked. These synthetic tests do not replace full-model OFF/ON canonical-state, sampling or parallel-native qualification.
 
 Only then run the frozen 258K workload, unchanged 262144 logical capacity / 20480 resident, one lane and four lanes, at least three paired rounds. Separate warmup by native request generation. Preserve failures and raw integer accounting. Monitor real graph-memory high water and retain the >=300 MiB device-free guard. No throughput or memory-headroom improvement is claimed by this document.

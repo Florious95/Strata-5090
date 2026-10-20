@@ -3600,7 +3600,10 @@ bool Verifier::init_device_table(std::string& err) {
                 err = "row table: requires Q4 rotated/streamed 20480 and fixed addresses"; return false;
             }
             auto& q = table_snapshot_.qsa[qi][b];
-            q.pools = qsa_attn_pools(st); q.host = st.host; q.map = st.map;
+            // Bind writers from canonical mutable ownership, never the const
+            // attention view returned by qsa_attn_pools(st).
+            q.pools.k_q4 = st.k_q4; q.pools.v_q4 = st.v_q4;
+            q.pools.page_table = st.page_table; q.host = st.host; q.map = st.map;
             q.idx_tail = st.idx_tail; q.idx_dead = st.idx_dead; q.idx_pooled = st.idx_pooled;
             q.idx_block_pos = st.idx_block_pos; q.cos_tab = st.cos_tab; q.sin_tab = st.sin_tab;
             q.tail_snapshot = tail_snap_b_ + ((size_t)b * 12 + qi) * (3 * g_->idx_key_dim);

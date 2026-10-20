@@ -21,8 +21,28 @@ struct alignas(16) DeviceTargetSlot {
     uint64_t address_epoch = 0;
     int32_t gdn_ord0 = 0, qsa_ord0 = 0;
 };
+// Writable pool capability borrowed directly from canonical QsaState, not from
+// QsaAttnPools (an attention-only const reader). Const descriptors freeze pointer
+// identities, not the storage that append/resolve must update. Keep the same
+// nine-pointer layout as the reader without permitting reader -> writer casts.
+struct DeviceQsaPools {
+    uint16_t *k_pool = nullptr, *v_pool = nullptr;
+    int8_t *k_q = nullptr, *v_q = nullptr;
+    uint16_t *k_scale = nullptr, *v_scale = nullptr;
+    uint8_t *k_q4 = nullptr, *v_q4 = nullptr;
+    const int32_t* page_table = nullptr;
+#if defined(__CUDACC__) || defined(__HIPCC__)
+    __host__ __device__
+#endif
+    QsaAttnPools read_only() const {
+        return {k_pool, v_pool, k_q, v_q, k_scale, v_scale, k_q4, v_q4, page_table};
+    }
+};
+static_assert(sizeof(DeviceQsaPools) == sizeof(QsaAttnPools));
+static_assert(offsetof(DeviceQsaPools, k_q4) == offsetof(QsaAttnPools, k_q4));
+static_assert(std::is_standard_layout_v<DeviceQsaPools> && std::is_trivially_copyable_v<DeviceQsaPools>);
 struct alignas(16) DeviceQsaSlot {
-    QsaAttnPools pools;
+    DeviceQsaPools pools;
     KvHostPools host;
     KvStreamMap map;
     float *idx_tail = nullptr, *idx_dead = nullptr, *idx_pooled = nullptr;

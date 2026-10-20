@@ -33,12 +33,14 @@ template<class T> struct Buffer {
     std::vector<T> download() const { std::vector<T> v(size);ck(cudaMemcpy(v.data(),p,size*sizeof(T),cudaMemcpyDeviceToHost),"download");return v; }
 };
 struct Host {
-    uint8_t *p=nullptr,*device=nullptr;size_t size;
+    uint8_t *p=nullptr,*device=nullptr;size_t size;std::vector<uint8_t> initial;
     Host(size_t n,int owner,int plane):size(n) {
         ck(cudaHostAlloc((void**)&p,n,cudaHostAllocMapped),"Host alloc");
         ck(cudaHostGetDevicePointer((void**)&device,p,0),"Host map");
         for(size_t i=0;i<n;i+=18) { p[i]=0;p[i+1]=0x28;for(int j=2;j<18;++j)p[i+j]=uint8_t(0x78+owner*17+plane*5+(i/18)%13); }
+        initial.assign(p,p+n);
     }
+    void reset(){std::memcpy(p,initial.data(),size);}
     ~Host(){cudaFreeHost(p);} Host(const Host&)=delete;
 };
 float rf(uint32_t& s){s^=s<<13;s^=s>>17;s^=s<<5;return float(int32_t(s))/2147483648.0f;}
@@ -51,7 +53,7 @@ struct Owner {
     Buffer<uint8_t> kp{size_t(Slots)*PBytes},vp{size_t(Slots)*PBytes};
     Buffer<int32_t> page{Blocks},block{Slots},stamp{Slots},ref{Slots},ctl{k::kKvCtlInts},miss{Slots},where{Slots};
     Buffer<float> tail{384},dead{128},pooled{size_t(MaxBlocks)*128},snap{384};Buffer<int32_t> idxpos{1};
-    k::DeviceQsaSlot q{};
+    k::DeviceQsaSlot q{};std::vector<float> initial_pooled,initial_dead;
     Owner(int b):hk(size_t(Cells)*2*144,b,0),hv(size_t(Cells)*2*144,b,1) {
         q.pools.k_q4=kp.p;q.pools.v_q4=vp.p;q.pools.page_table=page.p;
         q.host.k_q4=hk.device;q.host.v_q4=hv.device;
@@ -59,10 +61,11 @@ struct Owner {
         q.idx_tail=tail.p;q.idx_dead=dead.p;q.idx_pooled=pooled.p;q.idx_block_pos=idxpos.p;
         q.tail_snapshot=snap.p;q.max_cells=Cells;q.address_epoch=1;q.flags=7;
         uint32_t seed=0x27193+b*1337;
-        std::vector<float> x(pooled.size);for(auto& f:x)f=rf(seed);pooled.upload(x);
-        x.resize(128);for(auto& f:x)f=rf(seed);dead.upload(x);
+        initial_pooled.resize(pooled.size);for(auto& f:initial_pooled)f=rf(seed);pooled.upload(initial_pooled);
+        initial_dead.resize(128);for(auto& f:initial_dead)f=rf(seed);dead.upload(initial_dead);
     }
     void reset(cudaStream_t stream) {
+        hk.reset();hv.reset();pooled.upload(initial_pooled);dead.upload(initial_dead);snap.zero();
         k::kv_stream_reset(q.map,stream);
         ck(cudaMemsetAsync(kp.p,0,kp.size,stream),"reset K");
         ck(cudaMemsetAsync(vp.p,0,vp.size,stream),"reset V");
@@ -75,6 +78,15 @@ struct Owner {
             (pt[b]<0 || sb[pt[b]]==b),"complete page map bijection, no pending claim");
         for(int s=0;s<Slots;++s) require(sb[s]>=-1 && sb[s]<Blocks &&
             (sb[s]<0 || pt[sb[s]]==s),"complete slot map inverse");
+    }
+    void check_appended_pages(const std::vector<int32_t>& steps,const k::WindowSegment& s) {
+        const auto pt=page.download();const auto keys=kp.download(),values=vp.download();
+        for(int r=s.first;r<s.first+s.length;++r) {
+            const int b=steps[r*k::kStepCount+k::kStepPos]/4,slot=pt[b];
+            require(slot>=0&&slot<Slots,"append fixture page was already resident");
+            require(!std::memcmp(keys.data()+size_t(slot)*PBytes,hk.p+size_t(b)*PBytes,PBytes),"resident append K mirrored into pool");
+            require(!std::memcmp(values.data()+size_t(slot)*PBytes,hv.p+size_t(b)*PBytes,PBytes),"resident append V mirrored into pool");
+        }
     }
     void check_pages(const std::vector<int32_t>& ids,const std::vector<int32_t>& steps,const k::WindowSegment& s) {
         const auto pt=page.download(),sb=block.download();const auto keys=kp.download(),values=vp.download();
@@ -118,9 +130,9 @@ void legacy_target(std::array<std::unique_ptr<Owner>,4>& owners,Work& w,const k:
             s.length,MaxBlocks,Shape,w.scores.p+size_t(s.first)*MaxBlocks,stream);
         k::qsa_block_topk(w.scores.p+size_t(s.first)*MaxBlocks,w.steps.p+s.first*k::kStepCount,
             s.length,MaxBlocks,Cap,Shape,w.ids.p+size_t(s.first)*Cap,stream);
-        k::kv_stream_resolve(o.q.map,o.q.pools,o.q.host,k::kKvQ4,w.ids.p+size_t(s.first)*Cap,
+        k::kv_stream_resolve(o.q.map,o.q.pools.read_only(),o.q.host,k::kKvQ4,w.ids.p+size_t(s.first)*Cap,
             w.steps.p+s.first*k::kStepCount,s.length,Cap,Shape,stream);
-        k::qsa_decode_attn_batch(w.query.p+s.first*24*256,o.q.pools,w.ids.p+size_t(s.first)*Cap,
+        k::qsa_decode_attn_batch(w.query.p+s.first*24*256,o.q.pools.read_only(),w.ids.p+size_t(s.first)*Cap,
             w.steps.p+s.first*k::kStepCount,Cap,Shape,w.scratch.p+s.first*Stride,w.out.p+s.first*24*256,s.length,stream);
     }
 }
@@ -157,56 +169,106 @@ int main() {
     k::DeviceBatchView view{table.p,window.p,commit.p,epoch.p,status.p};
     cudaStream_t stream{};ck(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking),"stream");
     const k::RopeScaling rope{};
-    const std::vector<std::vector<std::pair<int,int>>> cases={{{0,6},{3,6}},{{3,3},{1,3},{0,3},{2,3}},
+    std::vector<std::vector<std::pair<int,int>>> cases={{{0,6},{3,6}},{{3,3},{1,3},{0,3},{2,3}},
         {{1,6},{2,6}},{{2,3},{0,3},{3,3},{1,3}},{{0,4},{2,4},{3,4}},{{3,8},{1,4}},{{2,4},{0,8}}};
-    std::map<std::pair<int,int>,cudaGraphExec_t> graphs;
-    int fixtures=0,replays=0;
-    for(int round=0;round<2;++round)for(const auto& layout:cases) {
-        int owner[Rows]{};int64_t positions[Rows]{};std::vector<int32_t> steps(Rows*k::kStepCount);int r=0;
-        for(const auto& [slot,len]:layout)for(int j=0;j<len;++j,++r) {
-            owner[r]=slot;positions[r]=round?258000+slot*17+j:31+slot*7+j;
-            k::qsa_step_fill(steps.data()+r*k::kStepCount,positions[r],Shape);
+    for(int width=1;width<=8;++width) cases.push_back({{width%4,width}});
+    Buffer<int32_t> warm_ids{8},warm_steps{k::kStepCount};
+    std::map<std::pair<int,int>,cudaGraphExec_t> graphs,append_graphs;
+    int fixtures=0,replays=0,resident_rows=0,zero_rows=0,terminal_rows=0,width_calls[9]{};
+    auto capture=[&](cudaGraphExec_t& graph,auto fn) {
+        cudaGraph_t raw{};ck(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal),"capture");fn();
+        ck(cudaStreamEndCapture(stream,&raw),"end capture");ck(cudaGraphInstantiate(&graph,raw,0),"instantiate");ck(cudaGraphDestroy(raw),"graph destroy");
+    };
+    for(int mode=0;mode<5;++mode)for(const auto& layout:cases) {
+        int owner[Rows]{};int64_t positions[Rows]{};int count=0,keep[4]{};
+        for(const auto& [slot,len]:layout) {
+            const int start=mode==0?0:mode==1?31+slot*7:mode==2?2051-len:
+                            mode==3?258000+slot*17:262142-len;
+            for(int j=0;j<len;++j,++count){owner[count]=slot;positions[count]=start+j;}
         }
-        const int cut=c::segment_group_boundary(owner,Rows,true,true);
-        k::DeviceWindowLayout d;std::string error;
-        require(c::make_device_window(owner,positions,Rows,cut,{1,2,3,4},{1,1,1,1},fixtures+1,1,1,d,error),error.c_str());
-        int keep[4]{};for(uint32_t i=0;i<d.segments;++i)keep[d.segment[i].slot]=1+(fixtures+i)%d.segment[i].length;
-        k::DeviceCommitLayout cd;require(c::make_device_commit(d,keep,cd,error),error.c_str());
-        window.object(d);commit.object(cd);status.zero();a.inputs(0x1234+fixtures,steps);b.inputs(0x1234+fixtures,steps);
+        const int cut=c::segment_group_boundary(owner,count,true,true);
+        const auto key=std::make_pair(count,cut);
         for(int s=0;s<4;++s){ref[s]->reset(stream);got[s]->reset(stream);}
-        ck(cudaDeviceSynchronize(),"reset and input sync");
-        const auto key=std::make_pair(Rows,cut);auto& graph=graphs[key];
-        if(!graph) {
-            cudaGraph_t raw{};ck(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal),"capture");
-            table_target(view,b,Rows,cut,gamma,rope,stream);
-            ck(cudaStreamEndCapture(stream,&raw),"end capture");ck(cudaGraphInstantiate(&graph,raw,0),"instantiate");ck(cudaGraphDestroy(raw),"graph destroy");
-        } else ++replays;
-        legacy_target(ref,a,d,gamma,rope,stream);ck(cudaGraphLaunch(graph,stream),"replay");ck(cudaStreamSynchronize(stream),"target sync");
-        require(status.download()[0]==0,"descriptor status");equal(a.scores,b.scores,"scores+inactive poison");equal(a.ids,b.ids,"IDs+inactive poison");equal(a.out,b.out,"attention+inactive poison");
-        const auto result=b.out.download();for(int i=0;i<Rows*24*256;++i)require(std::isfinite(result[i]),"finite attention");
-        const auto ids=b.ids.download();
-        for(uint32_t i=0;i<d.segments;++i){ref[d.segment[i].slot]->check_pages(ids,steps,d.segment[i]);got[d.segment[i].slot]->check_pages(ids,steps,d.segment[i]);}
-        for(int s=0;s<4;++s) {
-            ref[s]->check_map();got[s]->check_map();
-            const auto x=ref[s]->ctl.download(),y=got[s]->ctl.download();
-            require(x[0]==y[0] && x[2]==y[2] && x[3]==0 && y[3]==0,"resolver epoch/misses/no overflow");
-            for(int i=4;i<10;++i)require(x[i]==y[i],"integer resolver miss/lookup/call totals");
-            equal(ref[s]->tail,got[s]->tail,"target tail owner");equal(ref[s]->dead,got[s]->dead,"target dead owner");
-            equal(ref[s]->pooled,got[s]->pooled,"target pooled owner");equal(ref[s]->idxpos,got[s]->idxpos,"target block position owner");
-            require(!std::memcmp(ref[s]->hk.p,got[s]->hk.p,ref[s]->hk.size),"all Host K including inactive owners");
-            require(!std::memcmp(ref[s]->hv.p,got[s]->hv.p,ref[s]->hv.size),"all Host V including inactive owners");
+        ck(cudaDeviceSynchronize(),"independent fixture reset");
+        // A second window retains the first window's committed state and map.
+        // Near-end cases stop before a follow could exceed the logical capacity.
+        for(int phase=0;phase<(mode==4?1:2);++phase) {
+            std::vector<int32_t> steps(Rows*k::kStepCount);
+            for(int r=0;r<count;++r)k::qsa_step_fill(steps.data()+r*k::kStepCount,positions[r],Shape);
+            k::DeviceWindowLayout d;std::string error;
+            require(c::make_device_window(owner,positions,count,cut,{1,2,3,4},{1,1,1,1},fixtures+1,1,1,d,error),error.c_str());
+            for(uint32_t i=0;i<d.segments;++i)keep[d.segment[i].slot]=1+(fixtures+i)%d.segment[i].length;
+            k::DeviceCommitLayout cd;require(c::make_device_commit(d,keep,cd,error),error.c_str());
+            window.object(d);commit.object(cd);status.zero();a.inputs(0x1234+fixtures,steps);b.inputs(0x1234+fixtures,steps);
+            ck(cudaDeviceSynchronize(),"descriptor and input ready");
+            if(phase) {
+                // Pre-resolve every future append page, then test append alone
+                // before any later resolve can conceal a missing pool mirror.
+                for(uint32_t i=0;i<d.segments;++i) {
+                    const auto& s=d.segment[i];std::vector<int32_t> ids(8),st(k::kStepCount);
+                    for(int j=0;j<s.length;++j)ids[j]=(int32_t)positions[s.first+j];
+                    st[k::kStepWidth]=s.length;warm_ids.upload(ids);warm_steps.upload(st);
+                    ck(cudaDeviceSynchronize(),"warm IDs ready");
+                    for(Owner* o:{ref[s.slot].get(),got[s.slot].get()})
+                        k::kv_stream_resolve(o->q.map,o->q.pools.read_only(),o->q.host,k::kKvQ4,warm_ids.p,warm_steps.p,1,8,Shape,stream);
+                    ck(cudaStreamSynchronize(stream),"future pages resident");
+                    auto& o=*ref[s.slot];
+                    k::kv_append_q4_steps(o.kp.p,o.vp.p,o.page.p,a.steps.p+s.first*k::kStepCount,k::kStepCount,
+                        s.length,a.key.p+s.first*512,a.value.p+s.first*512,Shape,stream,&o.q.host);
+                }
+                auto& ag=append_graphs[key];
+                if(!ag)capture(ag,[&]{
+                    const int bounds[3]={0,cut?cut:count,count};
+                    for(int g=0;g<(cut?2:1);++g)k::batch_device_kv_append(view,0,bounds[g],bounds[g+1],b.steps.p,b.key.p,b.value.p,Shape,stream);
+                });
+                ck(cudaGraphLaunch(ag,stream),"resident append graph");ck(cudaStreamSynchronize(stream),"resident append sync");
+                require(status.download()[0]==0,"resident append descriptor status");
+                for(uint32_t i=0;i<d.segments;++i) {
+                    const auto& s=d.segment[i];ref[s.slot]->check_appended_pages(steps,s);got[s.slot]->check_appended_pages(steps,s);
+                    resident_rows+=s.length;
+                }
+            }
+            auto& graph=graphs[key];
+            if(!graph)capture(graph,[&]{table_target(view,b,count,cut,gamma,rope,stream);});else ++replays;
+            legacy_target(ref,a,d,gamma,rope,stream);ck(cudaGraphLaunch(graph,stream),"replay");ck(cudaStreamSynchronize(stream),"target sync");
+            require(status.download()[0]==0,"descriptor status");equal(a.scores,b.scores,"scores+inactive poison");equal(a.ids,b.ids,"IDs+inactive poison");equal(a.out,b.out,"attention+inactive poison");
+            const auto result=b.out.download();for(int i=0;i<count*24*256;++i)require(std::isfinite(result[i]),"finite attention");
+            const auto ids=b.ids.download();
+            for(uint32_t i=0;i<d.segments;++i){ref[d.segment[i].slot]->check_pages(ids,steps,d.segment[i]);got[d.segment[i].slot]->check_pages(ids,steps,d.segment[i]);}
+            for(int s=0;s<4;++s) {
+                ref[s]->check_map();got[s]->check_map();
+                const auto x=ref[s]->ctl.download(),y=got[s]->ctl.download();
+                require(x[0]==y[0] && x[2]==y[2] && x[3]==0 && y[3]==0,"resolver epoch/misses/no overflow");
+                for(int i=4;i<10;++i)require(x[i]==y[i],"integer resolver miss/lookup/call totals");
+                equal(ref[s]->tail,got[s]->tail,"target tail owner");equal(ref[s]->dead,got[s]->dead,"target dead owner");
+                equal(ref[s]->pooled,got[s]->pooled,"target pooled owner");equal(ref[s]->idxpos,got[s]->idxpos,"target block position owner");
+                require(!std::memcmp(ref[s]->hk.p,got[s]->hk.p,ref[s]->hk.size),"all Host K including inactive owners");
+                require(!std::memcmp(ref[s]->hv.p,got[s]->hv.p,ref[s]->hv.size),"all Host V including inactive owners");
+            }
+            for(uint32_t i=0;i<d.segments;++i){const auto&s=d.segment[i];auto&o=*ref[s.slot];
+                ck(cudaMemcpyAsync(o.tail.p,o.snap.p,384*4,cudaMemcpyDeviceToDevice,stream),"restore tail");
+                k::QsaIndexerBuffers ib{o.tail.p,o.dead.p,o.pooled.p,o.idxpos.p};
+                k::native_qsa_indexer_append_steps(a.raw.p+s.first*128,a.steps.p+s.first*k::kStepCount+k::kStepPos,
+                    k::kStepCount,keep[s.slot],0,gamma.p,1e-6f,ib,Shape,Cells,rope,stream);
+            }
+            k::batch_device_indexer(view,0,0,count,b.raw.p,b.steps.p,gamma.p,1e-6f,Shape,rope,true,stream);
+            ck(cudaStreamSynchronize(stream),"commit sync");require(status.download()[0]==0,"commit status");
+            for(int s=0;s<4;++s){equal(ref[s]->tail,got[s]->tail,"commit tail owner");equal(ref[s]->dead,got[s]->dead,"commit dead owner");equal(ref[s]->pooled,got[s]->pooled,"commit pooled owner");equal(ref[s]->idxpos,got[s]->idxpos,"commit block position owner");}
+            for(uint32_t i=0;i<d.segments;++i) {
+                const auto& s=d.segment[i];++width_calls[s.length];
+                for(int r=s.first;r<s.first+s.length;++r){zero_rows+=positions[r]==0;terminal_rows+=positions[r]==262141;}
+                const int64_t next=positions[s.first]+keep[s.slot];
+                for(int j=0;j<s.length;++j)positions[s.first+j]=next+j;
+            }
+            ++fixtures;
         }
-        for(uint32_t i=0;i<d.segments;++i){const auto&s=d.segment[i];auto&o=*ref[s.slot];
-            ck(cudaMemcpyAsync(o.tail.p,o.snap.p,384*4,cudaMemcpyDeviceToDevice,stream),"restore tail");
-            k::QsaIndexerBuffers ib{o.tail.p,o.dead.p,o.pooled.p,o.idxpos.p};
-            k::native_qsa_indexer_append_steps(a.raw.p+s.first*128,a.steps.p+s.first*k::kStepCount+k::kStepPos,
-                k::kStepCount,keep[s.slot],0,gamma.p,1e-6f,ib,Shape,Cells,rope,stream);
-        }
-        k::batch_device_indexer(view,0,0,Rows,b.raw.p,b.steps.p,gamma.p,1e-6f,Shape,rope,true,stream);
-        ck(cudaStreamSynchronize(stream),"commit sync");require(status.download()[0]==0,"commit status");
-        for(int s=0;s<4;++s){equal(ref[s]->tail,got[s]->tail,"commit tail owner");equal(ref[s]->dead,got[s]->dead,"commit dead owner");equal(ref[s]->pooled,got[s]->pooled,"commit pooled owner");equal(ref[s]->idxpos,got[s]->idxpos,"commit block position owner");}
-        ++fixtures;
     }
-    for(auto& [key,g]:graphs)ck(cudaGraphExecDestroy(g),"exec destroy");ck(cudaStreamDestroy(stream),"stream destroy");
-    std::printf("PASS table Q4: %d fixtures, %zu rows-cut graph families, %d reused graphs; full logical 256K, Host/map/IDs/attention/commit, no weights\n",fixtures,graphs.size(),replays);
+    for(auto& [key,g]:graphs)ck(cudaGraphExecDestroy(g),"exec destroy");
+    for(auto& [key,g]:append_graphs)ck(cudaGraphExecDestroy(g),"append exec destroy");
+    ck(cudaStreamDestroy(stream),"stream destroy");
+    require(zero_rows>0&&terminal_rows>0&&resident_rows>0,"boundary and resident fixtures executed");
+    for(int w=1;w<=8;++w)require(width_calls[w]>0,"all causal widths executed");
+    std::printf("PASS table Q4: %d windows, %zu target + %zu resident-append rows-cut graph families, %d target replays; resident_rows=%d pos0=%d terminal262141=%d; full logical256K, no weights\n",
+        fixtures,graphs.size(),append_graphs.size(),replays,resident_rows,zero_rows,terminal_rows);
+    for(int w=1;w<=8;++w)std::printf("width=%d windows=%d\n",w,width_calls[w]);
 }

@@ -36,7 +36,7 @@ DeviceSlotTable table_fixture() {
         uintptr_t base=uintptr_t(0x10000000000ull)+uintptr_t(qi*4+b)*uintptr_t(0x10000000000ull);
         auto next=[&](){base+=uintptr_t(0x100000000ull);return base;};
         q.pools.k_q4=pointer<uint8_t>(next());q.pools.v_q4=pointer<uint8_t>(next());
-        q.pools.page_table=pointer<int32_t>(next());q.map.page_table=const_cast<int32_t*>(q.pools.page_table);
+        q.map.page_table=pointer<int32_t>(next());q.pools.page_table=q.map.page_table;
         q.host.k_q4=pointer<uint8_t>(next());q.host.v_q4=pointer<uint8_t>(next());
         q.map.slot_block=pointer<int32_t>(next());q.map.slot_stamp=pointer<int32_t>(next());
         q.map.slot_ref=pointer<int32_t>(next());q.map.ctl=pointer<int32_t>(next());
@@ -66,6 +66,21 @@ DeviceWindow window(const std::vector<int>& owners,const std::vector<int>& width
 uint64_t recurrence(uint64_t state,int row) { return state*31+uint64_t(row+1); }
 }
 int main() {
+    // Writer capability must come from mutable canonical storage, never from an
+    // attention reader by stripping const. Publishing a reader only adds const.
+    static_assert(std::is_same_v<decltype(DeviceQsaSlot{}.pools.k_q4), uint8_t*>);
+    static_assert(std::is_same_v<decltype(DeviceQsaSlot{}.pools.v_q4), uint8_t*>);
+    static_assert(std::is_same_v<decltype(QsaAttnPools{}.k_q4), const uint8_t*>);
+    static_assert(!std::is_constructible_v<decltype(DeviceQsaSlot{}.pools), QsaAttnPools>);
+    uint8_t owned_k[2]{}, owned_v[2]{}; int32_t owned_map[1]{};
+    DeviceQsaSlot writable{};
+    writable.pools.k_q4=owned_k;writable.pools.v_q4=owned_v;writable.pools.page_table=owned_map;
+    const auto& frozen=writable;
+    frozen.pools.k_q4[1]=37;frozen.pools.v_q4[0]=91;
+    const auto reader=frozen.pools.read_only();
+    CHECK(owned_k[1]==37 && owned_v[0]==91);
+    CHECK(reader.k_q4==owned_k && reader.v_q4==owned_v && reader.page_table==owned_map);
+    CHECK(!reader.k_pool && !reader.v_pool && !reader.k_q && !reader.v_q && !reader.k_scale && !reader.v_scale);
     static_assert(sizeof(DeviceTargetSlot)==48 && sizeof(DeviceQsaSlot)==288);
     static_assert(sizeof(WindowRow)==16 && sizeof(WindowSegment)==32);
     static_assert(sizeof(DeviceSlotTable)==14016 && sizeof(DeviceWindowLayout)==352 && sizeof(DeviceCommitLayout)==32);

@@ -1049,7 +1049,7 @@ __global__ void __launch_bounds__(THREADS) batch_device_attn_kernel(
     if (!seg) return;
     const auto* q = batch_device_qsa(v, *seg, qi);
     if (!q) return;
-    attn_chunk_body<2, LANE_CELL, false, false>(query, q->pools, ids, steps,
+    attn_chunk_body<2, LANE_CELL, false, false>(query, q->pools.read_only(), ids, steps,
         heads, page, scale, acc, m, l, chunks, cap, stride);
 }
 
