@@ -1897,7 +1897,41 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const bool tile_on = batch_rec_ && qsa_tile && dec_batch && scores_multi &&
                     qsa_same_slot_tile(brow_, T, tb, te, tile_state.kv_mode,
                                        tile_state.kv_q4 && !tile_state.kv_hybrid);
-                if (tile_on) {
+                if (batch_rec_ && batch_generalized_ && qsa_tile && dec_batch && scores_multi) {
+                    // Dense groups may contain several independent slots. QSA tiles
+                    // instead follow complete causal slot segments, each with its own
+                    // Host backing and residency map. Resolve before this tile reads it.
+                    for (int first = tb; first < te;) {
+                        const int width = segment_width(brow_, te, first);
+                        const QsaState& sx = slot_ss(first).qsa_states[qi];
+                        const bool tiled = width >= 2 && width <= 8 && sx.kv_q4 && !sx.kv_hybrid &&
+                            s.idx_block == s.page_size &&
+                            (sx.kv_mode == 0 || (sx.kv_mode == 1 &&
+                             kv_stream_union_fits(sx.map.n_slots, width, cap_, s.page_size)));
+                        const int launches = tiled ? 1 : width;
+                        for (int j = 0; j < launches; ++j) {
+                            const int t = first + j, count = tiled ? width : 1;
+                            qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + t * IQ * ID,
+                                             step_ + t * kStepCount, count, max_blocks_, s,
+                                             scores_ + (size_t) t * max_blocks_, cs);
+                            qsa_block_topk(scores_ + (size_t) t * max_blocks_, step_ + t * kStepCount,
+                                           count, max_blocks_, cap_, s, sel_ + (size_t) t * cap_, cs);
+                            qsa_kv_resolve(sx, *g_, sel_ + (size_t) t * cap_, step_ + t * kStepCount,
+                                           count, cap_, cs);
+                            if (sx.kv_mode == 1) {
+                                if (tiled) ++record_head_.qsa_union_resolves;
+                                else ++record_head_.qsa_scalar_resolves;
+                            }
+                            qsa_decode_attn_batch(qcur_ + t * NH * HD, qsa_attn_pools(sx),
+                                                  sel_ + (size_t) t * cap_, step_ + t * kStepCount, cap_, s,
+                                                  attn_scratch_ + (size_t) t * attn_scratch_floats_,
+                                                  attn_ + t * NH * HD, count, cs);
+                            if (tiled) { ++record_head_.qsa_tiles; record_head_.qsa_rows += count; }
+                            else ++record_head_.qsa_scalar;
+                        }
+                        first += width;
+                    }
+                } else if (tile_on) {
                     // Same-slot rows retain their own causal steps; no cross-slot KV is shared.
                     qsa_block_scores(tile_state.idx_pooled, tile_state.idx_dead, qidx_ + tb * IQ * ID,
                                      step_ + tb * kStepCount, n, max_blocks_, s,
@@ -1972,6 +2006,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         qsa_block_topk(scores_ + (size_t) t * max_blocks_, step_ + t * kStepCount, 1, max_blocks_, cap_, s,
                                        sel_ + (size_t) t * cap_, cs);
                         qsa_kv_resolve(sx, *g_, sel_ + (size_t) t * cap_, step_ + t * kStepCount, 1, cap_, cs);
+                        if (sx.kv_mode == 1) ++record_head_.qsa_scalar_resolves;
                         const QsaAttnPools px = qsa_attn_pools(sx);
                         qsa_decode_attn_batch(qcur_ + t * NH * HD, px, sel_ + (size_t) t * cap_, step_ + t * kStepCount,
                                               cap_, s, attn_scratch_ + (size_t) t * attn_scratch_floats_,
@@ -3762,8 +3797,8 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
         native_router_enabled() && g_->n_expert == 512 && ss_->k == 10;
     // Small dual-slot windows use the same private tiles as wide windows. Never
     // split a single causal segment or change ordinary/pipelined/HIP batching.
-    const bool narrow_tiles = narrow_parallel_ && slots_.size() == 2 && mergeable && parallel_capable;
-    batch_dense_boundary_ = segmented ? segment_group_boundary(rows, S, narrow_tiles) : 0;
+    const bool narrow_tiles = narrow_parallel_ && (slots_.size() == 2 || batch_generalized_) && mergeable && parallel_capable;
+    batch_dense_boundary_ = segmented ? segment_group_boundary(rows, S, narrow_tiles, narrow_tiles && batch_generalized_) : 0;
     if (batch_dense_boundary_ < 0) { err = "verify: segments cannot fit two eight-row groups"; return false; }
     batch_expert_merged_ = mergeable && (S > 8 || (narrow_tiles && batch_dense_boundary_ > 0));
     batch_dense_parallel_ = batch_expert_merged_ && batch_dense_boundary_ > 0 && parallel_capable;
@@ -3776,23 +3811,39 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     // pairs, evicting the least recently used layout.  Without a limit the same eviction frees VRAM for a capture.
     const auto key = bkey(rows, S, hbase);
     bool evicted = false;
-    if (host_prof_on_) {
-        const auto it = exec_bm_.find(key);
-        host_prof_.graph_cache_hit = it != exec_bm_.end() && it->second != nullptr;
-    }
+    const auto cached = exec_bm_.find(key);
+    batch_graph_cache_hit_ = cached != exec_bm_.end() && cached->second != nullptr;
+    if (host_prof_on_) host_prof_.graph_cache_hit = batch_graph_cache_hit_;
     const int64_t hevict = host_stamp_ns();
     if (batch_graph_limit_ > 0 && exec_bm_.find(key) == exec_bm_.end() && exec_bm_.size() >= batch_graph_limit_ &&
         !evict_batch_graph(key, evicted, err))
         return false;
     host_prof_.evict_ns = host_stamp_ns() - hevict;
     bm_used_[key] = ++bm_tick_;
+    // Diagnostic arm only: observed device-free changes, NOT attributed graph
+    // bytes or a transient peak measurement. No queries/logging on replay.
+    static const bool graph_stats = env_on("STRATA_BATCH_GRAPH_STATS");
+    const bool measure_graph = graph_stats && !batch_graph_cache_hit_;
+    size_t gf0 = 0, gf1 = 0, gf2 = 0, gt = 0;
+    bool graph_mem_ok = measure_graph && cudaMemGetInfo(&gf0, &gt) == cudaSuccess;
     const int64_t hcapture = host_stamp_ns();
     if (!capture_batch(rows, S, hbase, err)) return false;
     const int64_t hcommit = host_stamp_ns();
+    if (measure_graph) graph_mem_ok = (cudaMemGetInfo(&gf1, &gt) == cudaSuccess) && graph_mem_ok;
     host_prof_.capture_exec_ns = hcommit - hcapture;
     if (!capture_commit_batch(rows, S, hbase, err)) return false;
     const int64_t hdata = host_stamp_ns();
     host_prof_.capture_commit_ns = hdata - hcommit;
+    if (measure_graph) {
+        graph_mem_ok = (cudaMemGetInfo(&gf2, &gt) == cudaSuccess) && graph_mem_ok;
+        if (graph_mem_ok)
+            std::fprintf(stderr, "strata batch graph memory: layouts=%zu limit=%zu rows=%d "
+                                 "free_before_bytes=%zu free_after_exec_bytes=%zu free_after_commit_bytes=%zu "
+                                 "observed_pair_delta_bytes=%lld\n", exec_bm_.size(), batch_graph_limit_, S,
+                         gf0, gf1, gf2, (long long) gf0 - (long long) gf2);
+        else
+            std::fprintf(stderr, "strata batch graph memory: device-free query unavailable\n");
+    }
     const Clock::time_point t0 = Clock::now();
     const QsaShapes s = shapes_of(g);
     for (int t = 0; t < S; ++t) {
