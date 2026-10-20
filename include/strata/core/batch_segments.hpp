@@ -7,6 +7,12 @@ namespace strata::core {
 
 inline constexpr int kBatchMaxRows = 16;
 
+// The late fork is emitted by the per-group, non-merged doorbell path. A
+// merged window publishes elsewhere and must join the shared stream early.
+inline constexpr bool shared_expert_fork_late(bool requested, bool all_resident, bool merged) {
+    return requested && !all_resident && !merged;
+}
+
 // Bound graph-pair retention before CUDA OOM. Both audited A/B arms use the
 // same small default; ordinary serving retains the existing 64-layout policy.
 inline bool parse_batch_graph_limit(const char* text, bool experiment, int& out) {

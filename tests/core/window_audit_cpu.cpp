@@ -120,6 +120,42 @@ int main(int argc, char** argv) {
                 "solo graph identity serializes exact owner/rows/epoch");
         require(std::filesystem::remove(solo_path), "remove owned solo artifact");
     }
+    {
+        const std::string table_path = path + ".table";
+        AuditConfig four = c;
+        four.slots = 4; four.effective_resident = {20480, 20480, 20480, 20480};
+        four.generalized = four.canonical = four.segmented = four.row_table = true;
+        WindowAudit table;
+        require(table.open(table_path.c_str(), four), "table header owns private artifact");
+        AuditWindow tw;
+        tw.active = {0, 1, 2, 3}; tw.row_slots = {0,0,0,1,1,1,2,2,2,3,3,3};
+        tw.route = {5760, 5472, 288, 0, 0};
+        for (int b = 0; b < 4; ++b) {
+            require(table.begin_admission(b) && table.end_admission(0, true, nullptr, true), "table owner generation admitted");
+            AuditSlot s = zero; s.id = b; s.rows = s.useful = 3; s.keep = s.emitted = 1;
+            tw.slots.push_back(s);
+        }
+        auto& d = tw.dispatch;
+        d.canonical = d.generalized = d.merged = d.dense_parallel = true;
+        d.execution_path = "batch_rows"; d.graph_key_kind = "rows_cut";
+        d.graph_key_rows = 12; d.graph_key_cut = 6; d.graph_key_profile = 278; d.graph_address_epoch = 1;
+        d.table_score_launches = 24; d.table_score_segments = 48;
+        d.table_attn_launches = 48; d.table_attn_rows = 144;
+        d.union_resolves = 48; d.kv_mode = 1;
+        require(table.window(tw), "table window preserves ordinary route and lifecycle accounting");
+        for (int b = 0; b < 4; ++b) require(table.finish_slot(b, "length"), "table owner drains");
+        require(table.close(), "table footer closes");
+        std::ifstream in(table_path);
+        const std::string contents((std::istreambuf_iterator<char>(in)), {});
+        require(contents.find("\"row_table\":true") != std::string::npos, "table capability is explicit");
+        require(contents.find("\"graph_key_cut\":6,\"graph_key_profile\":278") != std::string::npos,
+                "rows-cut key does not hide cut or frozen profile");
+        require(contents.find("\"qsa_tile_calls\":0,\"qsa_tile_rows\":0,\"qsa_scalar_rows\":0") != std::string::npos,
+                "table calls never masquerade as legacy same-slot tile calls");
+        require(contents.find("\"row_table_qsa_calls\":{\"score_launches\":24,\"score_segments\":48,\"attention_launches\":48,\"attention_rows\":144}") != std::string::npos,
+                "table kernel launches and query rows have distinct exact counters");
+        require(std::filesystem::remove(table_path), "remove owned table artifact");
+    }
     for (int mode = 0; mode < 4; ++mode) {
         const std::string bad_path = path + ".negative-" + std::to_string(mode);
         WindowAudit bad;

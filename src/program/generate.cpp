@@ -3072,6 +3072,18 @@ int main(int argc, char** argv) {
     }
     const char* audit_path = std::getenv("STRATA_BATCH_AUDIT");
     const bool audit_requested = audit_path && *audit_path;
+    bool row_table = false;
+    if (!strata::core::parse_slot_solo(std::getenv("STRATA_BATCH_ROW_TABLE"), row_table)) {
+        std::fprintf(stderr, "strata: STRATA_BATCH_ROW_TABLE must be 0 or 1\n"); return 2;
+    }
+    if (row_table && (!generalized || !audit_requested || o.batch != 4 || o.batch_rows != 12 ||
+        o.max_context != 262144 || o.kv_resident != 20480 || !o.batch_expert_merge || o.spec > 8)) {
+        std::fprintf(stderr, "strata: row table requires audited generalized C4 rows12, merged experts, "
+                             "context262144 and Q4 resident20480\n"); return 2;
+    }
+#if defined(STRATA_USE_HIP) || defined(STRATA_GPU_METAL) || defined(STRATA_GPU_SYCL)
+    if (row_table) { std::fprintf(stderr, "strata: row table requires NVIDIA CUDA\n"); return 2; }
+#endif
     int batch_graph_limit = 64;
     if (!strata::core::parse_batch_graph_limit(std::getenv("STRATA_BATCH_GRAPH_LIMIT"),
                                              generalized || audit_requested, batch_graph_limit)) {
@@ -9115,6 +9127,7 @@ int main(int argc, char** argv) {
             c.max_context = o.max_context; c.resident_requested = o.kv_resident;
             c.generalized = generalized; c.canonical = o.batch_slot_only; c.segmented = batch_fast;
             c.slot_solo = slot_solo;
+            c.row_table = row_table;
             c.solo_graph_limit = slot_solo ? (int) strata::core::slot_solo_graph_limit((size_t) batch_graph_limit) : 0;
             c.engine_version = STRATA_VERSION;
 #ifdef STRATA_SOURCE_SHA
@@ -10976,6 +10989,9 @@ int main(int argc, char** argv) {
                                  (long long) (later_reserve + 768 - sf_mib));
             }
         }
+        if (!ver.prepare_row_table(err)) {
+            std::fprintf(stderr, "strata row table: startup seal failed: %s\n", err.c_str()); return 1;
+        }
         if (slot_solo) {
             size_t before = 0, after = 0, total = 0;
             if (cudaMemGetInfo(&before, &total) != cudaSuccess ||
@@ -11047,6 +11063,7 @@ int main(int argc, char** argv) {
                                        " batch_graph_limit=" + std::to_string(batch_mtp || batch_fast || audit_requested ? batch_graph_limit : 0) +
                                        " batch_generalized=" + std::to_string(generalized ? 1 : 0) +
                                        " batch_slot_solo=" + std::to_string(slot_solo ? 1 : 0) +
+                                        " batch_row_table=" + std::to_string(row_table ? 1 : 0) +
                                        " batch_window_audit=" + std::to_string(window_audit.enabled() ? 1 : 0) +
                                         " slot_vision=" + std::to_string(o.batch_slot_only && o.vision ? 1 : 0) +
                                        " slot_spill_lazy=" + std::to_string(o.batch_slot_only ? 1 : 0) +
@@ -11324,8 +11341,13 @@ int main(int argc, char** argv) {
             d.qsa_scalar = ver.batch_qsa_scalar_rows();
             d.scalar_resolves = ver.batch_qsa_scalar_resolves(); d.union_resolves = ver.batch_qsa_union_resolves();
             d.graph_hit = ver.batch_graph_cache_hit();
-            d.execution_path = ver.last_slot_solo() ? "slot_solo" : "legacy";
-            d.graph_key_kind = ver.last_slot_solo() ? "slot_solo" : "legacy_layout";
+            d.execution_path = ver.last_slot_solo() ? "slot_solo" : ver.last_row_table() ? "batch_rows" : "legacy";
+            d.graph_key_kind = ver.last_slot_solo() ? "slot_solo" : ver.last_row_table() ? "rows_cut" : "legacy_layout";
+            d.graph_key_cut = ver.graph_key_cut(); d.graph_key_profile = ver.graph_key_profile();
+            d.table_score_launches = ver.row_table_score_launches();
+            d.table_score_segments = ver.row_table_score_segments();
+            d.table_attn_launches = ver.row_table_attention_launches();
+            d.table_attn_rows = ver.row_table_attention_rows();
             d.graph_key_rows = (int) w.row_slots.size();
             d.graph_owner_slot = ver.graph_owner_slot();
             d.graph_address_epoch = ver.graph_address_epoch();
@@ -11345,7 +11367,11 @@ int main(int argc, char** argv) {
         };
         auto park_slot = [&](int b, size_t held, std::string& e) -> bool {
             BSlot& sl = bs[(size_t) b];
-            if (!o.batch_slot_only || !sl.cached || sl.tainted || sl.ids.empty()) return true;
+            // BGEN has already rejected active owners. With RAM history
+            // disabled, keep the idle donor intact for the normal rewind/reset
+            // path; no snapshot or temporary canonical binding is required.
+            if (!o.batch_slot_only ||
+                !conversations.slot_park_required(sl.cached, sl.tainted, !sl.ids.empty())) return true;
             auto* old_session = serve_session;
             auto* old_drafter = serve_drafter;
             serve_session = bslot_ss[0][(size_t) b];
@@ -11362,7 +11388,7 @@ int main(int argc, char** argv) {
                 probe.push_back(-1); // an unconsumed tail lets best() match the complete saved live state
                 const auto saved = conversations.best(probe, live_imgs, cvec_cached);
                 ok = saved.live && saved.tokens == (int64_t) live.size();
-            } else if (!conversations.enabled()) ok = false;
+            }
             if (!ok && e.empty()) e = "slot-only completed state could not be parked in the RAM cache";
             std::swap(live, sl.ids);
             std::swap(checks, sl.checks);
@@ -12468,6 +12494,9 @@ int main(int argc, char** argv) {
                 admit_slot = (int) b;
                 if (!window_audit.begin_admission(admit_slot)) {
                     std::printf("ERR native audit: %s\n", window_audit.error().c_str()); return 1;
+                }
+                if (!ver.set_slot_request_generation(admit_slot, window_audit.generation(admit_slot), err)) {
+                    std::printf("ERR native request generation: %s\n", err.c_str()); return 1;
                 }
                 admit_max_new = mn;
                 adm_drain_ms = line_drain_ms;

@@ -23,6 +23,27 @@ SavedConversation image(std::initializer_list<int32_t> ids, bool cvec = true) {
 
 int main() {
     {
+        // A completed hot slot can be rewound/replaced with RAM history
+        // disabled. Gate before capture or metadata exchange; never erase a
+        // same-owner checkpoint donor while deciding whether to park it.
+        for (size_t budget : {size_t(0),size_t(4096)}) for (size_t slots : {size_t(0),size_t(8)})
+            for (bool cached : {false,true}) for (bool tainted : {false,true}) for (bool tokens : {false,true}) {
+                const ConversationCache cache(budget,slots);
+                const bool wanted=budget!=0 && slots!=0 && cached && !tainted && tokens;
+                check(cache.slot_park_required(cached,tainted,tokens)==wanted,"slot park honors explicit RAM policy");
+            }
+        for (auto limits : {std::pair<size_t,size_t>{0,8},{4096,0}}) {
+            const ConversationCache cache(limits.first,limits.second);
+            auto donor=image({1,2,3});donor.checkpoints.push_back(image({1,2}).live);
+            const auto old_ids=donor.live.ids, old_checkpoint=donor.checkpoints[0].ids;
+            int capture_calls=0;
+            if (cache.slot_park_required(true,false,true)) ++capture_calls;
+            check(capture_calls==0,"disabled cache never captures RAM snapshot");
+            check(donor.live.ids==old_ids && donor.checkpoints[0].ids==old_checkpoint,
+                  "disabled park leaves hot IDs and same-owner checkpoint donor intact");
+        }
+    }
+    {
         ConversationBuffer bytes;
         const size_t first = ConversationBuffer::segment_bytes + 17;
         const size_t peak = bytes.allocation_peak(first);

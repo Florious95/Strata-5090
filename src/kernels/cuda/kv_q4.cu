@@ -1,6 +1,7 @@
 // src/kernels/cuda/kv_q4.cu - see include/strata/kernels/kv_q4.hpp. Q4_0 KV with Walsh-Hadamard rotation
 // (from PR #21 by code-martin; KV-streaming integration and the deterministic group maximum added on merge).
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/batch_device_ops.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_stream.hpp"
 
@@ -97,7 +98,7 @@ __device__ __forceinline__ void q4_store(uint8_t* pool, long long row, int b, in
 }
 
 // One block = one 32-value group of one KV head of K (plane 0) or V (plane 1) for token step_idx; 32 threads.
-__global__ void kv_append_q4_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restrict__ v_q4,
+__device__ __forceinline__ void kv_append_q4_body(uint8_t* __restrict__ k_q4, uint8_t* __restrict__ v_q4,
                                     const int32_t* __restrict__ table, const int32_t* __restrict__ step,
                                     int step_stride, int planes,
                                     const float* __restrict__ kcur, const float* __restrict__ vcur,
@@ -115,6 +116,26 @@ __global__ void kv_append_q4_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restr
     if (host.k_q4 != nullptr)
         q4_store(is_v ? host.v_q4 : host.k_q4, ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size), b, t,
                  d, byte);
+}
+
+__global__ void kv_append_q4_kernel(uint8_t* k, uint8_t* v, const int32_t* table,
+    const int32_t* steps, int stride, int planes, const float* kc, const float* vc,
+    int heads, int dim, int page, KvHostPools host) {
+    kv_append_q4_body(k, v, table, steps, stride, planes, kc, vc, heads, dim, page, host);
+}
+__global__ void batch_kv_append_kernel(DeviceBatchView view, int qi, int begin, int end,
+    const int32_t* steps, const float* k, const float* value, int heads, int dim, int page) {
+    const int row = begin + blockIdx.z / 2;
+    const auto* seg = batch_device_row(view, row, begin, end);
+    if (!seg) return;
+    const auto* q = batch_device_qsa(view, *seg, qi);
+    if (!q) return;
+    // The body indexes z/2 relative to the fixed dense group; only its owner
+    // pools/map vary. K/V remain post-FWHT, with the original group quantizer.
+    kv_append_q4_body(q->pools.k_q4, q->pools.v_q4, q->pools.page_table,
+        steps + (size_t)begin * kStepCount, kStepCount, 2,
+        k + (size_t)begin * heads * dim, value + (size_t)begin * heads * dim,
+        heads, dim, page, q->host);
 }
 
 // The prompt path: grid (T, kv_heads, groups), K then V; also into the staging pool (identity layout) when given.
@@ -182,6 +203,15 @@ void need_256(const QsaShapes& s, const char* what) {
 }
 
 }  // namespace
+
+void batch_device_kv_append(DeviceBatchView v, int qi, int begin, int end, const int32_t* steps,
+                            const float* k, const float* value, const QsaShapes& s, void* stream) {
+    need_256(s, "batch device KV append");
+    batch_kv_append_kernel<<<dim3(s.n_head_kv, s.head_dim / QK4_0, (end - begin) * 2),
+        32, 0, (cudaStream_t)stream>>>(v, qi, begin, end, steps, k, value,
+                                     s.n_head_kv, s.head_dim, s.page_size);
+    check("batch device KV append");
+}
 
 void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream) {
     if (n_rows <= 0) return;
