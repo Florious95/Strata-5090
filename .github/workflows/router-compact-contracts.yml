@@ -1,0 +1,37 @@
+name: Compact router CPU contracts
+on:
+  pull_request:
+    paths:
+      - 'include/strata/kernels/router_compact.hpp'
+      - 'include/strata/kernels/native_router.hpp'
+      - 'src/kernels/cuda/native_router.cu'
+      - 'src/program/generate.cpp'
+      - 'tests/core/router_compact*'
+      - 'CMakeLists.txt'
+      - '.github/workflows/router-compact-contracts.yml'
+  workflow_dispatch:
+jobs:
+  cpu-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Release (NDEBUG keeps all checks active)
+        run: |
+          c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror -Iinclude tests/core/router_compact_cpu.cpp -o /tmp/router-compact-release
+          /tmp/router-compact-release
+      - name: ASan and UBSan
+        run: |
+          c++ -std=c++20 -O1 -g -DNDEBUG -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer -Iinclude tests/core/router_compact_cpu.cpp -o /tmp/router-compact-asan
+          /tmp/router-compact-asan
+      - name: Fast-math integer-control contract (not CUDA qualification)
+        run: |
+          c++ -std=c++20 -O2 -DNDEBUG -ffast-math -Wall -Wextra -Werror -Iinclude tests/core/router_compact_cpu.cpp -o /tmp/router-compact-fastmath
+          /tmp/router-compact-fastmath
+      - name: Existing canonical-state CPU regressions
+        run: |
+          for source in tests/core/slot_solo_cpu.cpp tests/core/batch_device_layout_cpu.cpp src/core/conversation_cache_test.cpp; do
+            name=$(basename "$source" .cpp)
+            c++ -std=c++20 -O2 -DNDEBUG -Iinclude "$source" -o "/tmp/$name"
+            "/tmp/$name"
+          done
