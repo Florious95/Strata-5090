@@ -12,6 +12,12 @@ bool native_moe_combine_enabled();
 // parts: k contiguous F32 rows of n_embd; weights: k F32 values. The first
 // product rounds to F32, following products accumulate with FMA in expert order,
 // and optional shared is added once afterward. Shared is not router weighted.
+// CUDA spells these operations as RN PTX without FTZ, including generic,
+// vec4 and mixed-hit variants. Results are independent of launch grouping for
+// identical F32 leaves, weights, shared values and router-rank ordering; this
+// does NOT make Q8_K CPU experts identical to Q8_1 GPU experts. Non-finite
+// leaves remain subject to the caller's existing non-finite failure policy;
+// NaN payload bits are not a cross-platform contract.
 // Requires a nonnull ordered stream and disjoint output. No allocation or sync.
 void native_moe_combine(const float* parts, const float* weights, const float* shared,
                         float* output, int64_t n_embd, int64_t k, void* stream);

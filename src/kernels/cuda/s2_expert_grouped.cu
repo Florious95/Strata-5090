@@ -14,6 +14,7 @@
 // The two agree to float rounding and not to the bit, which is the same contract `s_gemv_parity` carries for
 // the same reason.  `bench/micro/moe_hit_parity.cu` is the check.
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/kernels/ordered_moe_fold.hpp"
 #include "strata/core/geometry.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -717,7 +718,7 @@ __global__ void add_hits_kernel(float* __restrict__ parts, const float* __restri
     if (h >= *count) return;
     const size_t row = (size_t) dst[h] * (size_t) n_embd;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_embd; i += gridDim.x * blockDim.x)
-        parts[row + i] += hit_out[row + i];
+        parts[row + i] = ordered_moe::add_rn(parts[row + i], hit_out[row + i]);
 }
 }  // namespace
 

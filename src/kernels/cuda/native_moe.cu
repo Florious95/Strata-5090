@@ -21,6 +21,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/ordered_moe_fold.hpp"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cstddef>
@@ -45,23 +46,21 @@ __global__ void combine(const float* __restrict__ parts, const float* __restrict
     if (col >= n_embd) return;
     // ZADD: a part is 0.0f + hit (the zeroed row plus moe_hit_add of the verify window), rounded as that add
     float p0 = parts[col];
-    if (ZADD) p0 = 0.0f + p0;
-    float sum = p0 * weights[0];
+    if (ZADD) p0 = ordered_moe::add_rn(0.0f, p0);
+    ordered_moe::Fold sum(p0, weights[0]);
     for (int expert = 1; expert < k; ++expert) {
         float p = parts[int64_t(expert) * n_embd + col];
-        if (ZADD) p = 0.0f + p;
-        sum += p * weights[expert];
+        if (ZADD) p = ordered_moe::add_rn(0.0f, p);
+        sum.append(p, weights[expert]);
     }
     if constexpr (GATED) {
-        // contraction off in this block only: the product is rounded on its own (scale_rows' store), then added
-#pragma clang fp contract(off)
+        // Keep the existing sigmoid, but round its scale_rows-equivalent
+        // product before the final shared add, including under NVCC fast math.
         const float g = __fdividef(1.0f, 1.0f + __expf(-sg[tk]));
-        const float sh = shared[col] * g;
-        sum += sh;
+        output[col] = sum.with_shared(ordered_moe::mul_rn(shared[col], g));
     } else {
-        if (shared) sum += shared[col];
+        output[col] = shared ? sum.with_shared(shared[col]) : sum.value();
     }
-    output[col] = sum;
 }
 __global__ void combine_k10_vec4(const float4* __restrict__ parts4, const float* __restrict__ weights,
                                  const float4* __restrict__ shared4, float4* __restrict__ output4,
@@ -75,25 +74,16 @@ __global__ void combine_k10_vec4(const float4* __restrict__ parts4, const float*
     if (c4 >= n4) return;
     const float w0 = __ldg(weights + 0);
     const float4 p0 = parts4[c4];
-    float4 sum = make_float4(p0.x * w0, p0.y * w0, p0.z * w0, p0.w * w0);
+    ordered_moe::Fold sx(p0.x, w0), sy(p0.y, w0), sz(p0.z, w0), sw(p0.w, w0);
 #pragma unroll
     for (int expert = 1; expert < 10; ++expert) {
         const float w = __ldg(weights + expert);
         const float4 p = parts4[int64_t(expert) * n4 + c4];
-        // the documented contract spelled out: the first product rounded, then one FMA per expert in order. Left to the
-        // compiler's contraction, a build may fuse a different product (gfx1151: the float4 kernel then differed from the
-        // scalar one, native_multi_parity)
-        sum.x = fmaf(p.x, w, sum.x);
-        sum.y = fmaf(p.y, w, sum.y);
-        sum.z = fmaf(p.z, w, sum.z);
-        sum.w = fmaf(p.w, w, sum.w);
+        sx.append(p.x, w); sy.append(p.y, w); sz.append(p.z, w); sw.append(p.w, w);
     }
     const float4 sh = shared4[c4];
-    sum.x += sh.x;
-    sum.y += sh.y;
-    sum.z += sh.z;
-    sum.w += sh.w;
-    output4[c4] = sum;
+    output4[c4] = make_float4(sx.with_shared(sh.x), sy.with_shared(sh.y),
+                              sz.with_shared(sh.z), sw.with_shared(sh.w));
 }
 __global__ void combine_k10_vec4_hits(const float4* __restrict__ parts4, const float4* __restrict__ hits4,
                                       const int32_t* __restrict__ dst, const int32_t* __restrict__ count,
@@ -119,24 +109,26 @@ __global__ void combine_k10_vec4_hits(const float4* __restrict__ parts4, const f
     if (c4 >= n4) return;
     const float w0 = __ldg(weights + 0);
     float4 p0 = parts4[c4];
-    if (mask & 1) { const float4 hh = hits4[c4]; p0.x += hh.x; p0.y += hh.y; p0.z += hh.z; p0.w += hh.w; }
-    float4 sum = make_float4(p0.x * w0, p0.y * w0, p0.z * w0, p0.w * w0);
+    if (mask & 1) {
+        const float4 hh = hits4[c4];
+        p0.x = ordered_moe::add_rn(p0.x, hh.x); p0.y = ordered_moe::add_rn(p0.y, hh.y);
+        p0.z = ordered_moe::add_rn(p0.z, hh.z); p0.w = ordered_moe::add_rn(p0.w, hh.w);
+    }
+    ordered_moe::Fold sx(p0.x, w0), sy(p0.y, w0), sz(p0.z, w0), sw(p0.w, w0);
 #pragma unroll
     for (int expert = 1; expert < 10; ++expert) {
         const float w = __ldg(weights + expert);
         float4 p = parts4[int64_t(expert) * n4 + c4];
-        if ((mask >> expert) & 1) { const float4 hh = hits4[int64_t(expert) * n4 + c4]; p.x += hh.x; p.y += hh.y; p.z += hh.z; p.w += hh.w; }
-        sum.x = fmaf(p.x, w, sum.x);
-        sum.y = fmaf(p.y, w, sum.y);
-        sum.z = fmaf(p.z, w, sum.z);
-        sum.w = fmaf(p.w, w, sum.w);
+        if ((mask >> expert) & 1) {
+            const float4 hh = hits4[int64_t(expert) * n4 + c4];
+            p.x = ordered_moe::add_rn(p.x, hh.x); p.y = ordered_moe::add_rn(p.y, hh.y);
+            p.z = ordered_moe::add_rn(p.z, hh.z); p.w = ordered_moe::add_rn(p.w, hh.w);
+        }
+        sx.append(p.x, w); sy.append(p.y, w); sz.append(p.z, w); sw.append(p.w, w);
     }
     const float4 sh = shared4[c4];
-    sum.x += sh.x;
-    sum.y += sh.y;
-    sum.z += sh.z;
-    sum.w += sh.w;
-    output4[c4] = sum;
+    output4[c4] = make_float4(sx.with_shared(sh.x), sy.with_shared(sh.y),
+                              sz.with_shared(sh.z), sw.with_shared(sh.w));
 }
 bool valid_span(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
