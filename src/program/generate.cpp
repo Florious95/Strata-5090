@@ -3089,9 +3089,6 @@ int main(int argc, char** argv) {
     if (!strata::kernels::router_compact::parse_enabled(std::getenv("STRATA_ROUTER_COMPACT_TOPK"), compact_router)) {
         std::fprintf(stderr, "strata: STRATA_ROUTER_COMPACT_TOPK must be 0 or 1\n"); return 2;
     }
-    if (compact_router && !o.native_router) {
-        std::fprintf(stderr, "strata: compact TopK requires the native router\n"); return 2;
-    }
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL) || defined(STRATA_GPU_SYCL)
     if (compact_router) { std::fprintf(stderr, "strata: compact TopK requires NVIDIA CUDA\n"); return 2; }
 #endif
@@ -3194,6 +3191,11 @@ int main(int argc, char** argv) {
         }
         // Plan v0.3 (24 Sep): the CPU experts stay on the VNNI kernel.  The llama.cpp-CPU-exact q8_0 contract
         // cost 27.0 vs 17.2 ms/token of pool time and G-C does not need it; `--cpu-oracle-q8-0` still selects it.
+    }
+    // --native expands o.native_router above. Validate the resolved mode,
+    // not the initial default, so the normal native preset needs no extra flag.
+    if (compact_router && !o.native_router) {
+        std::fprintf(stderr, "strata: compact TopK requires the native router\n"); return 2;
     }
     if (o.logits_stride > 1 && (o.max_new != 1 || o.dump_logits.empty())) {
         std::fprintf(stderr, "strata generate: --logits-stride > 1 requires --max-new 1 and --dump-logits\n");
