@@ -3,6 +3,7 @@
 // No claim of full-model, GDN, sampler, or cross-quantizer determinism.
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/ordered_moe_fold.hpp"
+#include "strata/kernels/batch_deterministic_reduction.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -214,6 +215,10 @@ struct Fixture {
 };
 } // namespace
 int main() {
+    if (!k::batch_deterministic_reduction_enabled()) {
+        std::fprintf(stderr,"This RN-bit witness requires STRATA_BATCH_DETERMINISTIC_REDUCTION=1 (default is legacy OFF)\n");
+        return 2;
+    }
     int devices=0;
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || devices<1) {
         std::fprintf(stderr,"SKIP: NVIDIA CUDA device unavailable\n");return 77;

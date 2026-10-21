@@ -6,7 +6,22 @@ Base: `806939db941f4ddb9bff4961c9dc5cd6e0df7798`.
 
 This PR applies the batch-invariant **reduction** idea to the existing native MoE combine. It does not import DeepInfer kernels, change expert quantization, add a new scheduling mode, move canonical state, or change sampling. CPU Q8_K and GPU Q8_1 expert producers retain their existing arithmetic and throughput paths.
 
-The guarantee is conditional and intentionally narrow:
+## Runtime A/B switch (default OFF)
+
+`STRATA_BATCH_DETERMINISTIC_REDUCTION=0|1` selects the numerical profile:
+
+- Unset or `0`: original legacy combine kernels and ordinary `moe_hit_add` addition, including existing compiler fast-math/FTZ behavior.
+- `1`: ordered RN fold and RN hit merge described below, for every native single/multi, vec4, fused-hit, all-hit and gated combine variant.
+- Other values (including empty, whitespace, `01`, `true`) are rejected before graph construction.
+
+Native `INFO` always reports `batch_deterministic_reduction=0` or `=1`. The process-lifetime profile freezes on first query, initialized during startup before capture. Changing the environment in a running process cannot change a captured graph. Use the **same binary**, same launch arguments and fixed expert residency profile in **separate backend processes** for OFF/ON A/B; keep each process's 1->4->1 sequence uninterrupted. No additional graph-cache key is needed for an immutable profile.
+
+```bash
+STRATA_BATCH_DETERMINISTIC_REDUCTION=0 /path/to/strata generate <same arguments>  # legacy baseline
+STRATA_BATCH_DETERMINISTIC_REDUCTION=1 /path/to/strata generate <same arguments>  # ordered RN
+```
+
+The guarantee with `=1` is conditional and intentionally narrow:
 
 > Given identical effective F32 expert leaves, router weights, router-rank order and shared contribution, made ready on the ordered stream, the CUDA combine produces the same result independent of row grouping, supported combine variant, or CPU/GPU job completion order.
 
@@ -39,8 +54,9 @@ For the existing gated shared path, the original GPU sigmoid approximation is un
 ## Implementation
 
 - `include/strata/kernels/ordered_moe_fold.hpp`: shared scalar `Fold` and RN add/multiply/FMA primitives.
-- `src/kernels/cuda/native_moe.cu`: generic, K10 vec4, fused mixed-hit, all-hit and gated variants use that contract.
-- `src/kernels/cuda/s2_expert_grouped.cu`: only the final `moe_hit_add` addition changes to the common primitive. Expert dot products, quantizers, layouts and activations do not change.
+- `include/strata/kernels/batch_deterministic_reduction.hpp`: strict parser and immutable process profile, shared by Native INFO and launch wrappers.
+- `src/kernels/cuda/native_moe.cu`: host-only dispatch between verbatim pre-PR-2 legacy kernels and ordered generic, K10 vec4, fused mixed-hit, all-hit and gated kernels. There is no per-output device branch.
+- `src/kernels/cuda/s2_expert_grouped.cu`: only the final `moe_hit_add` addition is selected between the original expression and the RN primitive. Expert dot products, quantizers, layouts and activations do not change.
 - `include/strata/kernels/native_moe.hpp`: public contract and its limits, no API/ABI signature change.
 
 CUDA uses explicit `add.rn.f32`, `mul.rn.f32`, and `fma.rn.f32` PTX **without `.ftz`**. `native_moe.cu` is already built with `--use_fast_math`; implicit contraction/FTZ must not silently change the reduction contract. The old K10 path already documented first-product rounding followed by ordered FMA; generic and gated paths no longer leave that interpretation to compiler contraction.
@@ -71,7 +87,7 @@ c++ -std=c++20 -O1 -g -DNDEBUG -Wall -Wextra -Werror -ffp-contract=off \
 /tmp/ordered_moe_fold_asan
 ```
 
-CMake target/CTest name: `ordered_moe_fold_cpu` under `STRATA_BUILD_TESTS=ON`. The existing CPU-contract workflow also compiles and executes Release and ASan/UBSan variants.
+CMake target/CTest name: `ordered_moe_fold_cpu` under `STRATA_BUILD_TESTS=ON`. `batch_deterministic_reduction_cpu` adds four isolated process modes (`unset`, `0`, `1`, `invalid`), **176 checks** in total: exact parsing, default OFF, explicit ON/OFF, invalid-profile rejection and post-initialization immutability. CTest names are `batch_deterministic_reduction_{unset,0,1,invalid}`. The CPU-contract workflow compiles and executes both witnesses in Release and ASan/UBSan.
 
 ## Public CUDA witness (separate serialized qualification)
 
@@ -88,7 +104,7 @@ CMake target/CTest name: `ordered_moe_fold_cpu` under `STRATA_BUILD_TESTS=ON`. T
 
 It plans **3456 fixtures/replays**. Gated witness uses raw gate zero (exact sigmoid 0.5), so it does not pretend to validate cross-device sigmoid approximations. The complete effective leaf tensor and final shared contribution are identical for each single/multi reference pair.
 
-CMake target/CTest: `ordered_moe_fold_gpu`, NVIDIA CUDA only, exit77 for unavailable device or preservation of the existing 8 GiB test reserve. CPU or host-syntax success is not CUDA execution success.
+CMake target/CTest: `ordered_moe_fold_gpu`, NVIDIA CUDA only, exit77 for unavailable device or preservation of the existing 8 GiB test reserve. CTest explicitly supplies `STRATA_BATCH_DETERMINISTIC_REDUCTION=1`; direct execution requires that environment too and refuses OFF with exit2 rather than comparing legacy arithmetic against RN expectations. Existing native parity tests with the default profile exercise legacy OFF. CPU or host-syntax success is not CUDA execution success.
 
 ```bash
 cmake -S . -B build-pr2 -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=ON \
@@ -100,9 +116,11 @@ ctest --test-dir build-pr2 -R '^ordered_moe_fold_gpu$' --output-on-failure
 ## Local construction results (controller, not CUDA qualification)
 
 - Standalone Release and ASan/UBSan: 150617 checks each, exit0.
-- CMake Release and CMake ASan/UBSan: 8/8 selected CPU regressions each (ordered fold, device layout, Solo, window audit, MTP batching, conversation cache, telemetry, logit bias).
+- CMake Release and CMake ASan/UBSan: 12/12 selected CPU regressions each (ordered fold; four numerical-profile modes; device layout, Solo, window audit, MTP batching, conversation cache, telemetry, logit bias).
+- Runtime policy standalone Release and ASan/UBSan: 176 checks each across four isolated processes.
+- OFF source witness: the three legacy CUDA combine bodies match base `806939db` verbatim; scattered hit-add restores the original `parts += hit_out` expression. This is source preservation, not GPU execution parity.
 - Unfused-FMA sensitivity mutant: expected exit1 at the FMA-sensitive append check; production helper remains green.
-- GPU witness: strict host syntax check with Metal compatibility headers only. No NVIDIA compiler or device execution was performed on this controller.
+- GPU witness: strict host syntax check with Metal compatibility headers only. Native `generate.cpp` host syntax also passes with the Metal compatibility headers. No NVIDIA compiler or device execution was performed on this controller.
 
 ## Promotion gates and remaining limitations
 

@@ -12,8 +12,11 @@ bool native_moe_combine_enabled();
 // parts: k contiguous F32 rows of n_embd; weights: k F32 values. The first
 // product rounds to F32, following products accumulate with FMA in expert order,
 // and optional shared is added once afterward. Shared is not router weighted.
-// CUDA spells these operations as RN PTX without FTZ, including generic,
-// vec4 and mixed-hit variants. Results are independent of launch grouping for
+// STRATA_BATCH_DETERMINISTIC_REDUCTION=0 (default) preserves the legacy
+// kernels/arithmetic. =1 spells these operations as RN PTX without FTZ,
+// including generic, vec4 and mixed-hit variants. This numerical profile is
+// frozen on first query, before graph construction; A/B needs backend restarts.
+// With =1, results are independent of launch grouping for
 // identical F32 leaves, weights, shared values and router-rank ordering; this
 // does NOT make Q8_K CPU experts identical to Q8_1 GPU experts. Non-finite
 // leaves remain subject to the caller's existing non-finite failure policy;

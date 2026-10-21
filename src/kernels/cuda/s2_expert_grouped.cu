@@ -15,6 +15,7 @@
 // the same reason.  `bench/micro/moe_hit_parity.cu` is the check.
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/ordered_moe_fold.hpp"
+#include "strata/kernels/batch_deterministic_reduction.hpp"
 #include "strata/core/geometry.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -712,13 +713,16 @@ __global__ void hit_select_multi_kernel(const int32_t* __restrict__ ids, const i
     if (i == 0) *count = warp_count[0] + warp_count[1] + warp_count[2] + warp_count[3];
 }
 
+template<bool ORDERED>
 __global__ void add_hits_kernel(float* __restrict__ parts, const float* __restrict__ hit_out,
                                 const int32_t* __restrict__ dst, const int32_t* __restrict__ count, int n_embd) {
     const int h = blockIdx.y;
     if (h >= *count) return;
     const size_t row = (size_t) dst[h] * (size_t) n_embd;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_embd; i += gridDim.x * blockDim.x)
-        parts[row + i] = ordered_moe::add_rn(parts[row + i], hit_out[row + i]);
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_embd; i += gridDim.x * blockDim.x) {
+        if constexpr (ORDERED) parts[row + i] = ordered_moe::add_rn(parts[row + i], hit_out[row + i]);
+        else parts[row + i] += hit_out[row + i];
+    }
 }
 }  // namespace
 
@@ -1234,7 +1238,10 @@ void moe_hit_add(float* parts, const float* hit_out, const int32_t* dst, const i
                  int64_t n_embd, void* stream) {
     if (cap <= 0) return;
     const dim3 grid((unsigned) ((n_embd + 255) / 256 < 8 ? (n_embd + 255) / 256 : 8), (unsigned) cap);
-    add_hits_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(parts, hit_out, dst, count, (int) n_embd);
+    if (batch_deterministic_reduction_enabled())
+        add_hits_kernel<true><<<grid, 256, 0, (cudaStream_t) stream>>>(parts, hit_out, dst, count, (int) n_embd);
+    else
+        add_hits_kernel<false><<<grid, 256, 0, (cudaStream_t) stream>>>(parts, hit_out, dst, count, (int) n_embd);
     check("moe_hit_add", stream);
 }
 

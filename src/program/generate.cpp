@@ -56,6 +56,7 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/batch_deterministic_reduction.hpp"
 #include "strata/kernels/native_gdn.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/native_qsa.hpp"
@@ -3061,6 +3062,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata: STRATA_BATCH_GENERALIZED must be 0 or 1\n"); return 2;
     }
     const bool generalized = generalized_env && generalized_env[0] == '1';
+    bool deterministic_reduction = false;
+    try {
+        // Freeze the numerical profile before any CUDA graph is constructed.
+        deterministic_reduction = strata::kernels::batch_deterministic_reduction_enabled();
+    } catch (const std::invalid_argument& e) {
+        std::fprintf(stderr, "strata: %s\n", e.what()); return 2;
+    }
     bool slot_solo = false;
     if (!strata::core::parse_slot_solo(std::getenv("STRATA_BATCH_SLOT_SOLO"), slot_solo)) {
         std::fprintf(stderr, "strata: STRATA_BATCH_SLOT_SOLO must be 0 or 1\n"); return 2;
@@ -11032,7 +11040,7 @@ int main(int argc, char** argv) {
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
-                        "tail_role_token=%lld vram_elastic=%d "
+                        "tail_role_token=%lld vram_elastic=%d batch_deterministic_reduction=%d "
                         "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
@@ -11045,7 +11053,7 @@ int main(int argc, char** argv) {
                         pool.workers(), o.pcie_frac,
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
-                        (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
+                        (long long) o.tail_role_token, xcache.segmented() ? 1 : 0, deterministic_reduction ? 1 : 0,
                         // the prompt path: its chunk cap (the VRAM command's relend can lower it later), the stages a
                         // prompt flows through, the chunk size from which a chunk streams every expert, --prefill-pipe
                         (long long) o.prefill_chunk, sp.stage_count(),
