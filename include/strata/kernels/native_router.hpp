@@ -6,6 +6,14 @@ namespace strata::kernels {
 // This experiment is off by default and does not modify the legacy router.
 void native_router_set_enabled(bool enabled);
 bool native_router_enabled();
+// NVIDIA-only, off by default. Configure before capture; old graphs retain
+// their selected kernel. Only selection work changes, never the routed set.
+void native_router_set_compact_enabled(bool enabled);
+bool native_router_compact_enabled();
+// Explicit operator for public parity tests. diagnostics is null or [n_tok,2]
+// U32: conservative candidate count and whether compact selection was used.
+void native_router_top10_compact(const float* logits, int32_t* ids, float* weights,
+                                 int n_tok, void* stream, uint32_t* diagnostics = nullptr);
 
 // Pinned CUDA topk-moe contract for ONE token, 512 experts, top 10, softmax,
 // no selection bias, lower normalization clamp 2^-14, and scale 1.

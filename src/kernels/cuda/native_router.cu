@@ -21,6 +21,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "strata/kernels/native_router.hpp"
+#include "strata/kernels/router_compact.hpp"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cfloat>
@@ -31,6 +32,7 @@
 namespace strata::kernels {
 namespace {
 std::atomic<bool> enabled{false};
+std::atomic<bool> compact_enabled{false};
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
     for (int mask = 16; mask; mask >>= 1) value += __shfl_xor_sync(0xffffffffu, value, mask, 32);
@@ -148,6 +150,135 @@ __global__ void route_multi(const float* __restrict__ logits, int32_t* __restric
     const float inverse_selected_sum = 1.0f / selected_sum;
     if (lane < 10) weights[lane] = selected * inverse_selected_sum;
 }
+#if !defined(__HIPCC__)
+// Exact 512-><=128 candidate filtering, not approximate expert routing. All
+// probabilities and their two normalization reductions match route_multi.
+// The 16-bit prefixes are used ONLY for a conservative integer lower bound.
+__launch_bounds__(256, 1)
+__global__ void route_compact(const float* __restrict__ logits, int32_t* __restrict__ ids,
+                              float* __restrict__ weights, int n_tok, uint32_t* diagnostics) {
+    namespace rc = router_compact;
+    __shared__ uint16_t candidate_id[8][rc::capacity];
+    __shared__ float candidate_value[8][rc::capacity];
+    const int row = (int)blockIdx.x * 8 + (int)threadIdx.y;
+    if (row >= n_tok) return;
+    logits += (size_t)row * 512; ids += (size_t)row * 10; weights += (size_t)row * 10;
+    const int lane = threadIdx.x, group = threadIdx.y;
+    float values[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
+    __syncwarp();
+    float maximum = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);
+    maximum = warp_max(maximum);
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        values[i] = expf(values[i] - maximum);
+        sum += values[i];
+    }
+    const float reciprocal = 1.0f / warp_sum(sum);
+    uint32_t threshold = 0;
+    bool valid = true;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        values[i] *= reciprocal;
+        if (__isnanf(values[i])) values[i] = -FLT_MAX;
+        const uint32_t bits = __float_as_uint(values[i]);
+        valid = valid && rc::valid_probability_bits(bits);
+        threshold = max(threshold, (uint32_t)rc::bucket(bits));
+    }
+    valid = __all_sync(0xffffffffu, valid);
+    // 16 disjoint groups, each combining lanes j and j+16. This tighter bound
+    // costs the same five shuffles as a plain minimum over 32 lane maxima.
+    threshold = max(threshold, __shfl_xor_sync(0xffffffffu, threshold, 16, 32));
+#pragma unroll
+    for (int mask = 8; mask; mask >>= 1)
+        threshold = min(threshold, __shfl_xor_sync(0xffffffffu, threshold, mask, 32));
+    int count = 0;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) count += rc::keep(__float_as_uint(values[i]), (uint16_t)threshold);
+    int total = count;
+#pragma unroll
+    for (int mask = 16; mask; mask >>= 1)
+        total += __shfl_xor_sync(0xffffffffu, total, mask, 32);
+    const bool compact = rc::usable(total, valid);
+    if (diagnostics && lane == 0) {
+        diagnostics[(size_t)row * 2] = valid ? (uint32_t)total : 512u;
+        diagnostics[(size_t)row * 2 + 1] = compact;
+    }
+    float selected = 0.0f, selected_sum = 0.0f;
+    if (compact) {
+        int offset = count;
+#pragma unroll
+        for (int delta = 1; delta < 32; delta <<= 1) {
+            const int left = __shfl_up_sync(0xffffffffu, offset, delta, 32);
+            if (lane >= delta) offset += left;
+        }
+        offset -= count;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const uint32_t bits = __float_as_uint(values[i]);
+            if (rc::keep(bits, (uint16_t)threshold)) {
+                candidate_id[group][offset] = (uint16_t)(lane + i * 32);
+                candidate_value[group][offset++] = values[i];
+            }
+        }
+        __syncwarp();
+        float filtered[4]; int original[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int pos = lane + i * 32;
+            filtered[i] = pos < total ? candidate_value[group][pos] : -INFINITY;
+            original[i] = pos < total ? (int)candidate_id[group][pos] : INT32_MAX;
+        }
+        for (int rank = 0; rank < 10; ++rank) {
+            float best = filtered[0]; int expert = original[0];
+#pragma unroll
+            for (int i = 1; i < 4; ++i)
+                if (filtered[i] > best || (filtered[i] == best && original[i] < expert)) {
+                    best = filtered[i]; expert = original[i];
+                }
+#pragma unroll
+            for (int mask = 16; mask; mask >>= 1) {
+                const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
+                const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
+                if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
+            }
+            // Reassignment to a compact lane MUST NOT change selected_sum's
+            // reduction tree. Accumulate in the ORIGINAL winning expert lane.
+            if ((expert & 31) == lane) { ids[rank] = expert; selected_sum += best; }
+            if (rank == lane) selected = best;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) if (original[i] == expert) filtered[i] = -INFINITY;
+        }
+    } else {
+        // Dense boundary buckets, subnormals and invalid probabilities never
+        // truncate a candidate set. Replay the pinned exact selection body.
+        for (int rank = 0; rank < 10; ++rank) {
+            float best = values[0]; int expert = lane;
+#pragma unroll
+            for (int i = 1; i < 16; ++i)
+                if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
+#pragma unroll
+            for (int mask = 16; mask; mask >>= 1) {
+                const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
+                const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
+                if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
+            }
+            if ((expert & 31) == lane) {
+                values[expert / 32] = -INFINITY; ids[rank] = expert; selected_sum += best;
+            }
+            if (rank == lane) selected = best;
+        }
+    }
+    selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
+    const float inverse_selected_sum = 1.0f / selected_sum;
+    if (lane < 10) weights[lane] = selected * inverse_selected_sum;
+}
+#endif
+
 // The same contract for other (experts, top-k) shapes - Qwen3.6-35B-A3B's 256 / 8 - one warp per token, n_tok tokens
 // (8 per block).  The 512 / 10 path keeps its own kernels above (the Flash-Next bits), this template is only used
 // for the other shapes.
@@ -216,11 +347,38 @@ bool overlap(const void* a, size_t an, const void* b, size_t bn) {
 }
 void native_router_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_router_enabled() { return enabled.load(std::memory_order_relaxed); }
+void native_router_set_compact_enabled(bool value) {
+#if defined(__HIPCC__)
+    if (value) throw std::invalid_argument("compact router requires NVIDIA CUDA");
+#endif
+    compact_enabled.store(value, std::memory_order_relaxed);
+}
+bool native_router_compact_enabled() { return compact_enabled.load(std::memory_order_relaxed); }
+void native_router_top10_compact(const float* logits, int32_t* ids, float* weights,
+                                 int n_tok, void* stream, uint32_t* diagnostics) {
+#if defined(__HIPCC__)
+    (void)logits; (void)ids; (void)weights; (void)n_tok; (void)stream; (void)diagnostics;
+    throw std::invalid_argument("compact router requires NVIDIA CUDA");
+#else
+    if (!stream || n_tok < 1) throw std::invalid_argument("compact router requires a stream and positive rows");
+    const size_t li = (size_t)n_tok * 512 * 4, oi = (size_t)n_tok * 10 * 4, di = (size_t)n_tok * 2 * 4;
+    if (!valid(logits, li) || !valid(ids, oi) || !valid(weights, oi) ||
+        overlap(logits, li, ids, oi) || overlap(logits, li, weights, oi) || overlap(ids, oi, weights, oi) ||
+        (diagnostics && (!valid(diagnostics, di) || overlap(logits, li, diagnostics, di) ||
+                        overlap(ids, oi, diagnostics, di) || overlap(weights, oi, diagnostics, di))))
+        throw std::invalid_argument("compact router requires aligned disjoint spans");
+    route_compact<<<((unsigned)n_tok + 7u) / 8u, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(
+        logits, ids, weights, n_tok, diagnostics);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+#endif
+}
 void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream) {
     if (!stream || !valid(logits, 512 * 4) || !valid(ids, 10 * 4) || !valid(weights, 10 * 4)
         || overlap(logits, 512 * 4, ids, 10 * 4) || overlap(logits, 512 * 4, weights, 10 * 4)
         || overlap(ids, 10 * 4, weights, 10 * 4))
         throw std::invalid_argument("native router requires a stream, aligned spans, and disjoint outputs");
+    if (native_router_compact_enabled()) { native_router_top10_compact(logits, ids, weights, 1, stream); return; }
     route<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
@@ -229,6 +387,7 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
     if (!stream || n_tok < 1 || !valid(logits, (size_t) n_tok * 512 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
         !valid(weights, (size_t) n_tok * 10 * 4))
         throw std::invalid_argument("native router (multi) requires a stream and aligned [n,512]/[n,10] buffers");
+    if (native_router_compact_enabled()) { native_router_top10_compact(logits, ids, weights, n_tok, stream); return; }
     route_multi<<<(unsigned) ((n_tok + 7) / 8), dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, n_tok);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
