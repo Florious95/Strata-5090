@@ -25,6 +25,7 @@
 #include "strata/core/device.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/batch_segments.hpp"
+#include "strata/core/total_q_buckets.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
@@ -3081,6 +3082,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata: row table requires audited generalized C4 rows12, merged experts, "
                              "context262144 and Q4 resident20480\n"); return 2;
     }
+    bool total_q_buckets = false;
+    if (!strata::core::parse_slot_solo(std::getenv("STRATA_BATCH_TOTAL_Q_BUCKETS"),total_q_buckets)) {
+        std::fprintf(stderr,"strata: STRATA_BATCH_TOTAL_Q_BUCKETS must be 0 or 1\n"); return 2;
+    }
+    if (total_q_buckets && (!row_table || !o.batch_mtp)) {
+        std::fprintf(stderr,"strata: total-Q buckets require STRATA_BATCH_ROW_TABLE=1 and --batch-mtp\n"); return 2;
+    }
 #if defined(STRATA_USE_HIP) || defined(STRATA_GPU_METAL) || defined(STRATA_GPU_SYCL)
     if (row_table) { std::fprintf(stderr, "strata: row table requires NVIDIA CUDA\n"); return 2; }
 #endif
@@ -3088,6 +3096,9 @@ int main(int argc, char** argv) {
     if (!strata::core::parse_batch_graph_limit(std::getenv("STRATA_BATCH_GRAPH_LIMIT"),
                                              generalized || audit_requested, batch_graph_limit)) {
         std::fprintf(stderr, "strata: STRATA_BATCH_GRAPH_LIMIT must be a decimal integer in 1..64\n"); return 2;
+    }
+    if (total_q_buckets && batch_graph_limit < (int)strata::core::kTotalQTemplates.size()) {
+        std::fprintf(stderr,"strata: total-Q buckets require STRATA_BATCH_GRAPH_LIMIT>=8\n"); return 2;
     }
     strata::core::WindowAudit window_audit;
     const bool slot_only_cli = o.batch_slot_only;
@@ -9128,6 +9139,7 @@ int main(int argc, char** argv) {
             c.generalized = generalized; c.canonical = o.batch_slot_only; c.segmented = batch_fast;
             c.slot_solo = slot_solo;
             c.row_table = row_table;
+            c.total_q_buckets = total_q_buckets;
             c.solo_graph_limit = slot_solo ? (int) strata::core::slot_solo_graph_limit((size_t) batch_graph_limit) : 0;
             c.engine_version = STRATA_VERSION;
 #ifdef STRATA_SOURCE_SHA
@@ -11007,6 +11019,9 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+        if (!ver.prewarm_total_q_templates(err)) {
+            std::fprintf(stderr,"strata total-Q buckets: startup prewarm failed: %s\n",err.c_str()); return 1;
+        }
         // what the server's Monitor tab shows (servers before 0.1.8 skip unknown lines until READY)
         {
             size_t free_b = 0, total_b = 0;
@@ -11064,6 +11079,7 @@ int main(int argc, char** argv) {
                                        " batch_generalized=" + std::to_string(generalized ? 1 : 0) +
                                        " batch_slot_solo=" + std::to_string(slot_solo ? 1 : 0) +
                                         " batch_row_table=" + std::to_string(row_table ? 1 : 0) +
+                                        " batch_total_q_buckets=" + std::to_string(total_q_buckets ? 1 : 0) +
                                        " batch_window_audit=" + std::to_string(window_audit.enabled() ? 1 : 0) +
                                         " slot_vision=" + std::to_string(o.batch_slot_only && o.vision ? 1 : 0) +
                                        " slot_spill_lazy=" + std::to_string(o.batch_slot_only ? 1 : 0) +
@@ -11344,6 +11360,7 @@ int main(int argc, char** argv) {
             d.execution_path = ver.last_slot_solo() ? "slot_solo" : ver.last_row_table() ? "batch_rows" : "legacy";
             d.graph_key_kind = ver.last_slot_solo() ? "slot_solo" : ver.last_row_table() ? "rows_cut" : "legacy_layout";
             d.graph_key_cut = ver.graph_key_cut(); d.graph_key_profile = ver.graph_key_profile();
+            d.total_q_template = ver.batch_total_q_template_id(); d.total_q_bucket = ver.batch_total_q_bucket();
             d.table_score_launches = ver.row_table_score_launches();
             d.table_score_segments = ver.row_table_score_segments();
             d.table_attn_launches = ver.row_table_attention_launches();
@@ -11885,6 +11902,16 @@ int main(int argc, char** argv) {
                     (int)(batch_round % bs.size())) < 0) {
                 std::printf("ERR generalized batch segments cannot fit two eight-row groups\n"); return false;
             }
+            int offered_rows = 0;
+            for (int b = 0; b < (int)bs.size(); ++b) offered_rows += allocated[b];
+            if (total_q_buckets && logical > 1) {
+                strata::core::TotalQPlan plan;
+                if (!strata::core::plan_total_q_buckets({allocated[0],allocated[1],allocated[2],allocated[3]},
+                        (int)(batch_round%4),plan,err)) {
+                    std::printf("ERR %s\n",err.c_str()); return false;
+                }
+                for (int b = 0; b < 4; ++b) allocated[b] = plan.widths[b];
+            }
             for (int b = 0; b < (int) bs.size(); ++b)
                 if (bs[(size_t) b].active) {
                     const auto& sl = bs[(size_t) b];
@@ -11960,6 +11987,7 @@ int main(int argc, char** argv) {
             const bool host_trace = ver.batch_host_profile_enabled() && !use_slot_solo;
             const Clock::time_point hcall0 = host_trace ? Clock::now() : Clock::time_point{};
             auto audit_window = begin_audit_window(rows, S, pos);
+            audit_window.dispatch.total_q_offered_rows = total_q_buckets && logical > 1 ? offered_rows : 0;
             for (size_t a = 0; a < audit_window.slots.size(); ++a) {
                 int first = 0;
                 for (size_t j = 0; j < a; ++j) first += audit_window.slots[j].rows;

@@ -3777,10 +3777,75 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
         err = "STRATA_BATCH_ROW_TABLE must be 0 or 1"; return false;
     }
     row_table_ = table_env && table_env[0] == '1';
+    const char* bucket_env = std::getenv("STRATA_BATCH_TOTAL_Q_BUCKETS");
+    if (bucket_env && std::strcmp(bucket_env,"0") && std::strcmp(bucket_env,"1")) {
+        err = "STRATA_BATCH_TOTAL_Q_BUCKETS must be 0 or 1"; return false;
+    }
+    total_q_buckets_ = bucket_env && bucket_env[0] == '1';
+    if (total_q_buckets_ && !row_table_) {
+        err = "total-Q buckets require the device row table"; return false;
+    }
     // The driver seals the fixed table after final head/cache/split setters,
     // before READY or any request can capture a graph.
     std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences (layers [%lld, %lld))%s\n", (long long) S,
                  (long long) lb_, (long long) le_, g_batch_self_commit ? ", one-row windows keep their rows" : "");
+    return true;
+}
+
+bool Verifier::prewarm_total_q_templates(std::string& err) {
+    if (!total_q_buckets_ || total_q_ready_) return true;
+    const OnDevice on(device_);
+    if (!device_table_arena_ || !dense_parallel_ || !narrow_parallel_ || prof_on_ ||
+        batch_graph_limit_ < kTotalQTemplates.size() || last_batch_ || staged_ || prelaunched_ ||
+        b_running_.load() || solo_slot_ >= 0) {
+        err = "total-Q buckets require idle sealed C4, dense/narrow parallel, no profiler and graph limit >=8";
+        return false;
+    }
+    const auto generations = slot_generation_;
+    const uint64_t sequence = row_table_sequence_;
+    const auto window = *h_window_;
+    const auto commit = *h_device_commit_;
+    const double old_ms_host = ms_host;
+    struct Reset {
+        Verifier& v; std::array<uint64_t,4> generations; uint64_t sequence;
+        strata::kernels::DeviceWindowLayout window;
+        strata::kernels::DeviceCommitLayout commit; double ms_host;
+        ~Reset() {
+            v.slot_generation_ = generations; v.row_table_sequence_ = sequence;
+            *v.h_window_ = window; *v.h_device_commit_ = commit; *v.h_table_status_ = 0;
+            v.total_q_prewarming_ = false; v.total_q_template_ = -1;
+            v.batch_table_active_ = v.last_row_table_ = v.last_batch_ = false;
+            v.batch_expert_merged_ = v.batch_dense_parallel_ = v.batch_shared_after_ring_ = false;
+            v.batch_dense_boundary_ = v.batch_boundary_ = v.row_base_ = v.last_t_ = 0;
+            v.last_head_ = {}; v.host_prof_ = {}; v.ms_host = ms_host;
+        }
+    } reset{*this,generations,sequence,window,commit,old_ms_host};
+    total_q_prewarming_ = true;
+    slot_generation_ = {1,1,1,1}; // capture only: never runs a target or changes audit generations
+    for (const auto& t : kTotalQTemplates) {
+        int ids[12] = {}; int32_t tokens[12] = {}; int64_t positions[12] = {};
+        int at = 0;
+        for (int b = 0; b < 4; ++b) for (int j = 0; j < t.witness[b]; ++j) {
+            ids[at] = b; positions[at++] = j;
+        }
+        if (at != t.rows || !stage_batch(ids,at,0,tokens,positions,err,true)) return false;
+    }
+    if (exec_bm_.size() - total_q_evictable_count(exec_bm_) != kTotalQTemplates.size()) {
+        err = "total-Q buckets: incomplete target template bank"; return false;
+    }
+    for (const auto& entry : exec_bm_) if (total_q_pinned_key(entry.first)) {
+        const auto it = commit_bm_.find(entry.first);
+        if (!entry.second || it == commit_bm_.end() || !it->second) {
+            err = "total-Q buckets: incomplete commit template bank"; return false;
+        }
+    }
+    size_t free = 0, total = 0;
+    if (cudaMemGetInfo(&free,&total) != cudaSuccess || free < (size_t)512*1024*1024) {
+        err = "total-Q buckets: less than 512 MiB after prewarm; raise VRAM reserve"; return false;
+    }
+    total_q_ready_ = true;
+    std::fprintf(stderr,"strata total-Q buckets: READY families=4 exact_G2_pairs=8 pinned=1 legacy_LRU=%zu "
+                        "profile=%u free_bytes=%zu padding=0\n",batch_graph_limit_,total_q_profile_,free);
     return true;
 }
 
@@ -3947,7 +4012,7 @@ bool Verifier::evict_batch_graph(const std::vector<int>& keep, bool& evicted, st
     auto old = exec_bm_.end();
     uint64_t oldest = UINT64_MAX;
     for (auto it = exec_bm_.begin(); it != exec_bm_.end(); ++it) {
-        if (it->first == keep) continue;
+        if (it->first == keep || (total_q_buckets_ && total_q_pinned_key(it->first))) continue;
         const auto u = bm_used_.find(it->first);
         const uint64_t t = u == bm_used_.end() ? 0 : u->second;
         if (t < oldest) { oldest = t; old = it; }
@@ -3993,6 +4058,12 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
         err = std::string(what) + cudaGetErrorString(ie);
         return false;
     }
+    if (total_q_buckets_) {
+        size_t free = 0, total = 0;
+        if (cudaMemGetInfo(&free,&total) != cudaSuccess || free < (size_t)300*1024*1024) {
+            err = "total-Q buckets: less than 300 MiB after graph instantiate"; return false;
+        }
+    }
     return true;
 }
 
@@ -4037,6 +4108,21 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     batch_expert_merged_ = mergeable && (batch_table_active_ || S > 8 || (narrow_tiles && batch_dense_boundary_ > 0));
     batch_dense_parallel_ = batch_expert_merged_ && batch_dense_boundary_ > 0 && parallel_capable;
     batch_shared_after_ring_ = batch_dense_parallel_ && shared_after_ring;
+    total_q_template_ = -1;
+    if (total_q_buckets_ && batch_table_active_) {
+        int owners = 0;
+        for (int t = 0; t < S; t += segment_width(rows,S,t)) ++owners;
+        if (owners > 1) {
+            const int id = total_q_template_id(S,batch_dense_boundary_);
+            const uint32_t profile = device_execution_profile();
+            if ((!total_q_ready_ && !total_q_prewarming_) || id < 0 || !batch_dense_parallel_ ||
+                !batch_shared_after_ring_ || (total_q_profile_ && total_q_profile_ != profile)) {
+                err = "total-Q buckets: undeclared template or nonparallel/frozen profile changed"; return false;
+            }
+            if (!total_q_profile_) total_q_profile_ = profile;
+            total_q_template_ = id;
+        }
+    }
     // Dense tiles and the host expert group have deliberately different bounds:
     // the joined router publishes exactly one complete window, including <=8.
     batch_boundary_ = batch_expert_merged_ ? 0 : batch_dense_boundary_;
@@ -4049,8 +4135,13 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     const auto cached = exec_bm_.find(key);
     batch_graph_cache_hit_ = cached != exec_bm_.end() && cached->second != nullptr;
     if (host_prof_on_) host_prof_.graph_cache_hit = batch_graph_cache_hit_;
+    const bool pinned = total_q_buckets_ && total_q_pinned_key(key);
+    if (pinned && !total_q_prewarming_ && !batch_graph_cache_hit_) {
+        err = "total-Q buckets: sealed template missing; restart required"; return false;
+    }
     const int64_t hevict = host_stamp_ns();
-    if (batch_graph_limit_ > 0 && exec_bm_.find(key) == exec_bm_.end() && exec_bm_.size() >= batch_graph_limit_ &&
+    const size_t evictable = total_q_buckets_ ? total_q_evictable_count(exec_bm_) : exec_bm_.size();
+    if (!pinned && batch_graph_limit_ > 0 && exec_bm_.find(key) == exec_bm_.end() && evictable >= batch_graph_limit_ &&
         !evict_batch_graph(key, evicted, err))
         return false;
     host_prof_.evict_ns = host_stamp_ns() - hevict;
