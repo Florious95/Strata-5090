@@ -88,6 +88,7 @@ struct Fixture {
         std::vector<float> zero(parts.n); parts.upload(zero);hits.upload(zero);
         weights.upload(std::vector<float>(weights.n,1.0f));shared.upload(std::vector<float>(shared.n));
         gate.upload(std::vector<float>(gate.n));count.upload({0});
+        ck(cudaDeviceSynchronize(),"warmup inputs ready"); // uploads use the default stream; main is nonblocking
         for (int variant=0;variant<VariantCount;++variant) run_candidate(1,Variant(variant));
         ck(cudaStreamSynchronize(main),"entry warmup");
     }
@@ -225,10 +226,10 @@ int main() {
     }
     for (int width:{7,8,31,2560}) for (int experts:{1,2,10,15}) {Fixture fixture(width,experts);fixture.run();}
     require(fused_calls>0 && scatter_calls>0,"positive controls must exercise fused and R12 scatter fallback");
+    require(cases==3456 && graph_replays==3456,"planned fixture/replay count");
     std::printf("PASS ordered_moe_fold_gpu: %zu fixed-leaf fixtures/replays, fused=%zu scatter=%zu; "
                 "CPU RN bits == production single == captured mixed batch, inactive/guard poison intact\n",
                 cases,fused_calls,scatter_calls);
-    require(graph_replays==cases,"replay count");
     std::printf("NOT COVERED: expert Q8_K/Q8_1 equivalence, sigmoid approximation (gate=0 only), "
                 "GDN/attention/state transitions, model output IDs, performance or memory qualification\n");
 }
