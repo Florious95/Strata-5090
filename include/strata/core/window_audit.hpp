@@ -2,7 +2,9 @@
 
 // Opt-in host-side native accounting. No CUDA calls, token IDs or prompt data.
 // Wire contract: docs/WINDOW-AUDIT-V1.md. The default-disabled path writes nothing.
+#include "strata/core/total_q_buckets.hpp"
 #include <array>
+#include <cstring>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -79,6 +81,7 @@ struct AuditDispatch {
     int graph_key_rows = 0, graph_owner_slot = -1, graph_key_cut = 0;
     uint32_t graph_key_profile = 0;
     int table_score_launches = 0, table_score_segments = 0, table_attn_launches = 0, table_attn_rows = 0;
+    int total_q_template = -1, total_q_bucket = 0, total_q_offered_rows = 0;
     uint64_t graph_address_epoch = 0;
 };
 struct AuditWindow {
@@ -92,6 +95,7 @@ struct AuditConfig {
     int64_t max_context = 0, resident_requested = 0;
     std::vector<int64_t> effective_resident;
     bool generalized = false, canonical = false, segmented = false, slot_solo = false, row_table = false;
+    bool total_q_buckets = false;
     int solo_graph_limit = 0;
     std::string engine_version, source_sha;
     int source_dirty = -1;
@@ -127,7 +131,10 @@ public:
         if (file_ || c.slots < 2 || c.slots > 8 || c.max_rows < c.slots || c.max_rows > 16 ||
             c.max_context < 1 || c.effective_resident.size() != (size_t) c.slots)
             return fail("invalid audit configuration");
+        if (c.total_q_buckets && (c.slots != 4 || c.max_rows != 12 || !c.row_table ||
+            !c.generalized || !c.canonical || !c.segmented)) return fail("invalid total-Q audit configuration");
         max_rows_ = c.max_rows;
+        total_q_buckets_ = c.total_q_buckets;
 #if defined(_WIN32)
         const int fd = _open(path, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY, _S_IREAD | _S_IWRITE);
         if (fd >= 0) file_ = _fdopen(fd, "wb");
@@ -161,6 +168,8 @@ public:
              ",\"slot_solo\":" + boolean(c.slot_solo) + ",\"row_table\":" + boolean(c.row_table) +
              ",\"slot_solo_target_graph_limit\":" + num(c.solo_graph_limit) +
              ",\"slot_solo_commit_graph_limit\":" + num(c.slot_solo ? 4 : 0) +
+             ",\"total_q_buckets\":" + boolean(c.total_q_buckets) +
+             ",\"total_q_template_pairs\":" + num(c.total_q_buckets ? (int)kTotalQTemplates.size() : 0) +
              ",\"max_rows\":" + num(c.max_rows) + ",\"max_dense_groups\":2,\"audit_all_batch_paths\":true}," +
              "\"provenance\":{\"counter_schema\":\"expert-dispatch-occurrences-v1\",\"route_sources\":{" +
              "\"routed\":\"ExpertDispatch.experts\",\"hits\":\"ExpertDispatch.cache_hits\"," +
@@ -240,6 +249,18 @@ public:
         }
         if (row < 1 || row != w.row_slots.size() || row > (size_t) max_rows_)
             return fail("audit window exceeds configured row capacity");
+        const auto& bucket = w.dispatch;
+        const bool needs_bucket = total_q_buckets_ && w.slots.size() > 1;
+        if (needs_bucket != (bucket.total_q_template >= 0)) return fail("audit total-Q policy/dispatch mismatch");
+        if (needs_bucket) {
+            const int id = total_q_template_id((int)row,bucket.graph_key_cut);
+            if (id < 0 || bucket.total_q_template != id || bucket.total_q_bucket != kTotalQTemplates[id].bucket ||
+                bucket.total_q_offered_rows < (int)row || bucket.total_q_offered_rows > 12 ||
+                bucket.graph_key_rows != (int)row || !bucket.canonical || !bucket.generalized || !bucket.merged ||
+                bucket.dense_groups != 2 || !bucket.dense_parallel || !bucket.shared_after_ring || !bucket.graph_hit ||
+                std::strcmp(bucket.execution_path,"batch_rows") || std::strcmp(bucket.graph_key_kind,"rows_cut"))
+                return fail("audit total-Q requires an exact cached G2 template");
+        }
         const bool valid = w.route.valid();
         if (!valid) ++invalid_;
         std::string s = prefix("window") + ",\"window_id\":" + num(++window_id_) +
@@ -280,6 +301,9 @@ public:
             ",\"graph_key_kind\":" + quote(d.graph_key_kind) + ",\"graph_key_rows\":" + num(d.graph_key_rows) +
             ",\"graph_owner_slot\":" + num(d.graph_owner_slot) + ",\"graph_address_epoch\":" + num(d.graph_address_epoch) +
             ",\"graph_key_cut\":" + num(d.graph_key_cut) + ",\"graph_key_profile\":" + num(d.graph_key_profile) +
+             ",\"row_table_bucket\":" + (d.total_q_template < 0 ? std::string("null") :
+                 "{\"family\":" + num(d.total_q_bucket) + ",\"template_id\":" + num(d.total_q_template) +
+                 ",\"offered_rows\":" + num(d.total_q_offered_rows) + ",\"retained_rows\":" + num(d.graph_key_rows) + "}") +
             ",\"row_table_qsa_calls\":{\"score_launches\":" + num(d.table_score_launches) +
             ",\"score_segments\":" + num(d.table_score_segments) + ",\"attention_launches\":" + num(d.table_attn_launches) +
             ",\"attention_rows\":" + num(d.table_attn_rows) + "}" +
@@ -337,7 +361,7 @@ private:
     std::map<std::string, Total> scope_totals_;
     std::map<std::pair<int, uint64_t>, std::array<int64_t, 3>> slot_totals_;
     int admission_slot_ = -1, admission_runs_ = 0, max_rows_ = 0;
-    bool copy_instrumented_ = false, copy_known_ = false;
+    bool copy_instrumented_ = false, copy_known_ = false, total_q_buckets_ = false;
     std::array<int64_t, 4> copy_bytes_{};
     AuditRoute admission_route_;
     bool fail(const char* why) { if (error_.empty()) error_ = why; return false; }

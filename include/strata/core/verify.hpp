@@ -21,6 +21,7 @@
 // selection, native indexer) and a profile-filled VRAM expert tier with its residency table on the device.
 #pragma once
 #include "strata/core/batch_device_layout.hpp"
+#include "strata/core/total_q_buckets.hpp"
 
 #include "strata/core/slot_solo.hpp"
 
@@ -271,6 +272,12 @@ public:
     /// and head-sampling suppression while using the slot graph; commit with commit_slots().
     bool prepare_row_table(std::string& err) { return !row_table_ || init_device_table(err); }
     bool row_table_enabled() const { return row_table_; }
+    bool prewarm_total_q_templates(std::string& err);
+    int batch_total_q_template_id() const { return last_row_table_ ? total_q_template_ : -1; }
+    int batch_total_q_bucket() const {
+        const int id = batch_total_q_template_id();
+        return id >= 0 ? kTotalQTemplates[id].bucket : 0;
+    }
     bool last_row_table() const { return last_row_table_; }
     uint64_t row_table_epoch() const { return row_table_epoch_; }
     bool set_slot_request_generation(int slot, uint64_t generation, std::string& err);
@@ -486,6 +493,9 @@ private:
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
     int last_rows_[kBatchMaxRows] = {};                ///< the slots of the last batch window's rows
     bool row_table_ = false, batch_table_active_ = false, last_row_table_ = false;
+    bool total_q_buckets_ = false, total_q_ready_ = false, total_q_prewarming_ = false;
+    int total_q_template_ = -1;
+    uint32_t total_q_profile_ = 0;
     void* device_table_arena_ = nullptr;
     strata::kernels::DeviceBatchView device_batch_;
     strata::kernels::DeviceSlotTable table_snapshot_;
@@ -508,7 +518,11 @@ private:
     std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
         // All mutable owner pointers and complete segments are runtime device
         // inputs. The family has frozen geometry/addresses and explicit profile.
-        std::vector<int> k = batch_table_active_ ? std::vector<int>{-2, S} : batch_key(rows, S, hbase);
+        std::vector<int> k;
+        if (batch_table_active_ && total_q_template_ >= 0) {
+            const auto prefix = total_q_key_prefix(kTotalQTemplates[total_q_template_]);
+            k.assign(prefix.begin(),prefix.end());
+        } else k = batch_table_active_ ? std::vector<int>{-2, S} : batch_key(rows, S, hbase);
         k.push_back(ar_off_ ? 1 : 0);
         k.push_back(batch_expert_merged_ ? 1 : 0);
         k.push_back(batch_dense_boundary_);
