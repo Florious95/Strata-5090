@@ -158,7 +158,7 @@ __launch_bounds__(256, 1)
 __global__ void route_compact(const float* __restrict__ logits, int32_t* __restrict__ ids,
                               float* __restrict__ weights, int n_tok, uint32_t* diagnostics) {
     namespace rc = router_compact;
-    __shared__ uint32_t candidate_key[8][rc::capacity];
+    __shared__ uint16_t candidate_id[8][rc::capacity];
     __shared__ float candidate_value[8][rc::capacity];
     const int row = (int)blockIdx.x * 8 + (int)threadIdx.y;
     if (row >= n_tok) return;
@@ -221,7 +221,7 @@ __global__ void route_compact(const float* __restrict__ logits, int32_t* __restr
         for (int i = 0; i < 16; ++i) {
             const uint32_t bits = __float_as_uint(values[i]);
             if (rc::keep(bits, (uint16_t)threshold)) {
-                candidate_key[group][offset] = ((uint32_t)rc::bucket(bits) << 16) | (uint32_t)(lane + i * 32);
+                candidate_id[group][offset] = (uint16_t)(lane + i * 32);
                 candidate_value[group][offset++] = values[i];
             }
         }
@@ -231,7 +231,7 @@ __global__ void route_compact(const float* __restrict__ logits, int32_t* __restr
         for (int i = 0; i < 4; ++i) {
             const int pos = lane + i * 32;
             filtered[i] = pos < total ? candidate_value[group][pos] : -INFINITY;
-            original[i] = pos < total ? (int)(candidate_key[group][pos] & 0xffffu) : INT32_MAX;
+            original[i] = pos < total ? (int)candidate_id[group][pos] : INT32_MAX;
         }
         for (int rank = 0; rank < 10; ++rank) {
             float best = filtered[0]; int expert = original[0];

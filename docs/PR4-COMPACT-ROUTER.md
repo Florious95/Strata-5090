@@ -23,8 +23,8 @@ implementation, precision changes, or SM100-only kernels. It adds no dependency.
 3. Pair lanes `j` and `j+16`. The minimum of these 16 disjoint groups' maximum
    keys is a lower bound: at least 16 values survive, so a lower bucket cannot
    contain any of the top ten. Keep every value in the boundary bucket.
-4. If 16..128 candidates survive, compact their original IDs/prefixes and FP32
-   values into a bounded table (8 KiB shared memory per eight-row block).
+4. If 16..128 candidates survive, compact their original 16-bit IDs and FP32
+   values into a bounded table (6 KiB shared memory per eight-row block).
    Each lane then searches at most four candidates, instead of sixteen.
 5. Uniform/dense buckets and invalid rows take the full original selection
    body. In particular, >128 candidates are **never truncated**.
@@ -48,7 +48,7 @@ zero, that zero may be safely filtered according to the normal bound.
 The kernel has fixed grid geometry and bounded shared memory; no allocation,
 host synchronization, default-stream work, or JIT occurs during capture.
 Configure `STRATA_ROUTER_COMPACT_TOPK=0|1` before engine startup. It defaults to
-zero. Invalid values, a disabled native router, non-NVIDIA backends or a model
+zero. Invalid flag values, a disabled native router, non-NVIDIA backends or a model
 other than 512 experts/top10 are rejected. READY reports `router_compact_topk`.
 Existing graphs retain their chosen kernel; live reconfiguration is unsupported.
 
