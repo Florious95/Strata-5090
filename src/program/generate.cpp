@@ -25,6 +25,7 @@
 #include "strata/core/device.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/batch_segments.hpp"
+#include "strata/core/dspark_confidence.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
@@ -3084,6 +3085,15 @@ int main(int argc, char** argv) {
 #if defined(STRATA_USE_HIP) || defined(STRATA_GPU_METAL) || defined(STRATA_GPU_SYCL)
     if (row_table) { std::fprintf(stderr, "strata: row table requires NVIDIA CUDA\n"); return 2; }
 #endif
+    bool dspark = false;
+    if (!strata::core::parse_slot_solo(std::getenv("STRATA_BATCH_DSPARK"), dspark)) {
+        std::fprintf(stderr, "strata: STRATA_BATCH_DSPARK must be 0 or 1\n"); return 2;
+    }
+    if (dspark && (!slot_solo || !row_table || o.batch_spec < 2 || o.batch_spec > 8 ||
+                   o.spec < o.batch_spec || o.batch_suffix)) {
+        std::fprintf(stderr, "strata: DSPark needs audited C4 Solo+row-table MTP, variable rows12, "
+                             "2<=batch-spec<=spec<=8 and no suffix drafts\n"); return 2;
+    }
     int batch_graph_limit = 64;
     if (!strata::core::parse_batch_graph_limit(std::getenv("STRATA_BATCH_GRAPH_LIMIT"),
                                              generalized || audit_requested, batch_graph_limit)) {
@@ -5429,7 +5439,7 @@ int main(int argc, char** argv) {
             sx.mrope_host = mrope_host.data() + b * stride;
         }
     }
-    const int max_batch_spec = o.batch_slot_only ? 6 : 4;
+    const int max_batch_spec = dspark ? 8 : o.batch_slot_only ? 6 : 4;
     if (o.batch_spec < 1 || o.batch_spec > max_batch_spec ||
         (o.batch_spec > 4 && (o.spec < o.batch_spec || o.batch_rows != 12))) {
         std::fprintf(stderr, "strata: --batch-spec must be 1..4, or slot-only C2 5..6 with --spec >= depth "
@@ -11063,6 +11073,7 @@ int main(int argc, char** argv) {
                                        " batch_graph_limit=" + std::to_string(batch_mtp || batch_fast || audit_requested ? batch_graph_limit : 0) +
                                        " batch_generalized=" + std::to_string(generalized ? 1 : 0) +
                                        " batch_slot_solo=" + std::to_string(slot_solo ? 1 : 0) +
+                                        (dspark ? " batch_dspark=1 batch_dspark_lag=2 batch_dspark_history=16" : "") +
                                         " batch_row_table=" + std::to_string(row_table ? 1 : 0) +
                                        " batch_window_audit=" + std::to_string(window_audit.enabled() ? 1 : 0) +
                                         " slot_vision=" + std::to_string(o.batch_slot_only && o.vision ? 1 : 0) +
@@ -11297,6 +11308,7 @@ int main(int argc, char** argv) {
             bool img = false;              ///< the conversation has pictures (never reused from the slot)
             bool cacheable = true;         ///< request's checkpoint/cache opt-in
             int row_limit = 4;             ///< adaptive 12-row mode starts at proven depth, grows on accepted work
+            int dspark_draft_rows = 1;     ///< pending row plus the private proposals actually generated
             strata::kernels::SamplerParams sampling; ///< private params for row-local penalty histories
             const char* finish_reason = nullptr; ///< slot-only BDONE publishes complete canonical GPU hot state
             // the checkpoint its prompt read took at the last turn boundary (the history before the new turn's
@@ -11312,6 +11324,10 @@ int main(int argc, char** argv) {
             ConvCheckpoint::PromptPlan partial_plan;   ///< --prefill-pipe: the segment it stopped in, read on in its chunks
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+        std::array<strata::core::DsparkConfidence, 4> dspark_history;
+        if (dspark && bs.size() != dspark_history.size()) {
+            std::printf("ERR DSPark requires four canonical owners\n"); return 1;
+        }
         auto begin_audit_window = [&](const int* rows, int count, const int64_t* positions) {
             strata::core::AuditWindow w;
             if (!window_audit.enabled()) return w;
@@ -11837,7 +11853,11 @@ int main(int argc, char** argv) {
             const int row_budget = batch_prefilling && o.batch_prefill_rows > 0 ?
                 std::min(o.batch_rows, o.batch_prefill_rows) : o.batch_rows;
             const int per_slot = batch_fast && logical ? std::min({o.batch_spec, o.spec, row_budget / logical}) : 1;
-            const int proposal_cap = batch_fast && o.batch_rows_fair ? std::min(o.batch_spec, o.spec) : per_slot;
+            const int proposal_cap = batch_fast && (o.batch_rows_fair || dspark) ? std::min(o.batch_spec, o.spec) : per_slot;
+            std::array<strata::core::DsparkDepthPlan, 4> dspark_plans{};
+            if (dspark && batch_round == UINT64_MAX) {
+                std::printf("ERR DSPark window clock exhausted\n"); return false;
+            }
             int allocated[strata::core::kBatchMaxRows] = {}, wanted[strata::core::kBatchMaxRows] = {};
             int32_t proposals[strata::core::kBatchMaxRows][8] = {};
             int useful_slot[strata::core::kBatchMaxRows] = {};
@@ -11853,10 +11873,18 @@ int main(int argc, char** argv) {
                     sl.from_suffix = false;
                     sl.suffix_match = 0;
                     int32_t lookup[8] = {};
-                    const int slot_cap = adaptive_rows ? std::min(proposal_cap, sl.row_limit) : proposal_cap;
+                    int slot_cap = adaptive_rows ? std::min(proposal_cap, sl.row_limit) : proposal_cap;
+                    if (dspark) {
+                        const auto plan = dspark_history[(size_t)b].plan(std::min(o.batch_spec, o.spec));
+                        if (!plan.rows || plan.generation != window_audit.generation(b)) {
+                            std::printf("ERR DSPark stale owner generation\n"); return false;
+                        }
+                        dspark_plans[(size_t)b] = plan;
+                        slot_cap = std::min({proposal_cap, plan.rows, sl.dspark_draft_rows});
+                    }
                     int width = 1;
                     while (sl.draft_ready && !sl.stop && width < slot_cap &&
-                           sl.proposal_probs[width - 1] >= sl.min_probability &&
+                           (dspark || sl.proposal_probs[width - 1] >= sl.min_probability) &&
                            sl.p + width < o.max_context && sl.produced + width < sl.max_new) ++width;
                     if (sl.suffix && sl.draft_ready && !sl.stop && slot_cap > 1) {
                         const int limit = (int) std::min<int64_t>(slot_cap - 1,
@@ -11873,8 +11901,12 @@ int main(int argc, char** argv) {
                     // Ordinary upstream batching can have >4 slots. The packing
                     // arrays cover its full capacity even though MTP is <=4.
                     useful_slot[b] = width;
-                    for (int j = 0; j < width - 1; ++j)
+                    for (int j = 0; j < width - 1; ++j) {
                         proposals[b][j] = sl.from_suffix ? lookup[j] : sl.proposals[j];
+                        if (dspark && (proposals[b][j] < 0 || proposals[b][j] >= n_vocab)) {
+                            std::printf("ERR DSPark invalid private proposal token\n"); return false;
+                        }
+                    }
                     if (batch_fast && o.batch_spec_fixed && sl.draft_ready && !sl.stop)
                         width = (int) std::min<int64_t>(proposal_cap, o.max_context - sl.p);
                     wanted[b] = width;
@@ -11995,7 +12027,7 @@ int main(int argc, char** argv) {
                 keeps[t] = poisoned[t] ? 1 : strata::core::accepted_segment_prefix(tok + t, outb + t, useful[t],
                                                                 o.eos_ids.data(), (int) o.eos_ids.size());
             }
-            if (adaptive_rows) {
+            if (adaptive_rows && !dspark) {
                 for (int t = 0; t < S; t += widths[t]) {
                     auto& sl = bs[(size_t) rows[t]];
                     if (poisoned[t]) continue;
@@ -12068,6 +12100,43 @@ int main(int argc, char** argv) {
             }
             if (!o.batch_slot_only) for (const auto& slot : audit_window.slots)
                 if (!bs[(size_t) slot.id].active && !window_audit.finish_slot(slot.id, slot.finish)) return false;
+            int dspark_next[4] = {};
+            if (dspark) {
+                for (int t = 0; t < S; t += widths[t]) {
+                    const int b = rows[t];
+                    if (!poisoned[t] && bs[(size_t)b].active &&
+                        !dspark_history[(size_t)b].observe(window_audit.generation(b), batch_round + 1, useful[t], keeps[t])) {
+                        std::printf("ERR DSPark invalid committed observation\n"); return false;
+                    }
+                }
+                int next_wanted[4] = {};
+                for (int b = 0; b < 4; ++b) if (bs[(size_t)b].active) {
+                    const auto& sl = bs[(size_t)b];
+                    const auto plan = dspark_history[(size_t)b].plan(std::min(o.batch_spec, o.spec));
+                    next_wanted[b] = (int)std::max<int64_t>(1, std::min<int64_t>(plan.rows,
+                        std::min(sl.max_new - sl.produced, o.max_context - sl.p)));
+                }
+                strata::core::allocate_batch_rows(next_wanted, 4, o.batch_rows, (int)((batch_round + 1) % 4), dspark_next);
+                if (strata::core::pack_segment_rows(dspark_next, 4, (int)((batch_round + 1) % 4)) < 0) {
+                    std::printf("ERR DSPark next window is not packable\n"); return false;
+                }
+                // Independent diagnostics, not a V1 wire/schema or device ABI change.
+                if (o.batch_trace) {
+                    std::fprintf(stderr, "batch-dspark-dispatch {\"window_id\":%llu,\"lag\":2,\"slots\":[",
+                                 (unsigned long long)(batch_round + 1));
+                    bool comma = false;
+                    for (int t = 0; t < S; t += widths[t]) {
+                        const int b = rows[t]; const auto& p = dspark_plans[(size_t)b];
+                        std::fprintf(stderr, "%s{\"slot\":%d,\"generation\":%llu,\"step\":%llu,"
+                                             "\"history_through_window\":%llu,\"observations\":%d,"
+                                             "\"observed_rate\":%.9g,\"requested_rows\":%d,\"allocated_rows\":%d}",
+                            comma ? "," : "", b, (unsigned long long)p.generation, (unsigned long long)p.step,
+                            (unsigned long long)p.history_through_window, p.observations, p.observed_rate, p.rows, widths[t]);
+                        comma = true;
+                    }
+                    std::fprintf(stderr, "]}\n");
+                }
+            }
             std::vector<strata::core::MtpDrafter::DraftRound> draft_rounds;
             for (int t = 0; batch_fast && t < S; t += widths[t]) {
                 const int b = rows[t];
@@ -12090,17 +12159,19 @@ int main(int argc, char** argv) {
                     // proposals remain private and never advance target state.
                     int active = 0;
                     for (const auto& candidate : bs) active += candidate.active;
-                    const int draft_cap = o.batch_rows_fair ? std::min(o.batch_spec, o.spec) :
+                    const int draft_cap = dspark ? dspark_next[b] : o.batch_rows_fair ? std::min(o.batch_spec, o.spec) :
                         std::min({o.batch_spec, o.spec, o.batch_rows / std::max(1, active)});
-                    draft.set_max_drafts((adaptive_rows ? std::min(draft_cap, sl.row_limit) : draft_cap) - 1);
+                    draft.set_max_drafts(dspark ? std::max(1, draft_cap - 1) :
+                        (adaptive_rows ? std::min(draft_cap, sl.row_limit) : draft_cap) - 1);
+                    if (dspark) sl.dspark_draft_rows = std::max(2, draft_cap);
                     if (!draft.stage_window(ver.final_R(t), widths[t], err)) {
                         std::printf("ERR batch draft: %s\n", err.c_str()); return false;
                     }
                     if (o.batch_draft_overlap)
                         draft_rounds.push_back({&draft, widths[t], outb + t, pos[t], keeps[t] - 1,
-                                                sl.proposals, sl.proposal_probs, sl.min_probability});
+                                                sl.proposals, sl.proposal_probs, dspark ? 0.0f : sl.min_probability});
                     else if (!draft.draft(widths[t], outb + t, pos[t], keeps[t] - 1, sl.proposals, err,
-                                          sl.proposal_probs, sl.min_probability)) {
+                                          sl.proposal_probs, dspark ? 0.0f : sl.min_probability)) {
                         std::printf("ERR batch draft: %s\n", err.c_str()); return false;
                     }
                 }
@@ -12497,6 +12568,9 @@ int main(int argc, char** argv) {
                 }
                 if (!ver.set_slot_request_generation(admit_slot, window_audit.generation(admit_slot), err)) {
                     std::printf("ERR native request generation: %s\n", err.c_str()); return 1;
+                }
+                if (dspark && !dspark_history[(size_t)admit_slot].reset(window_audit.generation(admit_slot))) {
+                    std::printf("ERR DSPark invalid request generation\n"); return 1;
                 }
                 admit_max_new = mn;
                 adm_drain_ms = line_drain_ms;
@@ -15974,7 +16048,12 @@ int main(int argc, char** argv) {
                                      admit_slot, sl.imgs.size(), ss.rope_delta);
                     if (batch_fast) {
                         auto& draft = *slot_mtp[(size_t) admit_slot];
-                        if (adaptive_rows) draft.set_max_drafts(sl.row_limit - 1);
+                        if (dspark) {
+                            const auto plan = dspark_history[(size_t)admit_slot].plan(std::min(o.batch_spec, o.spec));
+                            if (!plan.rows) { std::printf("ERR DSPark uninitialized admission\n"); return 1; }
+                            sl.dspark_draft_rows = plan.rows;
+                            draft.set_max_drafts(plan.rows - 1);
+                        } else if (adaptive_rows) draft.set_max_drafts(sl.row_limit - 1);
                         // The solo admission emitted one token without drafting the
                         // final target row. Copy only the draft cells actually read,
                         // then catch up that final row to obtain the first proposals.
@@ -15991,7 +16070,8 @@ int main(int argc, char** argv) {
                              cudaDeviceSynchronize() == cudaSuccess);
                         if (!draft_copied ||
                             !draft.stage_window(ver.final_R(0), 1, err) ||
-                            !draft.draft(1, &sl.x, p - 1, 0, sl.proposals, err, sl.proposal_probs, sl.min_probability)) {
+                            !draft.draft(1, &sl.x, p - 1, 0, sl.proposals, err, sl.proposal_probs,
+                                         dspark ? 0.0f : sl.min_probability)) {
                             std::printf("ERR batch draft admission: %s\n", err.c_str()); return 1;
                         }
                         sl.draft_ready = true;
