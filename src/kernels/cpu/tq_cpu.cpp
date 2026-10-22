@@ -7,6 +7,7 @@
 #include "tq_states.hpp"
 #include "ggml-common-tq.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -184,32 +185,40 @@ void tq_rows(TqIsa isa, int ggml_type, const uint8_t* w, size_t row_bytes, int n
              float* const* out, int r0, int r1) {
     if (!tq_isa_ok(isa)) std::abort();   // a caller bug: asked for an ISA this CPU does not have
     tq_state_table();
-    const ActSet& s = unpack_all(act, n, nt);
-    rows_on(isa, tq_kbits(ggml_type), w, row_bytes, n, s.ptr, nt, out, r0, r1);
+    // Merged verification can route more than eight tokens to one expert. Keep every ISA's
+    // fixed-size scratch and per-token reduction unchanged by slicing only the token axis.
+    for (int first = 0; first < nt; first += kTqMaxTokens) {
+        const int count = std::min(kTqMaxTokens, nt - first);
+        const ActSet& s = unpack_all(act + first, n, count);
+        rows_on(isa, tq_kbits(ggml_type), w, row_bytes, n, s.ptr, count, out + first, r0, r1);
+    }
 }
 
 void tq_gu_rows(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
                 const void* const* act, int nt, float* const* ff, int r0, int r1) {
     if (!tq_isa_ok(isa)) std::abort();
     tq_state_table();
-    const ActSet& s = unpack_all(act, n, nt);
     thread_local std::vector<float> gbuf, ubuf;
     const size_t nr = (size_t) r1;   // row r of token t at [t * r1 + r]
     if (gbuf.size() < nr * kTqMaxTokens) { gbuf.resize(nr * kTqMaxTokens); ubuf.resize(nr * kTqMaxTokens); }
     float* gp[kTqMaxTokens];
     float* up[kTqMaxTokens];
-    for (int t = 0; t < nt; ++t) {
-        gp[t] = gbuf.data() + (size_t) t * nr;
-        up[t] = ubuf.data() + (size_t) t * nr;
-    }
     const int kb = tq_kbits(ggml_type);
-    rows_on(isa, kb, blob, gu_row, n, s.ptr, nt, gp, r0, r1);
-    rows_on(isa, kb, blob + up_off, gu_row, n, s.ptr, nt, up, r0, r1);
-    for (int t = 0; t < nt; ++t)
-        for (int r = r0; r < r1; ++r) {
-            const float g = gp[t][r], u = up[t][r];
-            ff[t][r] = (g / (1.f + std::exp(-g))) * u;   // native_gu_rows' SwiGLU expression
+    for (int first = 0; first < nt; first += kTqMaxTokens) {
+        const int count = std::min(kTqMaxTokens, nt - first);
+        const ActSet& s = unpack_all(act + first, n, count);
+        for (int t = 0; t < count; ++t) {
+            gp[t] = gbuf.data() + (size_t) t * nr;
+            up[t] = ubuf.data() + (size_t) t * nr;
         }
+        rows_on(isa, kb, blob, gu_row, n, s.ptr, count, gp, r0, r1);
+        rows_on(isa, kb, blob + up_off, gu_row, n, s.ptr, count, up, r0, r1);
+        for (int t = 0; t < count; ++t)
+            for (int r = r0; r < r1; ++r) {
+                const float g = gp[t][r], u = up[t][r];
+                ff[first + t][r] = (g / (1.f + std::exp(-g))) * u;   // native_gu_rows' SwiGLU expression
+            }
+    }
 }
 
 }  // namespace strata::kernels::cpu
