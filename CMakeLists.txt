@@ -2155,6 +2155,12 @@ if(STRATA_BUILD_TESTS)
     set_tests_properties(native_hadamard_test PROPERTIES TIMEOUT 300)
     # the CPU trellis kernels (tq_cpu.hpp): AVX2 / AVX-512 vs the scalar kernel bit for bit, vs ggml-cpu's vec_dot
     # and to_float, plain and with the Hadamard rotation; `tq_cpu_parity --bench` is the micro-benchmark
+    # Public TQ entries must safely accept merged 9..16-token jobs without expanding ISA scratch.
+    # Uses only Q8_0 ggml traits, so this runs with the default upstream dependency too.
+    add_executable(tq_token_chunks_cpu tests/core/tq_token_chunks_cpu.cpp)
+    target_link_libraries(tq_token_chunks_cpu PRIVATE strata_kernels_cpu)
+    add_test(NAME tq_token_chunks_cpu COMMAND tq_token_chunks_cpu)
+    set_tests_properties(tq_token_chunks_cpu PROPERTIES TIMEOUT 120)
     add_executable(tq_cpu_parity src/kernels/cpu/tq_cpu_parity.cpp)
     target_link_libraries(tq_cpu_parity PRIVATE strata_kernels_cpu)
     add_test(NAME tq_cpu_parity COMMAND tq_cpu_parity)
