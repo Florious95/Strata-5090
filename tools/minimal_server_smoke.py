@@ -42,14 +42,16 @@ def smoke() -> dict:
     summary = result.stdout + result.stderr
     # Windows-only tests skip on POSIX, so unittest ends "OK (skipped=N)", not a bare "OK".
     count = re.search(r"Ran (\d+) tests in [0-9.]+s\s+OK(?: \(skipped=(\d+)\))?\s*$", summary)
-    executed = int(count[1]) - int(count[2] or 0) if count else 0
-    passed = result.returncode == 0 and count is not None and executed >= MIN_TESTS
+    ran = int(count[1]) if count else 0
+    skipped = int(count[2] or 0) if count else 0
+    passed = result.returncode == 0 and count is not None and ran - skipped >= MIN_TESTS
     return {"schema_version": 1, "scope": "source_checkout_fake_engine_runtime_only",
             "platform": platform.platform(), "python": platform.python_version(),
             "requirements_sha256": hashlib.sha256((ROOT / "requirements.txt").read_bytes()).hexdigest(),
             "optional_packages_visible": {name: visible[name] for name in ("rich", "textual")},
             "server_packages_visible": {name: visible[name] for name in ("numpy", "jinja2", "requests")},
-            "test_module": TEST_MODULE, "tests_run": executed if count else None,
+            "test_module": TEST_MODULE, "tests_run": ran if count else None,
+            "tests_skipped": skipped if count else None, "tests_passed": ran - skipped if count else None,
             "duration_s": round(time.monotonic() - started, 2),
             "test_exit_code": result.returncode, "actual_gpu_engine": False,
             "passed": bool(passed), "test_summary": summary[-1000:]}
