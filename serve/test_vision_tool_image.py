@@ -5,6 +5,7 @@ an "[image omitted: why]" note.
 
     python -m serve.test_vision_tool_image
 """
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -39,16 +40,16 @@ class ToolImage(unittest.TestCase):
         vision = ElasticVision(tempfile.mkdtemp())
         svc = self.service(vision)
         messages = tool_turn()
-        svc._note_unreadable_tool_images(messages)
+        svc._note_unreadable_tool_images(messages, {}, None)
         self.assertEqual(vision.starts, 1)
         self.assertEqual(messages[1]["content"][0]["type"], "image")      # kept: it was read
-        svc._note_unreadable_tool_images(messages)                        # the running encoder is used as it is
+        svc._note_unreadable_tool_images(messages, {}, None)              # the running encoder is used as it is
         self.assertEqual(vision.starts, 1)
 
     def test_an_encoder_that_cannot_start_leaves_a_note_not_a_400(self):
         svc = self.service(FailingStart(tempfile.mkdtemp()))
         messages = tool_turn()
-        svc._note_unreadable_tool_images(messages)                        # no exception
+        svc._note_unreadable_tool_images(messages, {}, None)              # no exception
         part = messages[1]["content"][0]
         self.assertEqual(part["type"], "text")
         self.assertIn("[image omitted:", part["text"])
@@ -63,7 +64,9 @@ class ToolImage(unittest.TestCase):
 
     def test_encode_without_a_running_reader_is_a_clear_value_error(self):
         v = Vision.__new__(Vision)
-        v.dir, v.cache, v.proc = Path(tempfile.mkdtemp()), {}, None
+        v.dir, v.proc = Path(tempfile.mkdtemp()), None
+        self.addCleanup(shutil.rmtree, v.dir)
+        v._init_cache()                                                  # production raw-reference cache state
         import threading
         v.lock = threading.Lock()
         with mock.patch.object(Vision, "normalize", return_value=b"png"), self.assertRaises(ValueError) as cm:
