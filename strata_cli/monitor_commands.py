@@ -33,6 +33,19 @@ def add_status(sp: argparse._SubParsersAction) -> None:
     status.add_argument("--quiet", action="store_true", help="suppress human informational output")
 
 
+def running_launch() -> dict | None:
+    """The server a `strata launch` has running (address and its key), when no address was given: so `strata monitor` needs no --url.
+    Nothing is read when a connection, STRATA_URL or STRATA_CONNECTION names the server, and a thin monitor bundle has no launch code."""
+    if os.environ.get("STRATA_URL") or os.environ.get("STRATA_CONNECTION"):
+        return None
+    try:
+        from strata_cli.launch.cmd import launch_info
+        info = launch_info()
+    except Exception:                                    # noqa: BLE001 - no launch code, no profiles: use the default address
+        return None
+    return info if info and info.get("running") and info.get("url") else None
+
+
 def add_monitor(sp: argparse._SubParsersAction) -> None:
     monitor = sp.add_parser("monitor", help="read-only terminal monitor: seven views (Overview ... Logs, Connect), the same as the one strata launch opens")
     _connection(monitor)
@@ -100,6 +113,14 @@ def parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _file_words(exc: BaseException) -> str:
+    try:
+        from strata_control import longpath
+    except ImportError:                                 # the standalone monitor bundle does not carry strata_control
+        return f"local file operation failed ({type(exc).__name__})"
+    return longpath.file_words(exc)
+
+
 def _error(message: str, code: int, machine: bool) -> int:
     if machine:
         print(json.dumps({"schema_version": 1, "ok": False, "error": {"code": code, "message": message}}))
@@ -143,7 +164,7 @@ def _local_command(a: argparse.Namespace, machine: bool) -> int:
     return 0
 
 
-def run(a: argparse.Namespace, *, standalone: bool = False) -> int:
+def run(a: argparse.Namespace) -> int:
     machine = a.output in ("json", "jsonl") or getattr(a, "json", False)
     quiet = bool(getattr(a, "quiet", False) and not machine)
     try:
@@ -171,9 +192,10 @@ def run(a: argparse.Namespace, *, standalone: bool = False) -> int:
             return _error("JSON monitor output requires --once; interactive monitor uses a terminal", 2, machine)
         if a.command == "monitor" and not a.once and not sys.stdout.isatty():
             return _error("interactive monitor needs a terminal; use --once or strata status --json", 2, machine)
-        resolved = connections.resolve(url=a.url, connection=a.connection,
+        found = running_launch() if a.command in ("monitor", "status", "logs") and not (a.url or a.connection) else None
+        resolved = connections.resolve(url=found["url"] if found else a.url, connection=a.connection,
                                        credential_env=a.credential_env, timeout=a.timeout)
-        endpoint = Endpoint(resolved["url"], os.environ.get(resolved["credential_env"]),
+        endpoint = Endpoint(resolved["url"], os.environ.get(resolved["credential_env"]) or (found or {}).get("key"),
                             resolved["timeout_s"], resolved["prefix"])
         if a.command == "logs":
             from strata_cli.logs import run as run_logs
@@ -189,21 +211,22 @@ def run(a: argparse.Namespace, *, standalone: bool = False) -> int:
             if not quiet:
                 print(render_view(snapshot, "overview", width=80, height=24))
             return 0
-        options = dict(interval=a.interval, requests=a.requests, theme=a.theme, color=a.color, glyphs=a.glyphs)
         try:
-            if standalone:
-                # The thin zipapp is read-only: it intentionally excludes launch/config-writing helpers.
-                from strata_cli.monitor import MonitorApp
-                app = MonitorApp(endpoint, None, **options)
-            else:
-                from strata_cli.launch.monitor_ext import LaunchMonitor
-                # Source CLI keeps the seventh Connect view; q only detaches here.
-                app = LaunchMonitor(endpoint, None, info={"url": endpoint.base_url, "urls": [endpoint.base_url],
-                                    "key": endpoint.credential or "", "model": "", "profile": None, "name": None},
-                                    ask_quit=False, **options)
+            from strata_cli.launch.monitor_ext import LaunchMonitor
         except ImportError:
-            return _error("monitor component missing; install the optional terminal UI dependency", 5, machine)
-        app.run()
+            # the portable monitor bundle carries the read-only client only (no launch/Connect view): run the plain Monitor
+            try:
+                from strata_cli.monitor import MonitorApp
+            except ImportError:
+                return _error("monitor component missing; install the optional terminal UI dependency", 5, machine)
+            MonitorApp(endpoint, None, interval=a.interval, requests=a.requests,
+                       theme=a.theme, color=a.color, glyphs=a.glyphs).run()
+            return 0
+        # the one monitor, with the same seven views as the one `strata launch` opens (Connect is key 7 and works against this --url
+        # server); q just detaches here: nothing was started by this command, so there is nothing to stop
+        LaunchMonitor(endpoint, None, info={"url": endpoint.base_url, "urls": [endpoint.base_url], "key": endpoint.credential or "", "model": "",
+                                            "profile": None, "name": None}, ask_quit=False, interval=a.interval, requests=a.requests,
+                      theme=a.theme, color=a.color, glyphs=a.glyphs).run()
         return 0
     except ClientError as e:
         return _error(str(e), e.exit_code, machine)
@@ -214,12 +237,12 @@ def run(a: argparse.Namespace, *, standalone: bool = False) -> int:
     except BrokenPipeError:
         return 0
     except OSError as e:
-        return _error(f"local file operation failed ({type(e).__name__})", 6, machine)
+        return _error(_file_words(e), 6, machine)
     except KeyboardInterrupt:
         if a.command == "logs" and a.follow:
             return 0
         return _error("interrupted; operation completion may be unknown", 130, machine)
 
 
-def main(argv: list[str] | None = None, *, standalone: bool = False) -> int:
-    return run(parser().parse_args(argv), standalone=standalone)
+def main(argv: list[str] | None = None) -> int:
+    return run(parser().parse_args(argv))

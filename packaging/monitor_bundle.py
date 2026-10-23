@@ -31,16 +31,18 @@ SOURCES_V2 = (
 )
 SOURCES_V3 = (*SOURCES_V2, "strata_cli/dashboard.py")
 SOURCES_V4 = (*SOURCES_V3, "strata_cli/detail_dashboard.py")
-SOURCES_V5 = (*SOURCES_V4, "strata_cli/nav.py")
-SOURCES = (*SOURCES_V5, "strata_cli/consoleinfo.py")   # schema 6: nav/render's stdlib console dependency
-BOOTSTRAP = b"from strata_cli.monitor_commands import main\nraise SystemExit(main(standalone=True))\n"
+SOURCES_V5 = (*SOURCES_V4, "strata_cli/nav.py")      # schema 5: the view tabs every screen shares (strata_cli/nav.py)
+# schema 6: the two modules the interactive Monitor imports at run time (strata_cli/monitor.py, render.py) that earlier lists missed.
+# tests/terminal/test_monitor_bundle.py derives the import closure of the bundle's entry point and fails if this list falls behind.
+SOURCES = (*SOURCES_V5, "strata_cli/consoleinfo.py", "strata_cli/overview.py")
+BOOTSTRAP = b"from strata_cli.monitor_commands import main\nraise SystemExit(main())\n"
 MEMBERS_V1 = ("__main__.py", *SOURCES_V2)
 LICENSE_NOTICE = "LICENSE"
 MEMBERS_V2 = (*MEMBERS_V1, LICENSE_NOTICE)
 MEMBERS_V3 = (*MEMBERS_V2, "strata_cli/dashboard.py")
 MEMBERS_V4 = (*MEMBERS_V3, "strata_cli/detail_dashboard.py")
 MEMBERS_V5 = (*MEMBERS_V4, "strata_cli/nav.py")
-MEMBERS = (*MEMBERS_V5, "strata_cli/consoleinfo.py")
+MEMBERS = (*MEMBERS_V5, "strata_cli/consoleinfo.py", "strata_cli/overview.py")
 COMPATIBILITY = {"python_min": "3.10", "telemetry_schema": [1]}
 MAX_BUNDLE_BYTES = 1024 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024

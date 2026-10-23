@@ -40,6 +40,7 @@ def smoke() -> dict:
     result = subprocess.run([sys.executable, "-m", "unittest", TEST_MODULE], cwd=ROOT,
                             capture_output=True, text=True, timeout=240, check=False)
     summary = result.stdout + result.stderr
+    # Windows-only tests skip on POSIX, so unittest ends "OK (skipped=N)", not a bare "OK".
     count = re.search(r"Ran (\d+) tests in [0-9.]+s\s+OK(?: \(skipped=(\d+)\))?\s*$", summary)
     ran = int(count[1]) if count else 0
     skipped = int(count[2] or 0) if count else 0
