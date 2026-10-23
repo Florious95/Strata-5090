@@ -82,6 +82,13 @@ inline uint64_t kv_stream_map_bytes(int64_t n_slots) { return (uint64_t) n_slots
 /// Every block evicted: page table all -1, slots free, counters zero.
 void kv_stream_reset(const KvStreamMap& m, void* stream);
 
+/// Capacity for the sorted block-selector contract (whole selected indexer
+/// blocks plus the causal tail), not arbitrary unrelated token IDs.
+inline bool kv_stream_union_fits(int64_t n_slots, int64_t n_q, int64_t cap, int64_t page_size) {
+    return n_slots >= 2 && n_q > 0 && cap > 0 && page_size > 0 &&
+           cap / page_size <= n_slots - 2 && n_q <= n_slots / (cap / page_size + 2);
+}
+
 /// Make every block named by the selections of `n_q` queries resident (ids [n_q][cap], width from
 /// steps[q * kStepCount + kStepWidth]). Capturable. `n_slots` must hold the distinct blocks of one call
 /// (n_q x (cap / page_size + 2)); a call that cannot sets ctl[3] (see `kv_stream_counters`).

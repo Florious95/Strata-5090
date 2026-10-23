@@ -1,5 +1,6 @@
 // src/kernels/cuda/kv_stream.cu - see include/strata/kernels/kv_stream.hpp.
 #include "strata/kernels/kv_stream.hpp"
+#include "strata/kernels/batch_device_ops.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 
@@ -86,7 +87,7 @@ __device__ int block_scan(int v, int* warp_sums, int& total) {
     return excl;
 }
 
-__global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_t* __restrict__ ids,
+__device__ __forceinline__ void resolve_body(KvStreamMap m, const int32_t* __restrict__ ids,
                                                      const int32_t* __restrict__ steps, int n_q, int cap, int page_size) {
     __shared__ int s_nmiss, s_lookups, s_cut;
     __shared__ int warp_sums[32];
@@ -97,22 +98,40 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
     int lookups = 0;
     for (int q = 0; q < n_q; ++q) {
         const int width = steps[q * kStepCount + kStepWidth];
+        if (width < 0 || width > cap) { atomicExch(m.ctl + 3, 1); continue; }
         const int32_t* qi = ids + (long long) q * cap;
         for (int i = threadIdx.x; i < width; i += RT) {
+            if (qi[i] < 0 || qi[i] / page_size >= m.n_blocks) { atomicExch(m.ctl + 3, 1); continue; }
             const int b = qi[i] / page_size;
             if (i > 0 && qi[i - 1] / page_size == b) continue;   // ids are ascending: one lookup per block
             ++lookups;
             const int sl = m.page_table[b];
             if (sl >= 0) {
+                if (sl >= m.n_slots) { atomicExch(m.ctl + 3, 1); continue; }
                 m.slot_stamp[sl] = epoch;
                 m.slot_ref[sl] = 1;
             } else if (sl == -1 && atomicCAS(&m.page_table[b], -1, -2) == -1) {
-                m.miss_block[atomicAdd(&s_nmiss, 1)] = b;
+                const int miss = atomicAdd(&s_nmiss, 1);
+                if (miss < m.n_slots) m.miss_block[miss] = b;
+                else { m.page_table[b] = -1; atomicExch(m.ctl + 3, 1); }
             }
         }
     }
     if (lookups > 0) atomicAdd(&s_lookups, lookups);   // (#783, stuchapin909) most threads see none: skip the shared atomic
     __syncthreads();
+    // Overflow must stop before either miss array is indexed again, and before
+    // attention could read an unresolved page. A later status flag alone is not
+    // a memory-safety guard. Unlike assert, this remains enabled in Release.
+    if (m.ctl[3]) {
+        if (threadIdx.x == 0) {
+#if defined(__HIPCC__)
+            __builtin_trap();
+#else
+            asm volatile("trap;");
+#endif
+        }
+        return;
+    }
     // 2. one victim per miss: a clock sweep from the hand. A slot this call uses (stamp == epoch) is never taken;
     //    a referenced one loses its bit as the hand passes it and is taken on the next pass.
     const int need = s_nmiss, n = (int) m.n_slots;
@@ -139,8 +158,21 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
         hand = (int) (((long long) hand + cut) % n);
         __syncthreads();
     }
+    // A legal union fits without evicting a page this call uses. Fail before
+    // publishing a partial mapping if no such victim set exists.
+    if (got < need) {
+        if (threadIdx.x == 0) {
+            m.ctl[3] = 1;
+#if defined(__HIPCC__)
+            __builtin_trap();
+#else
+            asm volatile("trap;");
+#endif
+        }
+        return;
+    }
     // 3. re-point the table; the copy kernel fills the slots
-    const int placed = got < need ? got : need;
+    const int placed = need;
     for (int k = threadIdx.x; k < need; k += RT) {
         const int b = m.miss_block[k];
         if (k >= placed) { m.page_table[b] = -1; continue; }   // overflow: never happens with a legal n_slots
@@ -164,8 +196,22 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
     }
 }
 
+__global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_t* ids,
+    const int32_t* steps, int n_q, int cap, int page) {
+    resolve_body(m, ids, steps, n_q, cap, page);
+}
+__global__ void __launch_bounds__(RT) batch_resolve_kernel(DeviceBatchView view, int qi, int begin, int end,
+    const int32_t* ids, const int32_t* steps, int cap, int page) {
+    const auto* seg = batch_device_segment(view, blockIdx.x, begin, end);
+    if (!seg) return;
+    const auto* q = batch_device_qsa(view, *seg, qi);
+    if (!q) return;
+    resolve_body(q->map, ids + (size_t)seg->first * cap,
+                 steps + (size_t)seg->first * kStepCount, seg->length, cap, page);
+}
+
 // One block per missed block (grid-stride): copy its runs from the host copy into its slot, 16 B per thread.
-__global__ void copy_kernel(KvStreamMap m, Runs r) {
+__device__ __forceinline__ void copy_body(KvStreamMap m, Runs r) {
     const int need = m.ctl[2];
     for (int k = blockIdx.x; k < need; k += gridDim.x) {
         const long long b = m.miss_block[k], sl = m.miss_slot[k];
@@ -175,6 +221,20 @@ __global__ void copy_kernel(KvStreamMap m, Runs r) {
             for (int i = threadIdx.x; i < r.len[a] / 16; i += blockDim.x) dst[i] = src[i];
         }
     }
+}
+
+__global__ void copy_kernel(KvStreamMap m, Runs r) { copy_body(m, r); }
+__global__ void batch_copy_kernel(DeviceBatchView view, int qi, int begin, int end, int bytes) {
+    const auto* seg = batch_device_segment(view, blockIdx.y, begin, end);
+    if (!seg) return;
+    const auto* q = batch_device_qsa(view, *seg, qi);
+    if (!q) return;
+    Runs r{};
+    r.n = 2;
+    r.src[0] = q->host.k_q4; r.src[1] = q->host.v_q4;
+    r.dst[0] = q->pools.k_q4; r.dst[1] = q->pools.v_q4;
+    r.len[0] = bytes; r.len[1] = bytes;
+    copy_body(q->map, r);
 }
 
 __global__ void reset_kernel(KvStreamMap m) {
@@ -204,6 +264,16 @@ uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
     if (fmt == kKvQ4) return rows * kv_q4_bytes_per_head((int) s.head_dim) * 2;
     return fmt == kKvInt8 ? rows * (uint64_t) s.head_dim * 2 + rows * (uint64_t) (s.head_dim / KV_Q8_GROUP) * 2 * 2
                 : rows * (uint64_t) s.head_dim * 2 * 2;
+}
+
+void batch_device_kv_resolve(DeviceBatchView v, int qi, int begin, int end,
+    const int32_t* ids, const int32_t* steps, int64_t cap, const QsaShapes& s, void* stream) {
+    const auto st = (cudaStream_t)stream;
+    batch_resolve_kernel<<<kDeviceBatchSlots, RT, 0, st>>>(v, qi, begin, end, ids, steps, cap, s.page_size);
+    check("batch union resolve");
+    const int bytes = s.n_head_kv * s.page_size * kv_q4_bytes_per_head(s.head_dim);
+    batch_copy_kernel<<<dim3(96, kDeviceBatchSlots), 128, 0, st>>>(v, qi, begin, end, bytes);
+    check("batch union copy");
 }
 
 void kv_stream_reset(const KvStreamMap& m, void* stream) {

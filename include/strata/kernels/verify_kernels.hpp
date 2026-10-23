@@ -180,6 +180,16 @@ void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int3
 /// else 0, for n_rows rows.  Every word is written on every launch (nothing to clear between windows), so `flags` can
 /// be mapped host memory read after the window's own sync.  Graph-capturable; CUDA and HIP.
 inline constexpr int kNonfiniteBlocks = 16;
+// Read only the active rows within the mapped allocation. Invalid dimensions
+// poison the window rather than reading past the buffer or silently ignoring rows.
+inline uint32_t nonfinite_row_mask(const volatile uint32_t* flags, int rows, int capacity) {
+    if (!flags || rows < 1 || rows > capacity || capacity > 32) return UINT32_MAX;
+    uint32_t mask = 0;
+    for (int t = 0; t < rows; ++t)
+        for (int b = 0; b < kNonfiniteBlocks; ++b)
+            if (flags[t * kNonfiniteBlocks + b] != 0) { mask |= 1u << t; break; }
+    return mask;
+}
 void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* flags, void* stream);
 /// True where row_top_prob_split runs as its own kernel (CUDA; AMD keeps the one-block row_top_prob, so it calls
 /// that).  STRATA_MULTI_BLOCK_ARGMAX=0: off.

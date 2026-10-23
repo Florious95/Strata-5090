@@ -25,6 +25,7 @@ struct ConversationCheckpoint {
     std::vector<ConversationImageKey> imgs;
     std::vector<uint8_t> gdn, ple, tails, dead, block_pos;
     uint64_t used = 0; // upstream root-pinned/LRU checkpoint retention
+    int32_t rope_delta = 0; // RAM snapshot's next text position minus its KV cell
     // A shared-prefix pin (the request key pin=N): this checkpoint is the read-only prefix many suffix queries branch
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
@@ -110,6 +111,7 @@ inline ConversationCheckpointSplit conversation_checkpoints_split(std::vector<Co
         for (size_t k = 0; k < stages; ++k) {
             ConversationCheckpoint part;
             part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned;
+            part.rope_delta = c.rope_delta;
             out.parts[k].push_back(std::move(part));
         }
     }
@@ -210,6 +212,11 @@ public:
     ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0)
         : budget_(budget), slots_(slots), min_tokens_(min_tokens) {}
     bool enabled() const { return budget_ != 0 && slots_ != 0; }
+    // Explicitly disabled RAM history is a legal no-op before overwriting an
+    // idle hot slot. Its IDs/checkpoints still belong to the admission donor.
+    bool slot_park_required(bool cached, bool tainted, bool has_tokens) const {
+        return enabled() && cached && !tainted && has_tokens;
+    }
     /// `--conversation-cache-min-tokens`: whether a conversation of this length is worth one of `slots`.  Every
     /// parked conversation costs a whole slot whatever its length, so a client that interleaves short side requests
     /// with one long conversation spends the cache on the side requests and evicts the long one (oldest first) -

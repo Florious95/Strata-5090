@@ -52,8 +52,9 @@ const char* tq_isa_name(TqIsa isa);
 /// The 32768 x 4 int16 state table (filled on first use; thread-safe).
 const int16_t* tq_state_table();
 
-/// Rows [r0, r1) of a trellis matrix (`row_bytes` per row, `n` weights per row) against `nt` (<= 8) Q8_0
-/// activations of n values: out[t][r] = w_r . a[t].
+/// Rows [r0, r1) of a trellis matrix (`row_bytes` per row, `n` weights per row) against `nt` Q8_0
+/// activations of n values: out[t][r] = w_r . a[t]. Public entries slice the token axis into <=8-token
+/// chunks before unpacking or calling an ISA kernel; merged windows may pass up to the pool's MAXT.
 void tq_rows(TqIsa isa, int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
              float* const* out, int r0, int r1);
 /// Gate and up rows [r0, r1) (gate at blob, up at blob + up_off): ff[t][r] = silu(g) * u, the SwiGLU expression
@@ -61,7 +62,7 @@ void tq_rows(TqIsa isa, int ggml_type, const uint8_t* w, size_t row_bytes, int n
 void tq_gu_rows(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
                 const void* const* act, int nt, float* const* ff, int r0, int r1);
 
-/// Largest token group per call and widest row the kernels take.
+/// Largest internal ISA token chunk (not the public entry's window limit), and widest supported row.
 inline constexpr int kTqMaxTokens = 8;
 inline constexpr int kTqMaxN = 4096;
 

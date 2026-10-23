@@ -997,6 +997,34 @@ struct Q6KTraits {
         return q6_q8_dot_impl(r.vl, r.vh, u, r.scales, r.d, d8);
     }
 };
+// The 9..12-column head keeps Q6KTraits' four-warp arithmetic, but snapshots every
+// weight field (including the signed scales) before the column loop. No device
+// weight pointer survives in W, so applying another column cannot reload it.
+struct Q6KWideTraits : Q6KTraits {
+    struct W { int vl, vh, sc0, sc1; float d; };
+    __device__ __forceinline__ static W load(const Block* w, int iqs) {
+        const auto r = Q6KTraits::load(w, iqs);
+        return {r.vl, r.vh, r.scales[0], r.scales[4], r.d};
+    }
+    __device__ __forceinline__ static float apply(const W& r, const Q81Block* x, int iqs) {
+        const int bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
+        float sumf = 0.0f;
+        // Same signed-byte subtraction, DP4A order and float expression as
+        // q6_q8_dot_impl. Only the weight loads moved outside the column loop.
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int sc = i == 0 ? r.sc0 : r.sc1;
+            const int vil = (r.vl >> (4 * i)) & 0x0f0f0f0f;
+            const int vih = ((r.vh >> (4 * i)) << 4) & 0x30303030;
+            const int vi = __vsubss4(vil | vih, 0x20202020);
+            const int u = reinterpret_cast<const int*>(x[bq8_offset + 2 * i].qs)[iqs % 8];
+            const float d8 = __low2float(x[bq8_offset + 2 * i].ds);
+            sumf += d8 * (STRATA_DP4A(vi, u, 0) * sc);
+        }
+        return r.d * sumf;
+    }
+};
+
 struct IQ4XSTraits {
     using Block = IQ4XSBlock;
     static constexpr int DIV = 256, T = 8, KBY = 8, BPI = 4 * WARPS * WARP / 32;
@@ -1502,6 +1530,23 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
     const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);
     if (s26_tsum_on()) launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, true, false>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
     else launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, false, false>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
+}
+
+template<typename F, int NCOLS>
+void launch_k_wide_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
+    const dim3 block(WARP, WARPS, 1);
+    native_mmvq_multi_kernel<F, NCOLS, WARPS, 2><<<unsigned((n_out + 1) / 2), block, 0, s>>>(
+        static_cast<const typename F::Block*>(weights), static_cast<const Q81Block*>(x_q8_1), y, n_in, n_out);
+}
+
+template<typename F>
+void launch_k_wide(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
+    switch (ncols) {
+        case 9: launch_k_wide_n<F, 9>(weights, x_q8_1, y, n_in, n_out, s); break;
+        case 10: launch_k_wide_n<F, 10>(weights, x_q8_1, y, n_in, n_out, s); break;
+        case 11: launch_k_wide_n<F, 11>(weights, x_q8_1, y, n_in, n_out, s); break;
+        case 12: launch_k_wide_n<F, 12>(weights, x_q8_1, y, n_in, n_out, s); break;
+    }
 }
 
 template<typename F>
@@ -2791,6 +2836,41 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         native_q6_k_mmvq_kernel<false><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
     }
     launch_check();
+}
+
+bool native_head_f32_wide(int ggml_type, const void* weights, const float* x, void* scratch_q8_1,
+                          float* y, int n_in, int n_out, int ncols, void* stream) {
+#if defined(__HIPCC__)
+    return false;
+#else
+    if ((ggml_type != 13 && ggml_type != 14) || ncols < 9 || ncols > kNativeHeadWideMaxCols || !g_multi_exact)
+        return false;
+    validate_shape(n_in, 1, 256);
+    validate_pointer(weights); validate_pointer(x); validate_pointer(scratch_q8_1); validate_pointer(y);
+    validate_stream(stream);
+    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+    const auto s = static_cast<cudaStream_t>(stream);
+    const auto qcol = native_q8_1_bytes(n_in, 1);
+    // The small quantizer stays <=8 columns; its outputs occupy distinct columns
+    // of the already allocated wide verifier scratch. No extra workspace.
+    for (int first = 0; first < ncols; first += MAX_NCOLS)
+        native_quantize_q8_1(x + std::size_t(first) * n_in,
+                            static_cast<uint8_t*>(scratch_q8_1) + std::size_t(first) * qcol,
+                            n_in, std::min(MAX_NCOLS, ncols - first), stream);
+    // Canonical GGUF weights remain valid even when a packed copy is registered.
+    // Force the exact layout: four warps, two rows, the original reduction order.
+    // Q5KTraits already snapshots ql/qh, unpacked scales/mins and dm by value.
+    // Q6KWideTraits snapshots its signed scales too; neither W retains weights.
+    if (ggml_type == 13) launch_k_wide<Q5KTraits>(weights, scratch_q8_1, y, n_in, n_out, ncols, s);
+    else launch_k_wide<Q6KWideTraits>(weights, scratch_q8_1, y, n_in, n_out, ncols, s);
+    launch_check();
+    return true;
+#endif
+}
+
+bool native_q6_k_f32_wide(const void* weights, const float* x, void* scratch_q8_1,
+                          float* y, int n_in, int n_out, int ncols, void* stream) {
+    return native_head_f32_wide(14, weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
 void native_q6_k_f32(const void* weights, const float* x, void* scratch_q8_1,

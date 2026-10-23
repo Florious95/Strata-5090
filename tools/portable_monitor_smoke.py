@@ -146,8 +146,12 @@ def _malformed_response(bundle: Path, url: str) -> None:
         response = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError("malformed telemetry did not return one JSON error") from exc
+    # CPython versions have different JSON nesting limits: either decoding
+    # refuses this array or the client rejects its non-object top level. Both
+    # must remain a typed exit3 boundary, never a traceback or accepted snapshot.
     if (response.get("ok") is not False or
-            (response.get("error") or {}).get("message") != "server returned malformed JSON telemetry"):
+            (response.get("error") or {}).get("message") not in (
+                "server returned malformed JSON telemetry", "server returned a non-object telemetry response")):
         raise RuntimeError("deeply nested telemetry returned an unexpected error")
 
 

@@ -4,9 +4,13 @@
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import check_isa_guard as G  # noqa: E402
@@ -43,6 +47,48 @@ class Policy(unittest.TestCase):
     def test_listed_public_entry_point_is_fine(self):
         self.assertIsNone(G.judge("?act_quant_q8_1@cpu@kernels@strata@@YAXPEBMHAEAUActQ@123@@Z",
                                   "strata_kernels_cpu:expert.cpp.obj", "", False, False, False))
+
+    def test_tq_avx512_entry_is_allowed_in_its_wide_object(self):
+        self.assertIsNone(G.judge("strata::kernels::cpu::tq_detail::tq_rows_avx512(int)",
+                                  "tq_avx512.cpp.o", "", False, False, True))
+        self.assertIsNone(G.judge("?tq_rows_avx512@tq_detail@cpu@kernels@strata@@YAXXZ",
+                                  "strata_kernels_cpu:tq_avx512.cpp.obj", "", False, False, False))
+
+    def test_tq_archive_disassembly_is_accepted(self):
+        dis = ("tq_avx512.cpp.o: file format elf64-x86-64\n"
+               "<strata::kernels::cpu::tq_detail::tq_rows_avx512(int)>:\n"
+               "\t62 f1 7c 48 10 00\tvmovups (%rax),%zmm0\n")
+        with mock.patch.object(G.shutil, "which", return_value="/mock/tool"), \
+                mock.patch.object(G.subprocess, "run", side_effect=[SimpleNamespace(stdout=""),
+                                                                    SimpleNamespace(stdout=dis)]), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(G.run_elf("mock.a"), 0)
+            self.assertIn("1 functions", output.getvalue())
+            self.assertIn("0 not allowed", output.getvalue())
+
+    def test_tq_entry_does_not_allow_wide_code_in_baseline_or_avx2_objects(self):
+        for obj in ("tq_cpu.cpp.o", "tq_avx2.cpp.o", "pool.cpp.o"):
+            with self.subTest(obj=obj):
+                self.assertIsNotNone(G.judge("strata::kernels::cpu::tq_detail::tq_rows_avx512(int)",
+                                             obj, "", False, False, True))
+
+    def test_tq_wide_object_does_not_allow_probes_or_weak_entries(self):
+        self.assertIsNotNone(G.judge("strata::kernels::cpu::cpu_avx512_ok()",
+                                     "tq_avx512.cpp.o", "", False, False, True))
+        self.assertIn("weak", G.judge("strata::kernels::cpu::tq_detail::tq_rows_avx512(int)",
+                                      "tq_avx512.cpp.o", "", False, True, True))
+
+    def test_tq_objects_must_not_have_avx_static_initializers(self):
+        # VEX-only vmovups is not a wide instruction, but is still forbidden before main.
+        for obj in ("tq_avx2.cpp.o", "tq_avx512.cpp.o"):
+            dis = (f"{obj}: file format elf64-x86-64\n"
+                   "<_GLOBAL__sub_I_tq_rows>:\n\tc5 f8 10 00\tvmovups (%rax),%xmm0\n")
+            with self.subTest(obj=obj), mock.patch.object(G.shutil, "which", return_value="/mock/tool"), \
+                    mock.patch.object(G.subprocess, "run", side_effect=[SimpleNamespace(stdout=""),
+                                                                        SimpleNamespace(stdout=dis)]), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(G.run_elf("mock.a"), 1)
+                self.assertIn("static initialiser", output.getvalue())
 
     def test_the_probe_must_not_be_wide(self):
         self.assertIsNotNone(G.judge("?cpu_features@cpu@kernels@strata@@YA?AUCpuFeatures@123@XZ",

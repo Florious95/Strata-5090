@@ -103,7 +103,8 @@ def start_of(p):
         out = subprocess.run(["ps", "-o", "lstart=,stat=", "-p", str(p)], capture_output=True, text=True, timeout=5).stdout.strip()
     except Exception:
         return None
-    return None if not out or out.endswith("Z") else "s:" + out
+    parts = out.rsplit(None, 1)
+    return None if len(parts) != 2 or parts[1].startswith("Z") else "s:" + parts[0]
 os.set_blocking(0, True)
 data = b""
 while True:
@@ -139,7 +140,10 @@ def _start_token(pid: int) -> str:
                              timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return ""
-    return "" if not out or out.endswith("Z") else "s:" + out
+    # R/S and macOS status flags change during a process's lifetime. They are
+    # liveness, not identity; including them can make the watcher spare an orphan.
+    parts = out.rsplit(None, 1)
+    return "" if len(parts) != 2 or parts[1].startswith("Z") else "s:" + parts[0]
 
 
 def _watch(child: subprocess.Popen) -> None:
@@ -279,7 +283,8 @@ def install_stop_handlers(request_stop, finished: threading.Event | None = None)
 
     * POSIX: SIGTERM (docker stop, systemd, `kill`), SIGHUP (the terminal closed, the ssh connection dropped; not when it
       was ignored at start, which is what `nohup` does on purpose).
-      SIGINT keeps Python's own handler (Ctrl+C, and a second Ctrl+C to stop waiting).
+      SIGINT uses Python's own handler (Ctrl+C, and a second Ctrl+C to stop waiting); an ignored disposition inherited
+      from an asynchronous shell job is restored to that handler.
     * Windows: SIGBREAK, and the console's close, logoff and shutdown events. Those arrive on a thread of their own and
       the system ends the process a few seconds after the handler returns, so the handler waits for `finished` (up to
       4.5 s) and then returns; whatever is still running is ended by the job object.
@@ -288,6 +293,13 @@ def install_stop_handlers(request_stop, finished: threading.Event | None = None)
         def handler(signum, frame):
             request_stop(reason)
         return handler
+    try:
+        # Non-interactive shells pass SIGINT=SIG_IGN to background jobs. Python
+        # preserves it, so a foreground CLI child otherwise silently ignores -2.
+        if signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+    except (ValueError, OSError):
+        pass
     for name, reason in (("SIGTERM", "sigterm"), ("SIGHUP", "sighup"), ("SIGBREAK", "sigbreak")):
         sig = getattr(signal, name, None)
         if sig is None:

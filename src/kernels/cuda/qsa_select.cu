@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "strata/kernels/qsa_select.hpp"
+#include "strata/kernels/batch_device_ops.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 
 #include <cuda_runtime.h>
@@ -1038,6 +1039,19 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(co
     block_scores_multi_body(pooled, dead, q_idx, steps, nq, max_blocks, out, early_exit, srow);
 }
 
+__global__ void __launch_bounds__(SCORE_WARPS * 32) batch_scores_kernel(
+    DeviceBatchView v, int qi, int begin, int end, const float* queries,
+    const int32_t* steps, int64_t max_blocks, float* scores, bool early_exit) {
+    const auto* seg = batch_device_segment(v, blockIdx.y, begin, end);
+    if (!seg) return;
+    const auto* q = batch_device_qsa(v, *seg, qi);
+    if (!q) return;
+    block_scores_multi_body(q->idx_pooled, q->idx_dead,
+        queries + (size_t)seg->first * IDX_HEADS * IDX_DIM,
+        steps + (size_t)seg->first * kStepCount, seg->length, max_blocks,
+        scores + (size_t)seg->first * max_blocks, early_exit, QsaScoreRows{});
+}
+
 // Queries of different slots, each with its own indexer keys: blockIdx.y is the query, and its CTAs run exactly the
 // single-query call of block_scores_multi_kernel (qsa_block_scores_slots).
 struct ScoreSlotKeys {
@@ -1704,6 +1718,20 @@ bool scores_halve_on() {
         ok[dev] = strata::sm75_default(major, minor) ? 1 : 2;   // Turing, STRATA_SM75_PERF=1
     }
     return ok[dev] == 1;
+}
+
+bool batch_device_scores_supported() {
+    const char* rows = std::getenv("STRATA_QSA_ROWS");
+    return scores_multi_on() && !scores_halve_on() && !(rows && rows[0] == '1');
+}
+void batch_device_scores(DeviceBatchView v, int qi, int begin, int end, const float* queries,
+    const int32_t* steps, int64_t max_blocks, float* scores, const QsaShapes&, void* stream) {
+    batch_scores_kernel<<<dim3(256, kDeviceBatchSlots), SCORE_WARPS * 32, 0, (cudaStream_t)stream>>>(
+        v, qi, begin, end, queries, steps, max_blocks, scores, scores_early_exit());
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        std::fprintf(stderr, "batch device scores: %s\n", cudaGetErrorString(error)); std::exit(1);
+    }
 }
 
 void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
