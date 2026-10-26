@@ -1268,7 +1268,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int64_t nQall = g.n_qsa_layers();
     // Merged rows are generated text, each with its slot's explicit rotary position.
     // Never let a previously admitted image's global table reinterpret another slot.
-    const MropeTableScope batch_rope(nullptr, batch_rec_ && ss.mrope_device != nullptr);
+    const MropeTableScope batch_rope(nullptr, batch_rec_);
     // a batch window: row t is slot t, whose state lives in its own session
     auto slot_ss = [&](int t) -> SessionState& { return batch_rec_ ? *slots_[(size_t) brow_[t]] : ss; };
     const int hrow0 = batch_rec_ ? row_base_ : 0;   // a slot group's own hand-off rows
@@ -3787,7 +3787,8 @@ bool Verifier::init_device_table(std::string& err) {
     }
     for (int b = 0; b < 4; ++b) {
         const auto& sx = *slots_[b];
-        if (sx.max_cells != 262144 || sx.mrope_device || sx.gdn_ord0 || sx.qsa_ord0 ||
+        // Banks are not table inputs: stage_batch admits only text-only owners.
+        if (sx.max_cells != 262144 || sx.gdn_ord0 || sx.qsa_ord0 ||
             sx.qsa_alloc != 12 || sx.gdn_alloc != 36 || !sx.ple.ready() || !ple_stage()) {
             err = "row table: requires full text 256K canonical owners and PLE"; return false;
         }
@@ -3843,7 +3844,7 @@ bool Verifier::stage_device_window(const int* rows, int S, int hbase, const int6
     if (!device_table_arena_ || hbase || !batch_generalized_ || !batch_expert_merged_ || row_table_sequence_ == UINT64_MAX) {
         err = "row table: noncanonical profile or sequence overflow"; return false;
     }
-    for (int b = 0; b < 4; ++b) if (slots_[b]->mrope_device || table_owner_profile_[b] != solo_profile(b)) {
+    for (int b = 0; b < 4; ++b) if (table_owner_profile_[b] != solo_profile(b)) {
         // No graph may survive a static-address change. Restart is intentionally
         // required; do not try to rescue a window by replaying a stale family.
         err = "row table: frozen owner address/profile changed; restart required"; return false;
@@ -3891,6 +3892,7 @@ void Verifier::current_table_qsa_counts(const int* rows, int S) {
 bool Verifier::capture_device_commit(cudaGraphExec_t& ex, const std::vector<int>& key, std::string& err) {
     using namespace strata::kernels;
     if (ex) return true;
+    const MropeTableScope commit_rope(nullptr, true);   // batch_device_indexer: cell positions only
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "row table: commit capture could not begin"; return false;
     }
@@ -4210,7 +4212,11 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
             err = "verify: slot " + std::to_string(rows[t]) + " runs past its context";
             return false;
         }
-    batch_table_active_ = row_table_ && segmented;
+    // Table windows rotate with cell positions under a null table. A row whose
+    // bank is not the identity keeps the legacy owner-keyed graphs and its bank.
+    bool text_rows = true;
+    for (int t = 0; t < S; ++t) text_rows = text_rows && slots_[(size_t) rows[t]]->rope_text_only();
+    batch_table_active_ = row_table_ && segmented && text_rows;
     bool mergeable = segmented && batch_expert_merge_ &&
         strata::kernels::cpu::expert_layout().native && !device_plan_ && !all_resident_ && !remote_opt_;
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
@@ -4406,11 +4412,12 @@ void Verifier::reserve_solo_graph(int T) {
     }
 }
 
-Verifier::ScopedSoloBinding::ScopedSoloBinding(Verifier& v, int owner, std::string& err) {
+Verifier::ScopedSoloBinding::ScopedSoloBinding(Verifier& v, int owner, std::string& err)
+    : rope_(nullptr, owner >= 0) {   // Solo graphs use cell positions: text-only owners only
     if (owner < 0) return; // disabled/legacy: no synchronization or graph work
     if (owner >= 4 || v.slots_.size() != 4 || v.max_t_ != 12 || v.solo_slot_ >= 0 ||
         v.batch_rec_ || v.admission_sampling_ || v.b_running_.load() || v.staged_ || v.prelaunched_ || v.next_ ||
-        v.lb_ != 0 || v.le_ != v.g_->n_layers || v.slots_[owner]->mrope_device) {
+        v.lb_ != 0 || v.le_ != v.g_->n_layers || !v.slots_[owner]->rope_text_only()) {
         err = "slot solo: unsupported or busy verifier binding"; return;
     }
     const OnDevice on(v.device_);

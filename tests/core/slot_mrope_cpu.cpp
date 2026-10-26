@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 
 namespace k = strata::kernels;
 namespace { const int32_t* current = nullptr; int checks = 0; }
@@ -50,5 +51,33 @@ int main() {
     check(current == banks[0].data());
     for (int64_t c : {int64_t(262143), int64_t(262207)})
         check(k::mrope_text_position(c, 20, -8, nullptr) == c - 8);
-    std::printf("slot_mrope_cpu: %d checks PASS; layouts=1,7,8,9,10,11,12\n",checks);
+    // C4 Row Table/Solo routing: a null table with cell positions equals a bank only when every
+    // cell of it is (c, c, c). Slots 0/1 hold the images above, 2/3 text, 4 a 1x6 strip (delta 0).
+    std::array<std::array<int32_t, 128 * 3>, 5> c4{};
+    c4[0] = banks[0]; c4[1] = banks[1];
+    for (int b = 2; b < 5; ++b) for (int c = 0; c < 128; ++c) for (int s = 0; s < 3; ++s) c4[b][c * 3 + s] = c;
+    for (int c = 4; c < 10; ++c) { c4[4][c * 3] = c4[4][c * 3 + 1] = 4; c4[4][c * 3 + 2] = c; }
+    const bool identity[5] = {false, false, true, true, false};   // generate.cpp: no picture in the prompt
+    const int32_t c4_delta[5] = {delta[0], delta[1], 0, 0, 0}, c4_end[5] = {10, 16, 20, 20, 10};
+    bool text_only[5];
+    for (int b = 0; b < 5; ++b) {
+        bool exact = true;
+        for (int c = 0; c < 128; ++c) {
+            for (int s = 0; s < 3; ++s) exact = exact && c4[b][c * 3 + s] == c;
+            exact = exact && k::mrope_text_position(c, c4_end[b], c4_delta[b], c4[b].data()) == c;
+        }
+        text_only[b] = k::mrope_text_only(c4[b].data(), identity[b], c4_delta[b]);
+        check(text_only[b] == exact);
+        check(text_only[b] == (b == 2 || b == 3));
+        check(!k::mrope_text_only(c4[b].data(), identity[b], -3)); // a restored nonzero delta never qualifies
+    }
+    check(k::mrope_text_only(nullptr, false, -3)); // no --vision: no bank, the text path is unchanged
+    auto table_window = [&](std::initializer_list<int> rows) {
+        bool ok = true;
+        for (int r : rows) ok = ok && text_only[r];
+        return ok;
+    };
+    check(table_window({2, 2, 3, 3, 3}) && table_window({3}));
+    check(!table_window({2, 0, 0, 3}) && !table_window({1}) && !table_window({3, 3, 4}));
+    std::printf("slot_mrope_cpu: %d checks PASS; layouts=1,7,8,9,10,11,12; c4_routing=5\n",checks);
 }

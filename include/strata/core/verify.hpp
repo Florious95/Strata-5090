@@ -288,6 +288,8 @@ public:
         explicit operator bool() const { return v_ != nullptr; }
         bool finish(std::string& err);
     private:
+        // First member: its captures, runs and commit see no slot's bank (released last).
+        strata::kernels::MropeTableScope rope_;
         Verifier* v_ = nullptr;
         SessionState* anchor_ = nullptr;
         bool publish_ = false;

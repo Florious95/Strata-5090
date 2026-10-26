@@ -33,6 +33,12 @@ inline int32_t mrope_text_position(int64_t cell, int64_t tail_start, int32_t del
     return host_table && cell < tail_start ? host_table[cell * 3] : (int32_t) (cell + delta);
 }
 
+// Row Table windows and Slot Solo graphs run under a null table with cell positions. That
+// equals a slot's bank only while the bank is the identity and decode adds no delta.
+inline bool mrope_text_only(const int32_t* bank, bool identity, int32_t delta) {
+    return bank == nullptr || (identity && delta == 0);
+}
+
 // Host-side launch/capture selection only: CUDA kernels retain the pointer by value.
 // Slot prefill/pooling uses its own table; merged text decode uses explicit positions.
 class MropeTableScope {

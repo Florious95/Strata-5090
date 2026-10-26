@@ -3268,10 +3268,10 @@ int main(int argc, char** argv) {
     }
     strata::core::WindowAudit window_audit;
     const bool slot_only_cli = o.batch_slot_only;
-    if (generalized && (!o.serve || (o.batch != 2 && o.batch != 4 && o.batch != 8) || o.vision ||
+    if (generalized && (!o.serve || (o.batch != 2 && o.batch != 4 && o.batch != 8) || (o.vision && o.batch > 4) ||
                         o.kv != "q4_0" || o.mtp.empty() || o.batch_spec < 2 || o.spec < 2 ||
                         o.batch_spec_fixed || o.pipeline_windows > 0 || o.kv_grow || o.adapt_async || o.batch_groups > 1)) {
-        std::fprintf(stderr, "strata: generalized batching needs 2/4/8 text slots, Q4 KV, MTP, variable segments, "
+        std::fprintf(stderr, "strata: generalized batching needs 2/4/8 slots (vision: 2/4), Q4 KV, MTP, variable segments, "
                              "one group, no KV grow/pipeline/async adaptation\n"); return 2;
     }
     // From here the old internal slot-only field denotes effective canonical
@@ -4034,7 +4034,7 @@ int main(int argc, char** argv) {
     std::vector<int32_t> mrope_host;
     if (o.vision) {
         const int64_t cells = o.max_context + 64;
-        const int banks = o.batch_slot_only ? 2 : 1;
+        const int banks = o.batch_slot_only ? std::max(o.batch, 2) : 1;   // one per canonical slot
         mrope_host.resize((size_t) banks * cells * 3);
         for (int b = 0; b < banks; ++b)
             for (int64_t c = 0; c < cells; ++c) {
@@ -4048,6 +4048,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         strata::kernels::mrope_table_set(d_mrope);
+        std::fprintf(stderr, "strata vision: position table banks=%d cells=%lld\n", banks, (long long) cells);
     }
     strata::kernels::ple_set_native_postops(o.native_ple_postops);
     // before session_init: every graph captured from here on has the vector's kernels where it applies
@@ -5618,6 +5619,11 @@ int main(int argc, char** argv) {
     }
     if (o.batch_slot_only && o.vision) {
         const size_t stride = (size_t) (o.max_context + 64) * 3;
+        if (bslot_ss[0].size() * stride > mrope_host.size()) {
+            std::fprintf(stderr, "strata vision: %zu slots but %zu position banks\n",
+                         bslot_ss[0].size(), mrope_host.size() / stride);
+            return 1;
+        }
         for (size_t b = 0; b < bslot_ss[0].size(); ++b) {
             auto& sx = *bslot_ss[0][b];
             sx.mrope_device = d_mrope + b * stride;
@@ -12327,7 +12333,8 @@ int main(int argc, char** argv) {
             // the legacy path; Solo binds only a decode-only owner window.
             const bool use_slot_solo = strata::core::slot_solo_eligible(
                 slot_solo, (int) bs.size(), std::max(o.spec, batch_capacity), active_slots,
-                rows[0], S, bs[(size_t) rows[0]].img, batch_prefilling);
+                rows[0], S, bs[(size_t) rows[0]].img || !bslot_ss[0][(size_t) rows[0]]->rope_text_only(),
+                batch_prefilling);
             if (o.batch_slot_only) {
                 for (int t = 0; t < S; t += widths[t]) {
                     const auto& sl = bs[(size_t) rows[t]];
@@ -13385,13 +13392,14 @@ int main(int argc, char** argv) {
                 if (!ve.empty()) {
                     // leave the table as the identity so the next text request is untouched
                     for (int64_t c = 0; c < cells; ++c) put(c, c, c, c);
-                    upload_mrope();
+                    ss.rope_identity = upload_mrope();
                     mrope_identity = true;
                     std::printf("ERR %s\n", ve.c_str());
                     std::fflush(stdout);
                     continue;
                 }
                 mrope_identity = !geni;
+                ss.rope_identity = req_imgs.empty();   // no picture: every cell, prompt and tail, is (c, c, c)
             }
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
             const int32_t request_rope_delta = ss.mrope_host ? ss.mrope_host[(size_t) n * 3] - (int32_t) n : 0;

@@ -1,4 +1,5 @@
-// Hardware bit contract: independent image banks vs explicit per-slot text deltas.
+// Hardware bit contract: independent image banks vs explicit per-slot text deltas, and (pattern 3,
+// C4 Row Table/Solo) identity banks vs a null table with cell positions, prompt cells included.
 // Uses production native RoPE/norm+RoPE APIs; no model/encoder/GGUF.
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/native_rope.hpp"
@@ -28,19 +29,21 @@ int main(){
     for(size_t i=0;i<g.size();++i)g[i]=0.5f+float(i%31)/47.0f;
     input.upload(x);gamma.upload(g);
     int fixtures=0,replays=0;
-    for(int pattern=0;pattern<3;++pattern){
-        const int delta[2]={pattern==0?-3:0,pattern==2?0:-8};
+    for(int pattern=0;pattern<4;++pattern){
+        const bool text=pattern==3;
+        const int delta[2]={pattern==0?-3:0,pattern>=2?0:-8};
         for(int slot=0;slot<2;++slot){
             std::vector<int32_t> tab(banks[slot].n);
             for(int c=0;c<cells;++c)for(int axis=0;axis<3;++axis)tab[size_t(c)*3+axis]=c>=20?c+delta[slot]:c;
             // The prefill bank really has unequal image t/h/w, not a fake scalar table.
-            for(int c=4;c<16;++c){tab[c*3]=4;tab[c*3+1]=4+(c-4)/3;tab[c*3+2]=4+(c-4)%3;}
+            if(!text)for(int c=4;c<16;++c){tab[c*3]=4;tab[c*3+1]=4+(c-4)/3;tab[c*3+2]=4+(c-4)%3;}
             banks[slot].upload(tab);
         }
         for(int scale=0;scale<3;++scale){
             k::RopeScaling sc;
             if(scale){sc.type=scale==1?k::RopeScalingType::Linear:k::RopeScalingType::YaRN;sc.factor=2;sc.ext_factor=scale==2?1:0;}
-            for(int base:{32,32768,258000})for(int n:{1,7,8,9,10,11,12})for(int hd:{128,256})for(int fused:{0,1})for(int narrow:{0,1}){
+            for(int base:{0,32,32768,258000})for(int n:{1,7,8,9,10,11,12})for(int hd:{128,256})for(int fused:{0,1})for(int narrow:{0,1}){
+                if(base==0&&!text)continue;   // image cells: only the bank is right there
                 const int split=(n+1)/2,stride=fused?2*hd:hd;
                 std::vector<int32_t> cp(max_rows),tp(max_rows);
                 for(int t=0;t<n;++t){int slot=t<split?0:1;cp[t]=base+t;tp[t]=cp[t]+delta[slot];}
@@ -91,5 +94,5 @@ int main(){
     }
     k::mrope_table_set(nullptr);
     for(auto s:streams)ck(cudaStreamDestroy(s));
-    std::printf("slot_mrope_gpu: fixtures=%d graph_replays=%d rows=1,7,8,9,10,11,12 bits=0 PASS\n",fixtures,replays);
+    std::printf("slot_mrope_gpu: fixtures=%d graph_replays=%d rows=1,7,8,9,10,11,12 text_banks=1 bits=0 PASS\n",fixtures,replays);
 }
