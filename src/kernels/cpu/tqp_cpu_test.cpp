@@ -215,6 +215,25 @@ void check_type(int type, bool reference) {
         }
         std::printf("type %d gate/up rows, every ISA vs scalar: %s\n", type, ok ? "bitwise equal" : "DIFFERENT");
         if (!ok) fail("gate/up rows differ", type);
+        // a merged batch window routes up to 16 tokens to one expert: the entries slice the token axis by 8, so
+        // tokens t and t + 8 (the same activation) come out as the 8-token call's row t, on every ISA
+        const void* ap2[2 * NT];
+        for (int t = 0; t < 2 * NT; ++t) ap2[t] = c.ap[t % NT];
+        std::vector<float> o2((size_t) 2 * NT * c.rows), g2((size_t) 2 * NT * c.rows);
+        float* q2[2 * NT]; float* h2[2 * NT];
+        for (int t = 0; t < 2 * NT; ++t) { q2[t] = o2.data() + (size_t) t * c.rows; h2[t] = g2.data() + (size_t) t * c.rows; }
+        bool wide = true;
+        for (TqIsa isa : {TqIsa::scalar, TqIsa::avx2, TqIsa::avx512}) {
+            if (!tq_isa_ok(isa)) continue;
+            tq_rows(isa, type, c.w.data(), c.rb, c.n, ap2, 2 * NT, q2, 0, c.rows);
+            tq_gu_rows(isa, type, blob.data(), c.rb, up_off, c.n, ap2, 2 * NT, h2, 0, c.rows);
+            for (int h = 0; h < 2; ++h) {
+                wide = wide && same_bits(o2.data() + (size_t) h * NT * c.rows, ref.data(), (size_t) NT * c.rows);
+                wide = wide && same_bits(g2.data() + (size_t) h * NT * c.rows, ff0.data(), (size_t) NT * c.rows);
+            }
+        }
+        std::printf("type %d 16-token rows and gate/up rows vs two 8-token calls: %s\n", type, wide ? "bitwise equal" : "DIFFERENT");
+        if (!wide) fail("16-token rows differ from the 8-token slices", type);
     }
 }
 
