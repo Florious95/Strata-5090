@@ -87,6 +87,41 @@ void rows_scalar_t(const int16_t* tab, const uint8_t* w, size_t row_bytes, int n
     }
 }
 
+// TQP (Gyro-L): 64 pair-trellis steps of 2 weights; a 32-value group is 16 steps.  The table row holds the
+// TQ2_T state's two pairs; TQP uses the first pair only (weight 2t+j = lut[2*hyb(2*s)+j]).
+template <int KB>
+void rows_scalar_tqp_t(const uint8_t* w, size_t row_bytes, int n, const tq_detail::TqAct* const* a, int nt,
+                       float* const* out, int r0, int r1) {
+    const int nb = n / 128;
+    constexpr size_t bsz = 2 + 8 * KB;
+    const int16_t* tab = tq_state_table();
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* x = w + (size_t) r * row_bytes;
+        float acc[kTqMaxTokens][4] = {};
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* blk = x + (size_t) i * bsz;
+            const float dx = tq_detail::tq_half_to_float(tq_detail::tq_ld16(blk));
+            uint32_t st[64];
+            tq_detail::tq_states_tqp<KB>(blk + 2, st);
+            for (int t = 0; t < nt; ++t) {
+                const int16_t* q = a[t]->q + 128 * i;
+                for (int k = 0; k < 4; ++k) {
+                    int32_t s = 0;
+                    for (int j = 0; j < 16; ++j) {   // step 16k+j: two weights
+                        const int16_t* wv = tab + 4 * st[16 * k + j];
+                        const int16_t* qv = q + 32 * k + 2 * j;
+                        s += wv[0] * qv[0] + wv[1] * qv[1];
+                    }
+                    const float sc = dx * a[t]->d[4 * i + k];
+                    acc[t][k] = std::fma((float) s, sc, acc[t][k]);
+                }
+            }
+        }
+        for (int t = 0; t < nt; ++t)
+            out[t][r] = ((acc[t][0] + acc[t][1]) + (acc[t][2] + acc[t][3])) * (1.0f / 8192.0f);
+    }
+}
+
 }  // namespace
 
 const int16_t* tq_state_table() {
@@ -104,11 +139,18 @@ const int16_t* tq_state_table_computed() {
 const int16_t* tq_state_table_for(int t) { return (t == kTqTypeK5X || t == kTqTypeK4X) ? tq_state_table_computed() : tq_state_table(); }
 
 bool tq_supported(int t) noexcept {
-    return t == 144 || t == 145 || t == 146 || t == kTqTypeK5X || t == kTqTypeK4X || t == kTqTypeK5T || t == kTqTypeK4T;
+    return t == 144 || t == 145 || t == 146 || t == 147 || t == 148 || t == 149 ||
+           t == kTqTypeK5X || t == kTqTypeK4X || t == kTqTypeK5T || t == kTqTypeK4T;
 }
 
 int tq_kbits(int t) noexcept {
-    return t == 144 ? 8 : t == 145 ? 6 : t == 146 ? 7 : (t == kTqTypeK5X || t == kTqTypeK5T) ? 5 : (t == kTqTypeK4X || t == kTqTypeK4T) ? 4 : 0;
+    if (t == 148) return 6;                                   // TQP6
+    if (t == 144) return 8;
+    if (t == 146 || t == 149) return 7;
+    if (t == 145) return 6;
+    if (t == 147 || t == kTqTypeK5X || t == kTqTypeK5T) return 5;
+    if (t == kTqTypeK4X || t == kTqTypeK4T) return 4;
+    return 0;
 }
 
 bool tq_isa_ok(TqIsa isa) {
@@ -167,6 +209,13 @@ void tq_rows_scalar(int kb, const int16_t* tab, const uint8_t* w, size_t row_byt
     else rows_scalar_t<7>(tab, w, row_bytes, n, a, nt, out, r0, r1);
 }
 
+void tq_rows_scalar_tqp(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+                        float* const* out, int r0, int r1) {
+    if (kb == 5) rows_scalar_tqp_t<5>(w, row_bytes, n, a, nt, out, r0, r1);
+    else if (kb == 6) rows_scalar_tqp_t<6>(w, row_bytes, n, a, nt, out, r0, r1);
+    else rows_scalar_tqp_t<7>(w, row_bytes, n, a, nt, out, r0, r1);
+}
+
 }  // namespace tq_detail
 
 namespace {
@@ -198,18 +247,36 @@ void rows_on(TqIsa isa, int kb, const int16_t* tab, const uint8_t* w, size_t row
     }
 }
 
+// The pair layout (types 147-149): AVX2 and AVX-512 both take the AVX2 pair kernel; scalar, and any build without the
+// x86 units (arm64: the Metal build), the scalar one.
+void rows_pair_on(TqIsa isa, int kb, const uint8_t* w, size_t row_bytes, int n, const tq_detail::TqAct* const* a, int nt,
+                  float* const* out, int r0, int r1) {
+#if defined(STRATA_TQ_X86)
+    if (isa != TqIsa::scalar) {
+        tq_detail::tq_rows_avx2_tqp(kb, w, row_bytes, n, a, nt, out, r0, r1);
+        return;
+    }
+#else
+    (void) isa;
+#endif
+    tq_detail::tq_rows_scalar_tqp(kb, w, row_bytes, n, a, nt, out, r0, r1);
+}
+
 }  // namespace
 
 void tq_rows(TqIsa isa, int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
              float* const* out, int r0, int r1) {
     if (!tq_isa_ok(isa)) std::abort();   // a caller bug: asked for an ISA this CPU does not have
     const int16_t* tab = tq_state_table_for(ggml_type);
+    const int kb = tq_kbits(ggml_type);
+    const bool pair = tq_pair_layout(ggml_type);   // Gyro-L pair trellis: the AVX2 pair kernel (scalar is the reference)
     // Merged verification can route more than eight tokens to one expert. Keep every ISA's
     // fixed-size scratch and per-token reduction unchanged by slicing only the token axis.
     for (int first = 0; first < nt; first += kTqMaxTokens) {
         const int count = std::min(kTqMaxTokens, nt - first);
         const ActSet& s = unpack_all(act + first, n, count);
-        rows_on(isa, tq_kbits(ggml_type), tab, w, row_bytes, n, s.ptr, count, out + first, r0, r1);
+        if (pair) rows_pair_on(isa, kb, w, row_bytes, n, s.ptr, count, out + first, r0, r1);
+        else rows_on(isa, kb, tab, w, row_bytes, n, s.ptr, count, out + first, r0, r1);
     }
 }
 
@@ -223,6 +290,7 @@ void tq_gu_rows(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_row, si
     float* gp[kTqMaxTokens];
     float* up[kTqMaxTokens];
     const int kb = tq_kbits(ggml_type);
+    const bool pair = tq_pair_layout(ggml_type);   // Gyro-L pair trellis: its own kernels
     for (int first = 0; first < nt; first += kTqMaxTokens) {
         const int count = std::min(kTqMaxTokens, nt - first);
         const ActSet& s = unpack_all(act + first, n, count);
@@ -230,8 +298,12 @@ void tq_gu_rows(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_row, si
             gp[t] = gbuf.data() + (size_t) t * nr;
             up[t] = ubuf.data() + (size_t) t * nr;
         }
-        rows_on(isa, kb, tab, blob, gu_row, n, s.ptr, count, gp, r0, r1);
-        rows_on(isa, kb, tab, blob + up_off, gu_row, n, s.ptr, count, up, r0, r1);
+        auto rows = [&](const uint8_t* w, float* const* o) {
+            if (pair) rows_pair_on(isa, kb, w, gu_row, n, s.ptr, count, o, r0, r1);
+            else rows_on(isa, kb, tab, w, gu_row, n, s.ptr, count, o, r0, r1);
+        };
+        rows(blob, gp);
+        rows(blob + up_off, up);
         for (int t = 0; t < count; ++t)
             for (int r = r0; r < r1; ++r) {
                 const float g = gp[t][r], u = up[t][r];

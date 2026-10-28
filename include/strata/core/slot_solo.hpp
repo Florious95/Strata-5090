@@ -34,14 +34,18 @@ inline bool row_needs_sampling(bool greedy, float temperature, int history, cons
 // Only graph handles move; sequence state and the verifier's scratch never do.
 // The owning Verifier drains all streams before exchange/destruction. No copying
 // is permitted (including between the active bank and a slot's parked bank).
+// The verifier's one-CTA select row only (sel_long_ 0): a Solo binding refuses STRATA_SELECT_LONG. A graph's
+// first-launch flags move with it, so a parked graph is never mistaken for a launched one.
 template<class Handle> struct SoloGraphBank {
     Handle exec[9] = {}, exec_nr[9] = {}, commit = {};
     int groups[9] = {};
+    bool launched[9] = {}, launched_nr[9] = {};
     SoloGraphBank() = default;
     SoloGraphBank(const SoloGraphBank&) = delete;
     SoloGraphBank& operator=(const SoloGraphBank&) = delete;
-    void exchange(Handle (&a)[9], Handle (&b)[9], Handle& c, int (&g)[9]) {
+    void exchange(Handle (&a)[9], Handle (&b)[9], Handle& c, int (&g)[9], bool (&la)[9], bool (&lb)[9]) {
         std::swap(exec, a); std::swap(exec_nr, b); std::swap(commit, c); std::swap(groups, g);
+        std::swap(launched, la); std::swap(launched_nr, lb);
     }
 };
 

@@ -46,13 +46,18 @@ int main() {
     Bank parked[4];
     uintptr_t active[9] = {}, active_nr[9] = {}, commit = 99;
     int groups[9] = {};
-    for (int t = 1; t <= 8; ++t) { active[t] = t; active_nr[t] = t + 10; groups[t] = t % 2 + 1; }
+    bool launched[9] = {}, launched_nr[9] = {};
+    for (int t = 1; t <= 8; ++t) {
+        active[t] = t; active_nr[t] = t + 10; groups[t] = t % 2 + 1;
+        launched[t] = t % 3 == 0; launched_nr[t] = t % 3 == 1;
+    }
     for (int b = 0; b < 4; ++b) {
         parked[b].commit = 1000 + b;
         for (int t = 1; t <= 8; ++t) {
             parked[b].exec[t] = 100 + b * 20 + t;
             parked[b].exec_nr[t] = 110 + b * 20 + t;
             parked[b].groups[t] = 1;
+            parked[b].launched[t] = t == b + 1;   // a parked graph keeps its own first-launch state
         }
     }
     auto ownership = [&] {
@@ -68,20 +73,22 @@ int main() {
     };
     ownership();
     for (int owner : {3, 1, 0, 2, 2, 3, 0, 1}) {
-        parked[owner].exchange(active, active_nr, commit, groups);
+        parked[owner].exchange(active, active_nr, commit, groups, launched, launched_nr);
         ownership();
         require(commit == (uintptr_t) (1000 + owner), "nonzero owner has its own commit graph");
         for (int t = 1; t <= 8; ++t) {
             require(active[t] == (uintptr_t) (100 + owner * 20 + t), "arbitrary owner target graph");
             require(active_nr[t] == (uintptr_t) (110 + owner * 20 + t), "owner residency variant graph");
             require(groups[t] == 1, "groups exchanged with their target graph");
+            require(launched[t] == (t == owner + 1) && !launched_nr[t], "first-launch flags exchanged with their graphs");
         }
-        parked[owner].exchange(active, active_nr, commit, groups);
+        parked[owner].exchange(active, active_nr, commit, groups, launched, launched_nr);
         ownership();
         require(commit == 99, "anchor commit restored after accepted-prefix scope");
         for (int t = 1; t <= 8; ++t)
-            require(active[t] == (uintptr_t)t && active_nr[t] == (uintptr_t)(t + 10) && groups[t] == t % 2 + 1,
-                    "anchor graph/groups restored exactly");
+            require(active[t] == (uintptr_t)t && active_nr[t] == (uintptr_t)(t + 10) && groups[t] == t % 2 + 1 &&
+                    launched[t] == (t % 3 == 0) && launched_nr[t] == (t % 3 == 1),
+                    "anchor graph/groups/first-launch flags restored exactly");
     }
     std::printf("PASS %d Solo dispatch/sampling-predicate/handle ownership checks (CPU only)\n", checks);
 }
