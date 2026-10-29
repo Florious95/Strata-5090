@@ -1,4 +1,5 @@
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/kernels/idx_pooled.hpp"
 #include "conversation_checked.hpp"
 #include "conversation_copy.hpp"
 #include <chrono>
@@ -45,6 +46,22 @@ bool copy(void* dst, const void* src, size_t bytes, std::string& error, bool que
     return false;
 }
 
+// A restore writes the saved `dead` (FP32, `bytes`) into the pooled row the next token fills.  C8-6: a BF16 store
+// holds that row as the indexer writes it there, rounded to nearest even (idx_pooled.hpp) - converted on the host
+// and copied before return (its source is this frame's).
+bool put_spare(const QsaState& st, size_t row, const void* dead, size_t bytes, bool dead_on_device, std::string& error,
+               bool queued = false) {
+    const size_t dim = bytes / sizeof(float);
+    if (!strata::kernels::qsa_idx_pooled_bf16()) return copy(st.idx_pooled + row * dim, dead, bytes, error, queued);
+    std::vector<float> f(dim);
+    if (!dead_on_device) std::memcpy(f.data(), dead, bytes);
+    else if (!copy(f.data(), dead, bytes, error)) return false;
+    std::vector<uint16_t> h(dim);
+    for (size_t i = 0; i < dim; ++i) h[i] = strata::kernels::bf16_from_f32(f[i]);
+    return copy(reinterpret_cast<uint8_t*>(st.idx_pooled) + strata::kernels::idx_pooled_bytes(row, dim), h.data(),
+                dim * sizeof(uint16_t), error);
+}
+
 // The session's carve (#216): `qsa_states` keeps global ordinals and holds the owned ones
 // [qsa_ord0, qsa_ord0 + qsa_alloc); `gdn_state` holds `gdn_alloc` rows. A whole-model session owns every layer.
 size_t owned_qsa(const SessionState& ss) { return (size_t) std::max<int64_t>(ss.qsa_alloc, 0); }
@@ -71,7 +88,8 @@ bool checkpoint_targets(const SessionState& ss, const ModelGeometry& g, size_t t
         if (!st.idx_tail || !st.idx_dead || !st.idx_block_pos || !st.idx_pooled ||
             st.max_cells < 0 || tokens > (uint64_t) st.max_cells ||
             (tokens && tokens / (uint64_t) block >= (uint64_t) std::max<int64_t>(0, st.idx_pooled_rows)) ||
-            !product(pooled_bytes, {tokens / (uint64_t) block + 1, (uint64_t) g.idx_key_dim, sizeof(float)}))
+            !product(pooled_bytes, {tokens / (uint64_t) block + 1, (uint64_t) g.idx_key_dim,
+                                    strata::kernels::qsa_idx_pooled_bf16() ? 2u : sizeof(float)}))
             return fail(error, "invalid indexer running-state target");
     }
     return true;
@@ -422,7 +440,7 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
             !copy(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos, error)) return false;
         if (!c.ids.empty()) {
             const size_t row = c.ids.size() / strata::kernels::qsa_real_shapes().idx_block;
-            if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error)) return false;
+            if (!put_spare(st, row, c.dead.data() + j * z.dead, z.dead, false, error)) return false;
         }
     }
     const size_t tokens = c.ids.size();
@@ -454,7 +472,7 @@ bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, co
             !acopy(b.idx_block_pos, a.idx_block_pos, zf.block_pos)) return false;
         if (!ids.empty()) {   // restore writes the saved `dead` row into the pooled row the next token fills
             const size_t row = ids.size() / strata::kernels::qsa_real_shapes().idx_block;
-            if (!acopy(b.idx_pooled + row * g.idx_key_dim, a.idx_dead, zf.dead)) return false;
+            if (!put_spare(b, row, a.idx_dead, zf.dead, true, error, queued)) return false;
         }
     }
     const size_t tokens = ids.size();

@@ -65,6 +65,7 @@
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
+#include "strata/kernels/idx_pooled.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/kv_q4.hpp"
@@ -4637,6 +4638,24 @@ int main(int argc, char** argv) {
     strata::kernels::native_router_set_enabled(o.native_router);
     strata::kernels::native_qsa_set_enabled(o.native_qsa);
     strata::kernels::native_qsa_indexer_set_enabled(o.native_qsa_indexer);
+    // C8-6 STRATA_IDX_POOLED_BF16=1 (strictly 0|1, default 0; lossy, opt-in): the pooled indexer keys in BF16 - 192 MiB
+    // a 262144-cell session instead of 384 (idx_pooled.hpp).  Fixed here, before any session or drafter is sized.
+    bool idx_pooled_bf16 = false;
+    if (!strata::core::parse_slot_solo(std::getenv("STRATA_IDX_POOLED_BF16"), idx_pooled_bf16)) {
+        std::fprintf(stderr, "strata: STRATA_IDX_POOLED_BF16 must be 0 or 1\n"); return 2;
+    }
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL) || defined(STRATA_GPU_SYCL)
+    if (idx_pooled_bf16) { std::fprintf(stderr, "strata: STRATA_IDX_POOLED_BF16 requires NVIDIA CUDA\n"); return 2; }
+#endif
+    // the reference indexer rotates the stored row in place, and the FP16/BF16 check reads an FP32 store
+    if (idx_pooled_bf16 && (!o.native_qsa_indexer || std::getenv("STRATA_IDX_FP16_CHECK"))) {
+        std::fprintf(stderr, "strata: STRATA_IDX_POOLED_BF16 needs the native QSA indexer (--native or "
+                             "--native-qsa-indexer) and no STRATA_IDX_FP16_CHECK\n"); return 2;
+    }
+    strata::kernels::qsa_set_idx_pooled_bf16(idx_pooled_bf16);
+    if (idx_pooled_bf16)
+        std::fprintf(stderr, "strata: STRATA_IDX_POOLED_BF16=1: the QSA indexer's pooled keys are stored in BF16 "
+                             "(256 B a row, not 512; lossy)\n");
     strata::kernels::native_rope_set_enabled(o.native_rope);
     // The vision path: every rope kernel reads a cell's (t, h, w) from this table (strata/kernels/mrope.hpp).  It is
     // the identity until an image request, and it is set here, before any CUDA graph captures a rope kernel.
@@ -17923,8 +17942,10 @@ int main(int argc, char** argv) {
                     const strata::core::QsaState& st = ss.qsa_states[ss.qsa_ord0 + j];
                     h_tail = hash_dev(st.idx_tail, z.tail, h_tail);
                     h_dead = hash_dev(st.idx_dead, z.dead, h_dead);
-                    h_pool = hash_dev(st.idx_pooled, (size_t) (L / qs.idx_block) * qs.idx_dim * 4, h_pool);
-                    h_pool_full = hash_dev(st.idx_pooled, (size_t) (L > 0 ? L / qs.idx_block + 1 : 0) * qs.idx_dim * 4,
+                    h_pool = hash_dev(st.idx_pooled, (size_t) strata::kernels::idx_pooled_bytes(
+                                          (uint64_t) (L / qs.idx_block), (uint64_t) qs.idx_dim), h_pool);
+                    h_pool_full = hash_dev(st.idx_pooled, (size_t) strata::kernels::idx_pooled_bytes(
+                                               (uint64_t) (L > 0 ? L / qs.idx_block + 1 : 0), (uint64_t) qs.idx_dim),
                                            h_pool_full);
                     // KV streaming: the host copy is the identity layout and holds every cell
                     for (const auto& [pool, w] : kv_arrays(st)) {

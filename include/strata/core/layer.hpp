@@ -245,7 +245,8 @@ struct QsaState {
 
     float* idx_tail = nullptr;       ///< (idx_block - 1, idx_dim): the raw tail of the block being filled
     float* idx_dead = nullptr;       ///< (idx_dim,): the spare slot's key, CONSTANT for the sequence
-    float* idx_pooled = nullptr;     ///< (max_cells/idx_block + 2, idx_dim)
+    float* idx_pooled = nullptr;     ///< (max_cells/idx_block + 2, idx_dim): FP32, or BF16 under STRATA_IDX_POOLED_BF16
+                                     ///< - a storage handle, never indexed on the host (kernels/idx_pooled.hpp)
     int32_t* idx_block_pos = nullptr;
 
     float* cos_tab = nullptr;        ///< (max_cells, n_rot/2), built on the HOST in float64

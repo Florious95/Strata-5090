@@ -361,6 +361,7 @@ namespace strata::prefill { void peer_scatter_add(float * p0, const float * p1, 
 namespace strata::prefill { void rms_rows(float * p0, const float * p1, int64_t p2, int64_t p3, int64_t p4, float p5, void * p6) { strata::metal_engine::missing("strata::prefill::rms_rows"); } }
 namespace strata::prefill { void rope(float * p0, int64_t p1, int64_t p2, int64_t p3, int64_t p4, int64_t p5, const strata::kernels::RopeScaling & p6, void * p7) { strata::metal_engine::missing("strata::prefill::rope"); } }
 namespace strata::prefill { void round_f16(const float * p0, float * p1, int64_t p2, void * p3) { strata::metal_engine::missing("strata::prefill::round_f16"); } }
+namespace strata::prefill { void round_bf16(const float * p0, float * p1, int64_t p2, void * p3) { strata::metal_engine::missing("strata::prefill::round_bf16"); } }
 namespace strata::prefill { void route(const float * p0, int32_t * p1, float * p2, int64_t p3, int64_t p4, void * p5) { strata::metal_engine::missing("strata::prefill::route"); } }
 namespace strata::prefill { void split_q(const float * p0, float * p1, int64_t p2, void * p3) { strata::metal_engine::missing("strata::prefill::split_q"); } }
 namespace strata::prefill { void sums_to_f16(const float * p0, uint16_t * p1, int64_t p2, void * p3) { strata::metal_engine::missing("strata::prefill::sums_to_f16"); } }

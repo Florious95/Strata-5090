@@ -4013,31 +4013,45 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // design's last question). Every query is selected again from the pooled keys and `dead` rounded
                     // to fp16 (exactly what an fp16 store reads back); the agreement with the fp32 selection is
                     // printed cumulatively after each chunk's last QSA layer. Debug: syncs per layer.
-                    if (static const bool f16chk = std::getenv("STRATA_IDX_FP16_CHECK") != nullptr; f16chk) {
+                    // =bf16 (C8-6's quality gate; an FP32 engine only): the store STRATA_IDX_POOLED_BF16=1 keeps - the
+                    // pooled rows rounded to BF16, `dead` in FP32 - against the FP32 keys selected by the same warp
+                    // scorer (not the prompt's tensor-core one), so the rounding is the only difference; the BF16
+                    // engine's scorers read the widened keys bit for bit like this. Adds the per-query Jaccard's
+                    // median and 1st percentile over the sparse queries.
+                    if (static const char* f16chk = std::getenv("STRATA_IDX_FP16_CHECK"); f16chk != nullptr) {
+                        static const bool bf16 = std::strcmp(f16chk, "bf16") == 0;
                         static float *pooled16 = nullptr, *dead16 = nullptr;
-                        static int32_t* ids16 = nullptr;
+                        static int32_t *ids16 = nullptr, *ids32 = nullptr;
                         static double shared = 0, cells = 0;
                         static long long queries = 0, same = 0, sel_queries = 0;
+                        static std::vector<float> jaccard;
                         const int64_t rows = st.idx_pooled_rows;
                         if (pooled16 == nullptr &&
                             (cudaMalloc((void**) &pooled16, (size_t) rows * s.idx_dim * 4) != cudaSuccess ||
                              cudaMalloc((void**) &dead16, (size_t) s.idx_dim * 4) != cudaSuccess ||
-                             cudaMalloc((void**) &ids16, (size_t) (m.T * m.cap) * 4) != cudaSuccess)) {
+                             cudaMalloc((void**) &ids16, (size_t) (m.T * m.cap) * 4) != cudaSuccess ||
+                             (bf16 && cudaMalloc((void**) &ids32, (size_t) (m.T * m.cap) * 4) != cudaSuccess))) {
                             err = "STRATA_IDX_FP16_CHECK: no room for its buffers";
                             return false;
                         }
-                        round_f16(st.idx_pooled, pooled16, rows * s.idx_dim, m.cs);
-                        round_f16(st.idx_dead, dead16, s.idx_dim, m.cs);
+                        if (bf16) round_bf16(st.idx_pooled, pooled16, rows * s.idx_dim, m.cs);
+                        else round_f16(st.idx_pooled, pooled16, rows * s.idx_dim, m.cs);
+                        if (!bf16) round_f16(st.idx_dead, dead16, s.idx_dim, m.cs);
                         for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
                             const int64_t nb = std::min(m.sel_batch, T - t0);
                             const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
-                            strata::kernels::qsa_block_scores(pooled16, dead16, m.q_idx + t0 * 512, steps0, nb,
-                                                              m.max_blocks, s, m.sel_scores, m.cs);
+                            strata::kernels::qsa_block_scores(pooled16, bf16 ? st.idx_dead : dead16, m.q_idx + t0 * 512,
+                                                              steps0, nb, m.max_blocks, s, m.sel_scores, m.cs);
                             strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                             ids16 + t0 * m.cap, m.cs);
+                            if (!bf16) continue;
+                            strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
+                                                              m.max_blocks, s, m.sel_scores, m.cs);
+                            strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
+                                                            ids32 + t0 * m.cap, m.cs);
                         }
                         std::vector<int32_t> a((size_t) (T * m.cap)), b((size_t) (T * m.cap));
-                        cudaMemcpyAsync(a.data(), m.sel_ids, a.size() * 4, cudaMemcpyDeviceToHost, m.cs);
+                        cudaMemcpyAsync(a.data(), bf16 ? ids32 : m.sel_ids, a.size() * 4, cudaMemcpyDeviceToHost, m.cs);
                         cudaMemcpyAsync(b.data(), ids16, b.size() * 4, cudaMemcpyDeviceToHost, m.cs);
                         cudaStreamSynchronize(m.cs);
                         for (int64_t t = 0; t < T; ++t) {
@@ -4049,12 +4063,30 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             ++queries;
                             same += c == w;
-                            if (p0 + t + 1 > m.cap) { ++sel_queries; shared += (double) c; cells += (double) w; }
+                            if (p0 + t + 1 > m.cap) {
+                                ++sel_queries; shared += (double) c; cells += (double) w;
+                                if (bf16 && w > 0) jaccard.push_back((float) ((double) c / (double) (2 * w - c)));
+                            }
                         }
-                        if (qsa_index + 1 == g.n_qsa_layers())
+                        if (qsa_index + 1 == g.n_qsa_layers() && !bf16)
                             std::fprintf(stderr, "strata prefill: FP16 indexer keys: %lld of %lld selections identical; "
                                                  "where the selection is sparse, %.4f%% of cells shared (%lld queries)\n",
                                          same, queries, cells > 0 ? 100.0 * shared / cells : 100.0, sel_queries);
+                        if (qsa_index + 1 == g.n_qsa_layers() && bf16) {
+                            float med = 1.0f, p1 = 1.0f;   // (no sparse query yet)
+                            if (!jaccard.empty()) {
+                                auto at = [&](size_t k) {
+                                    std::nth_element(jaccard.begin(), jaccard.begin() + (ptrdiff_t) k, jaccard.end());
+                                    return jaccard[k];
+                                };
+                                p1 = at(jaccard.size() / 100);
+                                med = at(jaccard.size() / 2);
+                            }
+                            std::fprintf(stderr, "strata prefill: BF16 indexer keys: %lld of %lld selections identical; "
+                                                 "where the selection is sparse, %.4f%% of cells shared, Jaccard median "
+                                                 "%.5f p1 %.5f (%lld queries)\n",
+                                         same, queries, cells > 0 ? 100.0 * shared / cells : 100.0, med, p1, sel_queries);
+                        }
                     }
                     // STRATA_QSA_DUMP=<file>: append every QSA layer's selected cells for the prompt's last
                     // STRATA_QSA_DUMP_LAST (4096) positions - records of int32 {qsa layer, pos0, T, cap} + T*cap cells,

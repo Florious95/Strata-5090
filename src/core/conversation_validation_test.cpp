@@ -1,6 +1,7 @@
 // Host-only validation fixtures. CUDA is linked but must never be initialized:
 // invalid restores must return before the first CUDA call or destination write.
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/kernels/idx_pooled.hpp"
 #include "strata/kernels/kv_q4.hpp"
 
 #include <cstdint>
@@ -56,7 +57,7 @@ struct Pools {
                                       : g.head_dim * (format == 1 ? 1 : 2);
         data[0].resize(96 * g.n_head_kv * per, 0xa5); data[1] = data[0];
         data[2].resize(format == 1 ? 96 * g.n_head_kv * (g.head_dim / 64) * 2 : 0, 0xa5); data[3] = data[2];
-        data[4].resize(26 * g.idx_key_dim * 4, 0xa5);
+        data[4].resize(strata::kernels::idx_pooled_bytes(26, g.idx_key_dim), 0xa5);   // C8-6: FP32 or BF16 keys
         data[5].resize(3 * g.idx_key_dim * 4, 0xa5);
         data[6].resize(g.idx_key_dim * 4, 0xa5); data[7].resize(4, 0xa5);
         if (format == 2) { st.k_q4 = data[0].data(); st.v_q4 = data[1].data(); }
@@ -69,17 +70,19 @@ struct Pools {
     }
     ConversationKv image(const ModelGeometry& g, bool index) const {
         ConversationKv k;
-        k.format = qsa_kv_format(st); k.cells = 12; k.page_size = 4;
+        k.format = qsa_kv_format(st) + (strata::kernels::qsa_idx_pooled_bf16() ? strata::kernels::kIdxPooledBf16Format : 0);
+        k.cells = 12; k.page_size = 4;
         k.heads = g.n_head_kv; k.head_dim = g.head_dim; k.idx_dim = g.idx_key_dim;
         k.pooled_rows = index ? 3 : 0;
         k.k.resize(data[0].size() / 8, 13); k.v = k.k;
         k.k_scale.resize(data[2].size() / 8, 13); k.v_scale = k.k_scale;
-        k.pooled.resize(k.pooled_rows * g.idx_key_dim * 4, 13);
+        k.pooled.resize(strata::kernels::idx_pooled_bytes(k.pooled_rows, g.idx_key_dim), 13);
         return k;
     }
 };
 
-void fixture(int format, int experts, bool zero_qsa, bool ple) {
+void fixture(int format, int experts, bool zero_qsa, bool ple, bool bf16) {
+    strata::kernels::qsa_set_idx_pooled_bf16(bf16);   // C8-6: the pooled store's mode, before any state is carved
     ModelGeometry g;
     g.n_layers = zero_qsa ? 3 : 8; g.n_expert = experts;
     g.ssm_state_size = 2; g.ssm_v_heads = 2; g.ssm_conv_channels = 8;
@@ -112,6 +115,10 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
         return c;
     };
     image.live = checkpoint(9); image.checkpoints.push_back(checkpoint(5));
+    // the saved spare key: a tie BF16 rounds up to even (0x3f818000 -> 0x3f82), so a restore's spare row tells a
+    // converted key from copied FP32 bytes
+    const uint32_t spare_bits = 0x3f818000u;
+    for (size_t i = 0; i + 4 <= image.live.dead.size(); i += 4) std::memcpy(image.live.dead.data() + i, &spare_bits, 4);
     image.kv.reserve((size_t) g.n_qsa_layers() + 1);
     if (!zero_qsa) { image.kv.push_back(first.image(g, true)); image.kv.push_back(last.image(g, true)); }
     image.kv.push_back(draft.image(g, false));
@@ -144,8 +151,13 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     reject([](auto& s){s.live.ids[0] = -1;}, "negative live token rejected");
     reject([](auto& s){s.live.ple.push_back(0);}, "PLE size/enabled mismatch rejected");
     reject([](auto& s){s.live.tails.push_back(0);}, "tail size/zero-QSA mismatch rejected");
+    // C8-6: a snapshot of the other pooled store (format +32, other pooled bytes) never restores into this one
+    reject([](auto& s){for (auto& k : s.kv) k.format ^= strata::kernels::kIdxPooledBf16Format;},
+           "snapshot of the other pooled storage rejected");
     if (!zero_qsa) {
         reject([](auto& s){s.kv[1].pooled.pop_back();}, "late indexer spare row corruption rejected");
+        reject([&](auto& s){s.kv[0].pooled.resize(3 * g.idx_key_dim * (bf16 ? 4 : 2), 13);},
+               "pooled payload of the other storage's size rejected");
         reject([](auto& s){s.live.dead.pop_back();}, "missing indexer spare key rejected");
         reject([](auto& s){s.live.block_pos.pop_back();}, "missing indexer metadata rejected");
         ss.qsa_states = nullptr;
@@ -203,6 +215,29 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
           "injected host transfer backend completes a valid restore");
     check(gdn==image.live.gdn && history==image.live.ple && ss.ple_prev[0]==8 && ss.ple_prev[1]==9,
           "successful restore publishes correct running state and PLE window");
+    // the spare row (9 tokens: row 2) holds `dead` as the store's indexer writes it; the next row is untouched
+    auto spare_row = [&](const Pools& p) {
+        const size_t row = strata::kernels::idx_pooled_bytes(1, g.idx_key_dim);
+        const uint8_t* r = p.data[4].data() + 2 * row;
+        bool ok = std::all_of(r + row, r + 2 * row, [](uint8_t b){ return b == 0xa5; });
+        for (int64_t i = 0; i < g.idx_key_dim; ++i) {
+            uint32_t f = 0; uint16_t h = 0;
+            if (bf16) { std::memcpy(&h, r + 2 * i, 2); ok = ok && h == 0x3f82; }
+            else { std::memcpy(&f, r + 4 * i, 4); ok = ok && f == spare_bits; }
+        }
+        return ok;
+    };
+    if (!zero_qsa) check(spare_row(first) && spare_row(last), "restored spare row is dead in the store's format");
+    if (!zero_qsa) {   // conversation_checkpoint_copy: the same row from another session's FP32 `dead` (device source)
+        Pools first2(g, format), last2(g, format);
+        std::array<QsaState, 2> layers2{first2.st, last2.st};
+        std::vector<uint8_t> gdn2(gdn.size(), 0xa5), history2(history.size(), 0xa5);   // (z was reused above)
+        SessionState to = ss;
+        to.gdn_state = (float*) gdn2.data(); to.ple_hist = ple ? (float*) history2.data() : nullptr;
+        to.qsa_states = layers2.data();
+        check(conversation_checkpoint_copy(ss, to, image.live.ids, g, error), "direct checkpoint copy");
+        check(spare_row(first2) && spare_row(last2), "copied spare row is dead in the store's format");
+    }
     uint64_t fingerprint = 0;
     check(conversation_kv_verify(image.kv.back(),draft.st,g,9,false,fingerprint,error), "read-back verifies complete draft payload");
     draft.data[0][0] ^= 1;
@@ -243,7 +278,7 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
 }
 
 int main() {
-    for (int format : {0,1,2}) for (int experts : {256,512})
-        for (bool zero_qsa : {false,true}) for (bool ple : {false,true}) fixture(format,experts,zero_qsa,ple);
+    for (bool bf16 : {false,true}) for (int format : {0,1,2}) for (int experts : {256,512})
+        for (bool zero_qsa : {false,true}) for (bool ple : {false,true}) fixture(format,experts,zero_qsa,ple,bf16);
     std::printf("conversation_validation_test: %d host-only checks passed\n", checks);
 }

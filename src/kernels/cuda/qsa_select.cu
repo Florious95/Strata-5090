@@ -6,6 +6,7 @@
 #include <cstring>
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/batch_device_ops.hpp"
+#include "strata/kernels/idx_pooled.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 
 #include <cuda_runtime.h>
@@ -32,6 +33,9 @@ __device__ __forceinline__ uint32_t order_key(float s) {
     return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
 }
 
+// BF (C8-6, idx_pooled.hpp): the keys come from a BF16 store, widened exactly; the arithmetic is the FP32 kernel's.
+// The kernels below that take BF do the same; the launchers keep every other scorer to the FP32 store.
+template <bool BF>
 __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_kernel(const float* __restrict__ pooled,
                                                                         const float* __restrict__ dead,
                                                                         const float* __restrict__ q_idx,
@@ -43,8 +47,8 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_kernel(const fl
     const int64_t b = (int64_t) blockIdx.x * SCORE_WARPS + (threadIdx.x >> 5);
     if (b > n_bid || b >= max_blocks) return;
     const int lane = threadIdx.x & 31;
-    const float* key = (b == n_bid) ? dead : pooled + b * IDX_DIM;
-    const float4 k4 = *reinterpret_cast<const float4*>(key + lane * 4);
+    const float4 k4 = (b == n_bid) ? *reinterpret_cast<const float4*>(dead + lane * 4)
+                                   : pooled_load4<BF>(pooled, b * IDX_DIM + lane * 4);
     const float* q = q_idx + qi * IDX_HEADS * IDX_DIM + lane * 4;
     float score = 0.0f;
 #pragma unroll
@@ -199,6 +203,7 @@ __device__ __forceinline__ void mma_tf32(float* c, const uint32_t* a, const uint
 #endif
 }
 
+template <bool BF>
 __global__ void __launch_bounds__(128) block_scores_tc_kernel(const float* __restrict__ pooled,
                                                               const float* __restrict__ q_idx,
                                                               const int32_t* __restrict__ steps, int64_t nq,
@@ -231,7 +236,7 @@ __global__ void __launch_bounds__(128) block_scores_tc_kernel(const float* __res
         for (int i = t; i < TC_NB * IDX_DIM / 4; i += 128) {
             const int r = i / (IDX_DIM / 4), c = i % (IDX_DIM / 4);
             float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (b0 + r < hi_nbid) v = reinterpret_cast<const float4*>(pooled + (b0 + r) * IDX_DIM)[c];
+            if (b0 + r < hi_nbid) v = pooled_load4<BF>(pooled, (b0 + r) * IDX_DIM + c * 4);
             *reinterpret_cast<float4*>(sK + r * TC_KS + c * 4) = v;
         }
         __syncthreads();
@@ -974,6 +979,7 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __re
 // qsa_block_scores takes it for every call without an active-block count and at most MQ queries: the captured decode
 // window, the uncaptured decode, and prefill's pooled16 call.
 constexpr int MQ = 8;
+template <bool BF>
 __device__ __forceinline__ void block_scores_multi_body(const float* __restrict__ pooled,
                                                         const float* __restrict__ dead,
                                                         const float* __restrict__ q_idx,
@@ -1004,14 +1010,14 @@ __device__ __forceinline__ void block_scores_multi_body(const float* __restrict_
     for (int64_t b = (int64_t) blockIdx.x * SCORE_WARPS + (threadIdx.x >> 5); b <= top && b < max_blocks; b += wstride) {
         // srow.n > 0: each query reads its own sequence's keys; else one set of keys for every query
         const bool own = srow.n > 0;
-        const float4 kp = own ? float4{} : *reinterpret_cast<const float4*>(pooled + b * IDX_DIM + lane * 4);
+        const float4 kp = own ? float4{} : pooled_load4<BF>(pooled, b * IDX_DIM + lane * 4);
         const float4 kd = own ? float4{} : *reinterpret_cast<const float4*>(dead + lane * 4);
         for (int qi = 0; qi < nq; ++qi) {
             const int64_t n_bid = s_nbid[qi];
             if (b > n_bid) continue;
             const float4 k4 = !own ? ((b == n_bid) ? kd : kp)
                             : (b == n_bid) ? *reinterpret_cast<const float4*>(srow.dead[qi] + lane * 4)
-                                           : *reinterpret_cast<const float4*>(srow.pooled[qi] + b * IDX_DIM + lane * 4);
+                                           : pooled_load4<BF>(srow.pooled[qi], b * IDX_DIM + lane * 4);
             const float* q = qs + qi * IDX_HEADS * IDX_DIM + lane * 4;
             float score = 0.0f;
 #pragma unroll
@@ -1030,15 +1036,17 @@ __device__ __forceinline__ void block_scores_multi_body(const float* __restrict_
     }
 }
 
+template <bool BF>
 __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(const float* __restrict__ pooled,
                                                                               const float* __restrict__ dead,
                                                                               const float* __restrict__ q_idx,
                                                                               const int32_t* __restrict__ steps, int nq,
                                                                               int64_t max_blocks, float* __restrict__ out,
                                                                               bool early_exit, QsaScoreRows srow = {}) {
-    block_scores_multi_body(pooled, dead, q_idx, steps, nq, max_blocks, out, early_exit, srow);
+    block_scores_multi_body<BF>(pooled, dead, q_idx, steps, nq, max_blocks, out, early_exit, srow);
 }
 
+template <bool BF>
 __global__ void __launch_bounds__(SCORE_WARPS * 32) batch_scores_kernel(
     DeviceBatchView v, int qi, int begin, int end, const float* queries,
     const int32_t* steps, int64_t max_blocks, float* scores, bool early_exit) {
@@ -1046,7 +1054,7 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) batch_scores_kernel(
     if (!seg) return;
     const auto* q = batch_device_qsa(v, *seg, qi);
     if (!q) return;
-    block_scores_multi_body(q->idx_pooled, q->idx_dead,
+    block_scores_multi_body<BF>(q->idx_pooled, q->idx_dead,
         queries + (size_t)seg->first * IDX_HEADS * IDX_DIM,
         steps + (size_t)seg->first * kStepCount, seg->length, max_blocks,
         scores + (size_t)seg->first * max_blocks, early_exit, QsaScoreRows{});
@@ -1058,6 +1066,7 @@ struct ScoreSlotKeys {
     const float* pooled[MQ];
     const float* dead[MQ];
 };
+template <bool BF>
 __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_slots_kernel(ScoreSlotKeys keys,
                                                                               const float* __restrict__ q_idx,
                                                                               const int32_t* __restrict__ steps,
@@ -1070,9 +1079,9 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_slots_kernel(Sc
 #pragma unroll
     for (unsigned i = 1; i < MQ; ++i)
         if (z == i) { pooled = keys.pooled[i]; dead = keys.dead[i]; }
-    block_scores_multi_body(pooled, dead, q_idx + (size_t) z * IDX_HEADS * IDX_DIM,
-                            steps + (size_t) z * kStepCount, 1, max_blocks, out + (size_t) z * max_blocks, early_exit,
-                            QsaScoreRows{});
+    block_scores_multi_body<BF>(pooled, dead, q_idx + (size_t) z * IDX_HEADS * IDX_DIM,
+                                steps + (size_t) z * kStepCount, 1, max_blocks, out + (size_t) z * max_blocks,
+                                early_exit, QsaScoreRows{});
 }
 
 // QSAROWS (docs/QSAROWS.md, STRATA_QSA_ROWS=1): block_scores_multi_kernel's work for NQ <= 4 queries with less issue
@@ -1962,8 +1971,12 @@ bool qsa_block_scores_slots(const float* const* pooled, const float* const* dead
         keys.pooled[z] = pooled[z];
         keys.dead[z] = dead[z];
     }
-    block_scores_slots_kernel<<<dim3(256, (unsigned) nq), SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(
-        keys, q_idx, steps, max_blocks, scores, scores_early_exit());
+    if (qsa_idx_pooled_bf16())
+        block_scores_slots_kernel<true><<<dim3(256, (unsigned) nq), SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(
+            keys, q_idx, steps, max_blocks, scores, scores_early_exit());
+    else
+        block_scores_slots_kernel<false><<<dim3(256, (unsigned) nq), SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(
+            keys, q_idx, steps, max_blocks, scores, scores_early_exit());
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_slots: %s\n", cudaGetErrorString(e)); std::exit(1); }
     return true;
@@ -2105,8 +2118,12 @@ bool batch_device_scores_supported() {
 }
 void batch_device_scores(DeviceBatchView v, int qi, int begin, int end, const float* queries,
     const int32_t* steps, int64_t max_blocks, float* scores, const QsaShapes&, void* stream) {
-    batch_scores_kernel<<<dim3(256, v.slots), SCORE_WARPS * 32, 0, (cudaStream_t)stream>>>(
-        v, qi, begin, end, queries, steps, max_blocks, scores, scores_early_exit());
+    if (qsa_idx_pooled_bf16())
+        batch_scores_kernel<true><<<dim3(256, v.slots), SCORE_WARPS * 32, 0, (cudaStream_t)stream>>>(
+            v, qi, begin, end, queries, steps, max_blocks, scores, scores_early_exit());
+    else
+        batch_scores_kernel<false><<<dim3(256, v.slots), SCORE_WARPS * 32, 0, (cudaStream_t)stream>>>(
+            v, qi, begin, end, queries, steps, max_blocks, scores, scores_early_exit());
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) {
         std::fprintf(stderr, "batch device scores: %s\n", cudaGetErrorString(error)); std::exit(1);
@@ -2121,11 +2138,13 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         std::exit(1);
     }
     // a block past a query's n_bid returns at once: the grid need only reach the batch's largest n_bid (C-1)
+    // C8-6: a BF16 store takes only the kernels that read it (block_scores_kernel, the multi and tensor-core ones)
+    const bool bf16 = qsa_idx_pooled_bf16();
     if (scores_multi_on() && nq <= MQ && active_blocks <= 0) {   // no active count: decode (captured or not) and prefill's pooled16
         // QSAROWS: STRATA_QSA_ROWS=1 (exactly) takes block_scores_rows_kernel for calls of up to 4 queries - the same bits
         static const bool rows_env = [] { const char* v = std::getenv("STRATA_QSA_ROWS"); return v != nullptr && v[0] == '1' && v[1] == '\0'; }();
         if (rows_env && qsa_block_scores_rows(pooled, dead, q_idx, steps, nq, max_blocks, s, scores, stream)) return;
-        if (scores_halve_on()) {   // Turing: block_scores_halve_kernel, the same bits
+        if (scores_halve_on() && !bf16) {   // Turing: block_scores_halve_kernel, the same bits
             const cudaStream_t st = (cudaStream_t) stream;
             if (nq <= 1) block_scores_halve_kernel<4><<<256, SCORE_WARPS * 32, 0, st>>>(pooled, dead, q_idx, steps, (int) nq, max_blocks, scores);
             else if (nq <= 2) block_scores_halve_kernel<8><<<256, SCORE_WARPS * 32, 0, st>>>(pooled, dead, q_idx, steps, (int) nq, max_blocks, scores);
@@ -2144,8 +2163,12 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
             if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores halve: %s\n", cudaGetErrorString(e)); std::exit(1); }
             return;
         }
-        block_scores_multi_kernel<<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps, (int) nq,
-                                                                                     max_blocks, scores, scores_early_exit());
+        if (bf16)
+            block_scores_multi_kernel<true><<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(
+                pooled, dead, q_idx, steps, (int) nq, max_blocks, scores, scores_early_exit());
+        else
+            block_scores_multi_kernel<false><<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(
+                pooled, dead, q_idx, steps, (int) nq, max_blocks, scores, scores_early_exit());
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores multi: %s\n", cudaGetErrorString(e)); std::exit(1); }
         return;
@@ -2158,7 +2181,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         return value == nullptr ? -1 : (std::atoi(value) == 1 ? 1 : 0);
     }();
     // The bound is the ACTUAL live extent. A reserved 256K context never enables this by itself.
-    if (thread_env != 0 && active_blocks >= 16385 && active_blocks <= max_blocks && nq >= 64 &&
+    if (!bf16 && thread_env != 0 && active_blocks >= 16385 && active_blocks <= max_blocks && nq >= 64 &&
         (scores_thread_arch() == 2 || (thread_env == 1 && scores_thread_arch() == 1))) {
         static thread_local bool logged = false;
         if (!logged && (thread_env == -1 || std::getenv("STRATA_SCORES_THREAD_TRACE"))) {
@@ -2182,7 +2205,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
 #else
     // prompt calls (an active-block count): the thread-per-head kernel, the same bits (opt-in: scores_thread_on); else the
     // warp kernel below
-    if (active_blocks > 0 && scores_thread_on()) {
+    if (active_blocks > 0 && !bf16 && scores_thread_on()) {
         const dim3 tgrid((unsigned) ((reach + TS_BR - 1) / TS_BR), (unsigned) ((nq + TS_Q - 1) / TS_Q));
         block_scores_thread_kernel<<<tgrid, 256, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach,
                                                                              scores);
@@ -2193,8 +2216,12 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
     }
 #endif
     const dim3 grid((unsigned) ((reach + SCORE_WARPS - 1) / SCORE_WARPS), (unsigned) nq);
-    block_scores_kernel<<<grid, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps, max_blocks,
-                                                                              scores);
+    if (bf16)
+        block_scores_kernel<true><<<grid, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps,
+                                                                                    max_blocks, scores);
+    else
+        block_scores_kernel<false><<<grid, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps,
+                                                                                     max_blocks, scores);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
@@ -2202,7 +2229,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
 bool qsa_block_scores_rows(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                            int64_t max_blocks, const QsaShapes& s, float* scores, void* stream) {
     if (nq <= 0) return true;
-    if (nq > 4 || s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R) return false;
+    if (nq > 4 || s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || qsa_idx_pooled_bf16()) return false;
     cudaStream_t st = (cudaStream_t) stream;
     const int n = (int) nq;
     if (n == 1) block_scores_rows_kernel<1><<<256, SCORE_WARPS * 32, 0, st>>>(pooled, dead, q_idx, steps, n, max_blocks, scores);
@@ -2222,8 +2249,12 @@ void qsa_block_scores_rows(const QsaScoreRows& rows, const float* q_idx, const i
         std::exit(1);
     }
     static const bool early = [] { const char* v = std::getenv("STRATA_QSA_EARLY_EXIT"); return v == nullptr || std::atoi(v) != 0; }();
-    block_scores_multi_kernel<<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(nullptr, nullptr, q_idx, steps, (int) nq,
-                                                                                 max_blocks, scores, early, rows);
+    if (qsa_idx_pooled_bf16())
+        block_scores_multi_kernel<true><<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(
+            nullptr, nullptr, q_idx, steps, (int) nq, max_blocks, scores, early, rows);
+    else
+        block_scores_multi_kernel<false><<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(
+            nullptr, nullptr, q_idx, steps, (int) nq, max_blocks, scores, early, rows);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_rows: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
@@ -2232,7 +2263,9 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
                          int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks) {
     if (nq <= 0) return true;
     if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > 65535 * TC_QT) return false;
+    const bool bf16 = qsa_idx_pooled_bf16();   // C8-6: only the TF32 tensor-core kernel reads a BF16 store
 #if defined(__HIPCC__)
+    if (bf16) return false;
     // AMD: the gfx12 (RDNA4) WMMA scorer, opt-in (STRATA_SELECT_WMMA=1): it selects slightly differently from the warp
     // kernel (254/256 queries the same), so the default keeps the warp kernel; every other target keeps it too (false)
     static const bool wmma_on = [] {
@@ -2288,7 +2321,7 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
                 const char* v = std::getenv("STRATA_SELECT_SIMT");
                 return v == nullptr ? 0 : v[0] == '1' ? 1 : v[0] == '2' ? 2 : 0;
             }();
-            if (!simt) return false;
+            if (!simt || bf16) return false;
             const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
             if (simt == 2) {
                 // STRATA_SIMT2_TILE=2: 64 x 64 tiles (measured slower: 400K 3.00 vs 2.82 ms)
@@ -2314,23 +2347,27 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
                                      false);
         }
     }
-    static bool attr[64] = {};   // the shared-memory opt-in is per device (a layer split runs it on several)
+    static bool attr[2][64] = {};   // the shared-memory opt-in is per device (a layer split runs it on several) and kernel
     int adev = 0;
     cudaGetDevice(&adev);
     const int bytes = (TC_QT * TC_QS + TC_NB * TC_KS) * (int) sizeof(float);
-    if (!attr[adev]) {
-        if (cudaFuncSetAttribute(block_scores_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
-            cudaSuccess) {
+    if (!attr[bf16][adev]) {
+        if (cudaFuncSetAttribute(bf16 ? block_scores_tc_kernel<true> : block_scores_tc_kernel<false>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) != cudaSuccess) {
             cudaGetLastError();
             return false;
         }
-        attr[adev] = true;
+        attr[bf16][adev] = true;
     }
     const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
     const int64_t per = (int64_t) TC_NB * TC_ITER;
     const dim3 grid((unsigned) ((reach + per - 1) / per), (unsigned) ((nq + TC_QT - 1) / TC_QT));
-    block_scores_tc_kernel<<<grid, 128, bytes, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach,
-                                                                         scores);
+    if (bf16)
+        block_scores_tc_kernel<true><<<grid, 128, bytes, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks,
+                                                                                  reach, scores);
+    else
+        block_scores_tc_kernel<false><<<grid, 128, bytes, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks,
+                                                                                   reach, scores);
     block_scores_tail_kernel<<<(unsigned) nq, 32, 0, (cudaStream_t) stream>>>(dead, q_idx, steps, max_blocks, scores);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_tc: %s\n", cudaGetErrorString(e)); std::exit(1); }
@@ -3037,7 +3074,7 @@ static void scores_dx_launch(const float* pooled, const float* q_idx, const int3
 static bool qsa_block_scores_dx(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
                                 int64_t nq, int64_t max_blocks, float* scores, void* stream) {
     int sms = 0;
-    if (nq < 1 || nq > MQ || !scores_dx_device(sms)) return false;
+    if (nq < 1 || nq > MQ || qsa_idx_pooled_bf16() || !scores_dx_device(sms)) return false;
     const cudaStream_t st = (cudaStream_t) stream;
     switch (nq) {
         case 1: scores_dx_launch<1>(pooled, q_idx, steps, max_blocks, scores, sms, st); break;

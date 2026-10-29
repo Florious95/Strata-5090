@@ -52,7 +52,7 @@ struct alignas(16) DeviceQsaSlot {
     DeviceQsaPools pools;
     KvHostPools host;
     KvStreamMap map;
-    float *idx_tail = nullptr, *idx_dead = nullptr, *idx_pooled = nullptr;
+    float *idx_tail = nullptr, *idx_dead = nullptr, *idx_pooled = nullptr;   // idx_pooled: FP32 or BF16 (idx_pooled.hpp)
     int32_t* idx_block_pos = nullptr;
     const float *cos_tab = nullptr, *sin_tab = nullptr;
     float* tail_snapshot = nullptr;

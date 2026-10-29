@@ -20,6 +20,7 @@
 
 #include "strata/kernels/native_qsa_score.hpp"
 #include "strata/core/geometry.hpp"
+#include "strata/kernels/idx_pooled.hpp"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cstddef>
@@ -197,6 +198,7 @@ void native_qsa_score(const float* pooled,const float* query,const float* bias,
     if(!stream||s.idx_dim!=D||s.idx_n_head!=HEADS||s.idx_block!=R||s.idx_top_k!=2048||
        max_cells<1||max_cells>INT32_MAX-3||max_blocks!=max_cells/R+1)
         throw std::invalid_argument("native QSA score requires128dim/4heads/4cells/2048budget, exact capacities and explicit stream");
+    if(qsa_idx_pooled_bf16())throw std::invalid_argument("native QSA score reads an FP32 pooled store, not STRATA_IDX_POOLED_BF16's");
     const Span spans[]={{pooled,size_t(max_blocks)*D*4},{query,HEADS*D*4},
         {step,kStepCount*4},{cells,size_t(max_cells)*4},{bias,bias?size_t(max_blocks)*4:0}};
     const int count=bias?5:4;

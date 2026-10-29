@@ -44,6 +44,7 @@
 #include "strata/kernels/qsa.hpp"
 
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/idx_pooled.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/mrope.hpp"
@@ -246,6 +247,8 @@ __global__ void indexer_key_append_kernel(const float* __restrict__ raw, const i
 
 /// One warp per indexer head, one block per pooled row; thread 0 sums the relu'd dots IN HEAD ORDER and maps
 /// the row's score onto its cells.  The reference's Relu is PER HEAD, so the dots cannot be summed first.
+/// BF (C8-6): the pooled store is BF16, each key widened exactly before the same FP64 arithmetic.
+template <bool BF>
 __global__ void qsa_index_kernel(const float* __restrict__ pooled,
                                  const float* __restrict__ q_idx, const float* __restrict__ bias,
                                  int idx_n_head, int idx_dim, long long r,
@@ -266,7 +269,7 @@ __global__ void qsa_index_kernel(const float* __restrict__ pooled,
 
     double acc = 0.0;
     for (int d = lane; d < idx_dim; d += 32)
-        acc = __dadd_rn(acc, __dmul_rn((double) pooled[(size_t) b * idx_dim + d],
+        acc = __dadd_rn(acc, __dmul_rn((double) pooled_load<BF>(pooled, (size_t) b * idx_dim + d),
                                        (double) q_idx[(size_t) wid * idx_dim + d]));
     for (int o = 16; o > 0; o >>= 1) acc = __dadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, o));
     if (lane == 0) s_dot[wid] = acc;
@@ -613,8 +616,12 @@ void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, 
     // THE GRID IS `max_blocks`, A CONSTANT - not this token's `n_bid + 1`.  The kernel returns for
     // `b > n_bid`, so the surplus blocks cost a launch and nothing else.
     const int threads = 32 * (int) s.idx_n_head;
-    qsa_index_kernel<<<(unsigned) max_blocks, threads, 0, (cudaStream_t) stream>>>(
-        pooled, q_idx, bias, (int) s.idx_n_head, (int) s.idx_dim, s.idx_block, step, cell_scores);
+    if (qsa_idx_pooled_bf16())
+        qsa_index_kernel<true><<<(unsigned) max_blocks, threads, 0, (cudaStream_t) stream>>>(
+            pooled, q_idx, bias, (int) s.idx_n_head, (int) s.idx_dim, s.idx_block, step, cell_scores);
+    else
+        qsa_index_kernel<false><<<(unsigned) max_blocks, threads, 0, (cudaStream_t) stream>>>(
+            pooled, q_idx, bias, (int) s.idx_n_head, (int) s.idx_dim, s.idx_block, step, cell_scores);
     check_launch("qsa_index");
     if (stream == nullptr) check_sync("qsa_index");
 }
@@ -726,6 +733,8 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
     if (pos_dev == nullptr) fail("indexer_key_append: pos_dev is null");
     if (b.tail == nullptr || b.dead == nullptr || b.pooled == nullptr || b.block_pos == nullptr)
         fail("indexer_key_append: the indexer buffers are not all set (tail/dead/pooled/block_pos)");
+    // its completion rotation runs in place on the stored row: a BF16 store would round twice
+    if (qsa_idx_pooled_bf16()) fail("indexer_key_append: BF16 pooled keys (STRATA_IDX_POOLED_BF16) need the native indexer");
     const int threads = (int) s.idx_dim;
     const size_t smem = (size_t) s.idx_dim * sizeof(double);
     // **ONE LAUNCH, NO HOST BRANCH ON THE POSITION.**  The completion rotation is inside the kernel now.  The

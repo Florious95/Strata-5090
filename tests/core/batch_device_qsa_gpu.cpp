@@ -3,6 +3,7 @@
 // arithmetic contract. Each selected logical page must equal authoritative Host.
 #include "strata/core/batch_device_layout.hpp"
 #include "strata/kernels/batch_device_ops.hpp"
+#include "strata/kernels/idx_pooled.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/qsa_select.hpp"
@@ -61,7 +62,12 @@ struct Owner {
         q.idx_tail=tail.p;q.idx_dead=dead.p;q.idx_pooled=pooled.p;q.idx_block_pos=idxpos.p;
         q.tail_snapshot=snap.p;q.max_cells=Cells;q.address_epoch=1;q.flags=7;
         uint32_t seed=0x27193+b*1337;
-        initial_pooled.resize(pooled.size);for(auto& f:initial_pooled)f=rf(seed);pooled.upload(initial_pooled);
+        initial_pooled.resize(pooled.size);for(auto& f:initial_pooled)f=rf(seed);
+        if(k::qsa_idx_pooled_bf16()) {   // C8-6: a BF16 store holds BF16 keys (the buffer's first half)
+            std::vector<uint16_t> h(pooled.size);for(auto& x:h)x=k::bf16_from_f32(rf(seed));
+            std::memcpy(initial_pooled.data(),h.data(),h.size()*2);
+        }
+        pooled.upload(initial_pooled);
         initial_dead.resize(128);for(auto& f:initial_dead)f=rf(seed);dead.upload(initial_dead);
     }
     void reset(cudaStream_t stream) {
@@ -259,8 +265,9 @@ void run(int owners,int rows,std::vector<std::vector<std::pair<int,int>>> cases)
     ck(cudaStreamDestroy(stream),"stream destroy");
     require(zero_rows>0&&terminal_rows>0&&resident_rows>0,"boundary and resident fixtures executed");
     for(int w=1;w<=8;++w)require(width_calls[w]>0,"all causal widths executed");
-    std::printf("PASS table Q4 owners=%d rows=%d: %d windows, %zu target + %zu resident-append rows-cut graph families, %d target replays; resident_rows=%d pos0=%d terminal262141=%d; full logical256K, no weights\n",
-        owners,rows,fixtures,graphs.size(),append_graphs.size(),replays,resident_rows,zero_rows,terminal_rows);
+    std::printf("PASS table Q4 owners=%d rows=%d pooled=%s: %d windows, %zu target + %zu resident-append rows-cut graph families, %d target replays; resident_rows=%d pos0=%d terminal262141=%d; full logical256K, no weights\n",
+        owners,rows,k::qsa_idx_pooled_bf16()?"bf16":"fp32",fixtures,graphs.size(),append_graphs.size(),replays,resident_rows,
+        zero_rows,terminal_rows);
     for(int w=1;w<=8;++w)std::printf("width=%d windows=%d\n",w,width_calls[w]);
 }
 int main() {
@@ -277,7 +284,13 @@ int main() {
     run(4,12,{{{0,6},{3,6}},{{3,3},{1,3},{0,3},{2,3}},
         {{1,6},{2,6}},{{2,3},{0,3},{3,3},{1,3}},{{0,4},{2,4},{3,4}},{{3,8},{1,4}},{{2,4},{0,8}}});
     // C8-3: A8 2 rows each, A4 4 each on owners 4..7, A3 5+4+4, A2 6+6, mixed widths, 8+8 and owners past 3
-    run(8,16,{{{7,2},{0,2},{6,2},{1,2},{5,2},{2,2},{4,2},{3,2}},{{4,4},{5,4},{6,4},{7,4}},{{6,5},{2,4},{5,4}},
-        {{1,6},{6,6}},{{5,3},{1,3},{7,2},{0,2},{2,2},{4,2},{6,2}},{{6,8},{3,8}},{{3,4},{6,4},{0,4},{5,4}},
-        {{2,1},{7,1},{0,1},{5,1},{3,1},{6,1},{1,1},{4,1}}});
+    const std::vector<std::vector<std::pair<int,int>>> c8={{{7,2},{0,2},{6,2},{1,2},{5,2},{2,2},{4,2},{3,2}},
+        {{4,4},{5,4},{6,4},{7,4}},{{6,5},{2,4},{5,4}},{{1,6},{6,6}},{{5,3},{1,3},{7,2},{0,2},{2,2},{4,2},{6,2}},
+        {{6,8},{3,8}},{{3,4},{6,4},{0,4},{5,4}},{{2,1},{7,1},{0,1},{5,1},{3,1},{6,1},{1,1},{4,1}}};
+    run(8,16,c8);
+    // C8-6: the same table == legacy contract with the pooled store in BF16 (both sides write and score it through
+    // the same mode-dispatched kernels; idx_pooled_gpu holds BF16 against FP32 itself)
+    k::qsa_set_idx_pooled_bf16(true);
+    run(8,16,c8);
+    k::qsa_set_idx_pooled_bf16(false);
 }
