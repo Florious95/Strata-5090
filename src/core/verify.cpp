@@ -345,6 +345,43 @@ const bool g_coherent = env_on("STRATA_VERIFY_COHERENT");
 const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
 #endif
 const bool g_trace = env_on("STRATA_VERIFY_TRACE");
+const bool g_table_shared_commit = env_on("STRATA_BATCH_TABLE_SHARED_COMMIT");
+const bool g_batch_graph_update = env_on("STRATA_BATCH_GRAPH_UPDATE");
+// STRATA_BATCH_GRAPH_UPDATE: a row-table key that differs from `b` only in the row count (bkey's index 1); the dense
+// boundary and every profile bit are equal.  Whether the topology is the same is cudaGraphExecUpdate's to say.
+bool recyclable_table_key(const std::vector<int>& a, const std::vector<int>& b) {
+    if (a.size() != b.size() || a.size() < 2 || a[0] != -2 || b[0] != -2) return false;
+    for (size_t i = 2; i < a.size(); ++i)
+        if (a[i] != b[i]) return false;
+    return true;
+}
+// STRATA_BATCH_GRAPH_UPDATE: cudaGraphExecUpdate of `old` to `graph`.  0: it took the graph; else the refusal's class,
+// 1 a node (type, function, parameters, attributes), 2 the topology, 3 anything else; `detail` the CUDA result and the
+// failing node's type.
+int exec_update(cudaGraphExec_t old, cudaGraph_t graph, std::string& detail) {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL) && CUDART_VERSION >= 12000
+    cudaGraphExecUpdateResultInfo info{};
+    if (cudaGraphExecUpdate(old, graph, &info) == cudaSuccess) return 0;
+    (void) cudaGetLastError();
+    cudaGraphNodeType type{};
+    const int node = info.errorNode != nullptr && cudaGraphNodeGetType(info.errorNode, &type) == cudaSuccess ? (int) type : -1;
+    (void) cudaGetLastError();
+    detail = "(result=" + std::to_string((int) info.result) + ",node_type=" + std::to_string(node) + ")";
+    switch (info.result) {
+    case cudaGraphExecUpdateErrorNodeTypeChanged:
+    case cudaGraphExecUpdateErrorFunctionChanged:
+    case cudaGraphExecUpdateErrorParametersChanged:
+    case cudaGraphExecUpdateErrorUnsupportedFunctionChange:
+    case cudaGraphExecUpdateErrorAttributesChanged: return 1;
+    case cudaGraphExecUpdateErrorTopologyChanged: return 2;
+    default: return 3;
+    }
+#else
+    (void) old; (void) graph;
+    detail = "(unsupported)";
+    return 3;
+#endif
+}
 const bool g_no_multi_gr = env_on("STRATA_NO_MULTI_GR");   // #783 PR-g: per-token GR reads/writes and generic-T kernels again
 const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: per-token K/V and indexer appends again
 // STRATA_BATCH_SELF_COMMIT=1 (opt-in): a batch window whose rows are each another slot's one token keeps them itself,
@@ -749,6 +786,8 @@ Verifier::~Verifier() {
         if (kv.second) cudaGraphExecDestroy(kv.second);
     for (auto& kv : commit_bm_)
         if (kv.second) cudaGraphExecDestroy(kv.second);
+    if (table_commit_exec_) cudaGraphExecDestroy(table_commit_exec_);
+    if (recycle_exec_) cudaGraphExecDestroy(recycle_exec_);
     if (device_table_arena_) cudaFree(device_table_arena_);
     if (h_window_) cudaFreeHost(h_window_);
     if (h_device_commit_) cudaFreeHost(h_device_commit_);
@@ -4244,7 +4283,12 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
         last_head_ = bm_head_.at(key);
         return true;
     }
+    // STRATA_BATCH_GRAPH_UPDATE: the exec evict_batch_graph kept for this capture; updated below, else destroyed
+    cudaGraphExec_t old = recycle_exec_;
+    recycle_exec_ = nullptr;
+    const Clock::time_point tcapture = Clock::now();
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        if (old) cudaGraphExecDestroy(old);
         err = "verify: begin batch capture failed";
         return false;
     }
@@ -4260,10 +4304,30 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok || ce != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
+        if (old) cudaGraphExecDestroy(old);
         err = !ok ? rerr : std::string("verify: end batch capture: ") + cudaGetErrorString(ce);
         return false;
     }
-    const bool made = instantiate_evicting(ex, graph, bkey(rows, S, hbase), "verify: batch instantiate: ", err);
+    const Clock::time_point texec = Clock::now();
+    bool made = false;
+    std::string exec_note = "instantiated";
+    if (old) {
+        std::string detail;
+        const int refused = exec_update(old, graph, detail);
+        uint64_t* const counter[] = {&graph_update_.success, &graph_update_.failed_nodes, &graph_update_.failed_topology,
+                                     &graph_update_.failed_other};
+        static const char* const outcome[] = {"updated", "update_failed_nodes", "update_failed_topology", "update_failed_other"};
+        ++*counter[refused];
+        exec_note = outcome[refused] + detail;
+        if (refused == 0) {
+            ex = old;
+            made = true;
+        } else {
+            cudaGraphExecDestroy(old);   // before the instantiate: its VRAM is free for the new exec, as without the switch
+        }
+    }
+    if (!made) made = instantiate_evicting(ex, graph, key, "verify: batch instantiate: ", err);
+    const Clock::time_point tdone = Clock::now();
     cudaGraphDestroy(graph);
     if (!made) return false;
     if (cudaGraphUpload(ex, cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess)
@@ -4272,15 +4336,27 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
     for (int t = 0; t < S; ++t) list += (t ? "," : "") + std::to_string(rows[t]);
     bm_head_[key] = record_head_;
     last_head_ = record_head_;
-    std::fprintf(stderr, "strata verify: captured the batch window over slots %s head_type=%d head_wide_active=%d qsa_tile_calls=%d qsa_tile_rows=%d qsa_scalar_rows=%d\n",
+    std::string update_log;   // STRATA_BATCH_GRAPH_UPDATE: this capture's exec and the running counters
+    if (g_batch_graph_update) {
+        const auto us = [](Clock::duration d) { return (long long) std::chrono::duration_cast<std::chrono::microseconds>(d).count(); };
+        char buf[384];
+        std::snprintf(buf, sizeof buf, " rows=%d exec=%s capture_us=%lld exec_us=%lld graph_update_success=%llu "
+                      "graph_update_failed_nodes=%llu graph_update_failed_topology=%llu graph_update_failed_other=%llu "
+                      "graph_recycle_victim_incompatible=%llu", S, exec_note.c_str(), us(texec - tcapture), us(tdone - texec),
+                      (unsigned long long) graph_update_.success, (unsigned long long) graph_update_.failed_nodes,
+                      (unsigned long long) graph_update_.failed_topology, (unsigned long long) graph_update_.failed_other,
+                      (unsigned long long) graph_update_.victim_incompatible);
+        update_log = buf;
+    }
+    std::fprintf(stderr, "strata verify: captured the batch window over slots %s head_type=%d head_wide_active=%d qsa_tile_calls=%d qsa_tile_rows=%d qsa_scalar_rows=%d%s\n",
                  list.c_str(), last_head_.type, (int) last_head_.wide,
-                 last_head_.qsa_tiles, last_head_.qsa_rows, last_head_.qsa_scalar);
+                 last_head_.qsa_tiles, last_head_.qsa_rows, last_head_.qsa_scalar, update_log.c_str());
     return true;
 }
 
 bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::string& err) {
     if (!batch_table_active_ && batch_self_commits(rows, S)) return true;   // the window keeps its rows: no commit graph
-    cudaGraphExec_t& cex = commit_bm_[bkey(rows, S, hbase)];
+    cudaGraphExec_t& cex = batch_commit_exec(bkey(rows, S, hbase));
     if (batch_table_active_) return capture_device_commit(cex, bkey(rows, S, hbase), err);
     if (cex != nullptr) return true;
     using namespace strata::kernels;
@@ -4624,7 +4700,7 @@ bool Verifier::batch_commit_rows(const int* rows, int S, int hbase, const int* k
     return true;
 }
 
-bool Verifier::evict_batch_graph(const std::vector<int>& keep, bool& evicted, std::string& err) {
+bool Verifier::evict_batch_graph(const std::vector<int>& keep, bool& evicted, std::string& err, bool recycle) {
     evicted = false;
     auto old = exec_bm_.end();
     uint64_t oldest = UINT64_MAX;
@@ -4640,7 +4716,15 @@ bool Verifier::evict_batch_graph(const std::vector<int>& keep, bool& evicted, st
         return false;
     }
     const auto old_key = old->first;
-    if (old->second) cudaGraphExecDestroy(old->second);
+    // STRATA_BATCH_GRAPH_UPDATE: the LRU victim itself, never a hotter graph picked for its shape, is kept for
+    // capture_batch's update when its key is `keep`'s family
+    if (recycle && old->second && recyclable_table_key(old_key, keep)) {
+        if (recycle_exec_) cudaGraphExecDestroy(recycle_exec_);
+        recycle_exec_ = old->second;
+    } else {
+        if (recycle && old->second) ++graph_update_.victim_incompatible;
+        if (old->second) cudaGraphExecDestroy(old->second);
+    }
     exec_bm_.erase(old);
     bm_head_.erase(old_key);
     bm_used_.erase(old_key);
@@ -4651,6 +4735,11 @@ bool Verifier::evict_batch_graph(const std::vector<int>& keep, bool& evicted, st
     }
     evicted = true;
     return true;
+}
+
+cudaGraphExec_t& Verifier::batch_commit_exec(const std::vector<int>& key) {
+    if (g_table_shared_commit && !key.empty() && key[0] == -2) return table_commit_exec_;
+    return commit_bm_[key];
 }
 
 bool Verifier::evict_window_graph(int keep_t, bool& evicted, std::string& err) {
@@ -4871,7 +4960,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     if (host_prof_on_) host_prof_.graph_cache_hit = batch_graph_cache_hit_;
     const int64_t hevict = host_stamp_ns();
     if (batch_graph_limit_ > 0 && exec_bm_.find(key) == exec_bm_.end() && exec_bm_.size() >= batch_graph_limit_ &&
-        !evict_batch_graph(key, evicted, err))
+        !evict_batch_graph(key, evicted, err, g_batch_graph_update && batch_table_active_))
         return false;
     host_prof_.evict_ns = host_stamp_ns() - hevict;
     bm_used_[key] = ++bm_tick_;
@@ -5358,7 +5447,7 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
     if (last_row_table_ && !make_device_commit(*h_window_, keep, *h_device_commit_, err)) return false;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (last_row_table_ || !batch_self_commits(last_rows_, S)) {   // (else the window has kept its rows)
-        const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
+        const cudaError_t le = cudaGraphLaunch(batch_commit_exec(bkey(last_rows_, S, row_base_)), cs_);
         if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
         const cudaError_t se = cudaStreamSynchronize(cs_);
         if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
@@ -5405,7 +5494,7 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, base)], cs_);
     if (le == cudaSuccess && (batch_table_active_ || !batch_self_commits(rows, S)))   // (else the window has kept its rows itself)
-        le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
+        le = cudaGraphLaunch(batch_commit_exec(bkey(rows, S, base)), cs_);   // right behind it: every row is kept
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     if (ple_stage())   // the host's side of the commit (the hash's last two tokens)

@@ -1552,6 +1552,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_test(NAME ${_table_test} COMMAND ${_table_test})
       set_tests_properties(${_table_test} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     endforeach()
+    # the same contract with the row table's rows head reduction (STRATA_TABLE_QSA_ROWS=1) against the legacy scores
+    add_test(NAME batch_device_qsa_gpu_table_rows COMMAND batch_device_qsa_gpu)
+    set_tests_properties(batch_device_qsa_gpu_table_rows PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300
+                         ENVIRONMENT STRATA_TABLE_QSA_ROWS=1)
   endif()
   add_executable(qsa_tile_gpu tests/core/qsa_tile_gpu.cpp)
   target_include_directories(qsa_tile_gpu PRIVATE ${_strata_gpu_include_directories})

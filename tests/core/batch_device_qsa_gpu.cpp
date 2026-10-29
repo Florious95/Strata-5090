@@ -160,6 +160,8 @@ int main() {
         std::fprintf(stderr,"SKIP: preserving 8 GiB reserve with 512 MiB fixture allowance\n");return 77;
     }
     require(k::batch_device_scores_supported(),"normal score profile required");
+    const char* table_rows=std::getenv("STRATA_TABLE_QSA_ROWS");
+    require(k::batch_device_scores_rows()==(table_rows&&!std::strcmp(table_rows,"1")),"table scorer honors STRATA_TABLE_QSA_ROWS");
     std::array<std::unique_ptr<Owner>,4> ref,got;
     for(int b=0;b<4;++b){ref[b]=std::make_unique<Owner>(b);got[b]=std::make_unique<Owner>(b);}
     Work a,b;Buffer<float> gamma{128};gamma.upload(std::vector<float>(128,1.0f));
@@ -268,7 +270,8 @@ int main() {
     ck(cudaStreamDestroy(stream),"stream destroy");
     require(zero_rows>0&&terminal_rows>0&&resident_rows>0,"boundary and resident fixtures executed");
     for(int w=1;w<=8;++w)require(width_calls[w]>0,"all causal widths executed");
-    std::printf("PASS table Q4: %d windows, %zu target + %zu resident-append rows-cut graph families, %d target replays; resident_rows=%d pos0=%d terminal262141=%d; full logical256K, no weights\n",
-        fixtures,graphs.size(),append_graphs.size(),replays,resident_rows,zero_rows,terminal_rows);
+    std::printf("PASS table Q4: %d windows, %zu target + %zu resident-append rows-cut graph families, %d target replays; resident_rows=%d pos0=%d terminal262141=%d; full logical256K, no weights; table scores=%s\n",
+        fixtures,graphs.size(),append_graphs.size(),replays,resident_rows,zero_rows,terminal_rows,
+        k::batch_device_scores_rows()?"rows":"multi");
     for(int w=1;w<=8;++w)std::printf("width=%d windows=%d\n",w,width_calls[w]);
 }

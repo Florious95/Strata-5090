@@ -974,6 +974,37 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __re
 // qsa_block_scores takes it for every call without an active-block count and at most MQ queries: the captured decode
 // window, the uncaptured decode, and prefill's pooled16 call.
 constexpr int MQ = 8;
+
+// QSAROWS (docs/QSAROWS.md): the four heads' lane products d[h] of one (block, query) reduced together - reduce-scatter
+// with warp_sum's pairing (xor 16 and 8 leave one head per lane, then 4, 2, 1: six shuffles for the four heads instead
+// of twenty), lane 8h then holds head h's sum and three shuffles bring them to lane 0, which adds the relus in head
+// order.  Every addition is one of block_scores_kernel's warp_sum additions (float add commutes): the same score bits.
+// Warp-uniform call; the returned score is lane 0's.
+__device__ __forceinline__ float rows_head_score(const float (&d)[IDX_HEADS], int lane) {
+    const bool hi16 = (lane & 16) != 0, hi8 = (lane & 8) != 0;
+    // after xor 16 the lane keeps heads {0,1} (bit 4 clear) or {2,3}; after xor 8 one head
+    float r2[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+        r2[i] = (hi16 ? d[i + 2] : d[i]) + __shfl_xor_sync(0xffffffffu, hi16 ? d[i] : d[i + 2], 16);
+    float r = (hi8 ? r2[1] : r2[0]) + __shfl_xor_sync(0xffffffffu, hi8 ? r2[0] : r2[1], 8);
+    r += __shfl_xor_sync(0xffffffffu, r, 4);
+    r += __shfl_xor_sync(0xffffffffu, r, 2);
+    r += __shfl_xor_sync(0xffffffffu, r, 1);
+    const float s1 = __shfl_sync(0xffffffffu, r, 8);
+    const float s2 = __shfl_sync(0xffffffffu, r, 16);
+    const float s3 = __shfl_sync(0xffffffffu, r, 24);
+    float score = 0.0f;
+    score += r > 0.0f ? r : 0.0f;
+    score += s1 > 0.0f ? s1 : 0.0f;
+    score += s2 > 0.0f ? s2 : 0.0f;
+    score += s3 > 0.0f ? s3 : 0.0f;
+    return score;
+}
+
+// kRows (the row table's STRATA_TABLE_QSA_ROWS=1): rows_head_score instead of one butterfly per head; the queries stay
+// in shared memory (a table segment has 1..8 rows, known only on the device), the keys are read as before.
+template <bool kRows = false>
 __device__ __forceinline__ void block_scores_multi_body(const float* __restrict__ pooled,
                                                         const float* __restrict__ dead,
                                                         const float* __restrict__ q_idx,
@@ -1014,13 +1045,23 @@ __device__ __forceinline__ void block_scores_multi_body(const float* __restrict_
                                            : *reinterpret_cast<const float4*>(srow.pooled[qi] + b * IDX_DIM + lane * 4);
             const float* q = qs + qi * IDX_HEADS * IDX_DIM + lane * 4;
             float score = 0.0f;
+            if constexpr (kRows) {
+                float d[IDX_HEADS];
 #pragma unroll
-            for (int h = 0; h < IDX_HEADS; ++h) {
-                const float4 q4 = *reinterpret_cast<const float4*>(q + h * IDX_DIM);
-                float d = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
+                for (int h = 0; h < IDX_HEADS; ++h) {
+                    const float4 q4 = *reinterpret_cast<const float4*>(q + h * IDX_DIM);
+                    d[h] = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
+                }
+                score = rows_head_score(d, lane);
+            } else {
 #pragma unroll
-                for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
-                score += d > 0.0f ? d : 0.0f;
+                for (int h = 0; h < IDX_HEADS; ++h) {
+                    const float4 q4 = *reinterpret_cast<const float4*>(q + h * IDX_DIM);
+                    float d = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
+#pragma unroll
+                    for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
+                    score += d > 0.0f ? d : 0.0f;
+                }
             }
             if (lane == 0) {
                 if (b == n_bid && s_nkv[qi] % R != 0) score += 1e9f;
@@ -1039,6 +1080,7 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(co
     block_scores_multi_body(pooled, dead, q_idx, steps, nq, max_blocks, out, early_exit, srow);
 }
 
+template <bool kRows>
 __global__ void __launch_bounds__(SCORE_WARPS * 32) batch_scores_kernel(
     DeviceBatchView v, int qi, int begin, int end, const float* queries,
     const int32_t* steps, int64_t max_blocks, float* scores, bool early_exit) {
@@ -1046,7 +1088,7 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) batch_scores_kernel(
     if (!seg) return;
     const auto* q = batch_device_qsa(v, *seg, qi);
     if (!q) return;
-    block_scores_multi_body(q->idx_pooled, q->idx_dead,
+    block_scores_multi_body<kRows>(q->idx_pooled, q->idx_dead,
         queries + (size_t)seg->first * IDX_HEADS * IDX_DIM,
         steps + (size_t)seg->first * kStepCount, seg->length, max_blocks,
         scores + (size_t)seg->first * max_blocks, early_exit, QsaScoreRows{});
@@ -1109,7 +1151,6 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_rows_kernel(con
             qr[qi][h] = qi < nq ? *reinterpret_cast<const float4*>(q_idx + qi * IDX_HEADS * IDX_DIM + h * IDX_DIM + lane * 4)
                                 : make_float4(0.f, 0.f, 0.f, 0.f);
     const float4 kd = *reinterpret_cast<const float4*>(dead + lane * 4);
-    const bool hi16 = (lane & 16) != 0, hi8 = (lane & 8) != 0;
     const int64_t wstride = (int64_t) gridDim.x * SCORE_WARPS;
     for (int64_t b = (int64_t) blockIdx.x * SCORE_WARPS + (threadIdx.x >> 5); b <= top && b < max_blocks; b += wstride) {
         const float4 kp = *reinterpret_cast<const float4*>(pooled + b * IDX_DIM + lane * 4);
@@ -1125,25 +1166,8 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_rows_kernel(con
                 const float4 q4 = qr[qi][h];
                 d[h] = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
             }
-            // reduce-scatter: after xor 16 the lane keeps heads {0,1} (bit 4 clear) or {2,3}; after xor 8 one head
-            float r2[2];
-#pragma unroll
-            for (int i = 0; i < 2; ++i)
-                r2[i] = (hi16 ? d[i + 2] : d[i]) + __shfl_xor_sync(0xffffffffu, hi16 ? d[i] : d[i + 2], 16);
-            float r = (hi8 ? r2[1] : r2[0]) + __shfl_xor_sync(0xffffffffu, hi8 ? r2[0] : r2[1], 8);
-            r += __shfl_xor_sync(0xffffffffu, r, 4);
-            r += __shfl_xor_sync(0xffffffffu, r, 2);
-            r += __shfl_xor_sync(0xffffffffu, r, 1);
-            // lane 8h holds head h's full sum: gather to lane 0 and add the relus in head order, as the warp kernel
-            const float s1 = __shfl_sync(0xffffffffu, r, 8);
-            const float s2 = __shfl_sync(0xffffffffu, r, 16);
-            const float s3 = __shfl_sync(0xffffffffu, r, 24);
+            float score = rows_head_score(d, lane);
             if (lane == 0) {
-                float score = 0.0f;
-                score += r > 0.0f ? r : 0.0f;
-                score += s1 > 0.0f ? s1 : 0.0f;
-                score += s2 > 0.0f ? s2 : 0.0f;
-                score += s3 > 0.0f ? s3 : 0.0f;
                 if (b == n_bid && s_nkv[qi] % R != 0) score += 1e9f;
                 out[qi * max_blocks + b] = score;
             }
@@ -2103,10 +2127,27 @@ bool batch_device_scores_supported() {
     const char* rows = std::getenv("STRATA_QSA_ROWS");
     return scores_multi_on() && !scores_halve_on() && !(rows && rows[0] == '1');
 }
+// STRATA_TABLE_QSA_ROWS=1 (exactly, opt-in): the row table's scores with QSAROWS's head reduction, the same bits;
+// grid, table reads and shared-memory queries as before.  Read once: every captured graph has the same kernel.
+bool batch_device_scores_rows() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_TABLE_QSA_ROWS");
+        const bool rows = e != nullptr && e[0] == '1' && e[1] == '\0';
+        if (rows) std::fprintf(stderr, "qsa table scores: rows head reduction (STRATA_TABLE_QSA_ROWS=1)\n");
+        return rows;
+    }();
+    return on;
+}
 void batch_device_scores(DeviceBatchView v, int qi, int begin, int end, const float* queries,
     const int32_t* steps, int64_t max_blocks, float* scores, const QsaShapes&, void* stream) {
-    batch_scores_kernel<<<dim3(256, kDeviceBatchSlots), SCORE_WARPS * 32, 0, (cudaStream_t)stream>>>(
-        v, qi, begin, end, queries, steps, max_blocks, scores, scores_early_exit());
+    const dim3 grid(256, kDeviceBatchSlots);
+    const cudaStream_t st = (cudaStream_t)stream;
+    if (batch_device_scores_rows())
+        batch_scores_kernel<true><<<grid, SCORE_WARPS * 32, 0, st>>>(
+            v, qi, begin, end, queries, steps, max_blocks, scores, scores_early_exit());
+    else
+        batch_scores_kernel<false><<<grid, SCORE_WARPS * 32, 0, st>>>(
+            v, qi, begin, end, queries, steps, max_blocks, scores, scores_early_exit());
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) {
         std::fprintf(stderr, "batch device scores: %s\n", cudaGetErrorString(error)); std::exit(1);

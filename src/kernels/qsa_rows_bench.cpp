@@ -16,8 +16,14 @@
 // --rows: block_scores_rows_kernel (STRATA_QSA_ROWS=1, docs/QSAROWS.md) against the multi kernel, scores and ids bit for
 // bit, and its microseconds beside the reference's.
 //
-//   qsa_rows_bench [--device N] [--iters 100] [--ctx 131072] [--max-context 262144] [--rows] [--no-dense]
-//   exit 0 (77: no GPU; 1: a --rows parity failure)
+// --table: the row table's scorer (batch_device_scores) at the C4 window shapes, one launch per dense group as
+// verify.cpp makes them, against qsa_block_scores per segment (the legacy path) bit for bit, and its microseconds.
+// STRATA_TABLE_QSA_ROWS=1 picks its rows head reduction: compare runs with and without it.
+//
+//   qsa_rows_bench [--device N] [--iters 100] [--ctx 131072] [--max-context 262144] [--rows] [--table] [--no-dense]
+//   exit 0 (77: no GPU; 1: a --rows or --table parity failure)
+#include "strata/core/batch_device_layout.hpp"
+#include "strata/kernels/batch_device_ops.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -105,17 +111,18 @@ struct Table {   // us[T] for T = 1..MAXT
 int main(int argc, char** argv) {
     int device = 0, iters = 100;
     int64_t ctx = 131072, max_ctx = 262144;
-    bool rows = false, dense = true;
+    bool rows = false, table_scores = false, dense = true;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--device") == 0 && i + 1 < argc) device = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) iters = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--ctx") == 0 && i + 1 < argc) ctx = std::atoll(argv[++i]);
         else if (std::strcmp(argv[i], "--max-context") == 0 && i + 1 < argc) max_ctx = std::atoll(argv[++i]);
         else if (std::strcmp(argv[i], "--rows") == 0) rows = true;
+        else if (std::strcmp(argv[i], "--table") == 0) table_scores = true;
         else if (std::strcmp(argv[i], "--no-dense") == 0) dense = false;
         else {
             std::fprintf(stderr, "usage: qsa_rows_bench [--device N] [--iters 100] [--ctx 131072] [--max-context 262144] "
-                                 "[--rows] [--no-dense]\n");
+                                 "[--rows] [--table] [--no-dense]\n");
             return 2;
         }
     }
@@ -342,6 +349,97 @@ int main(int argc, char** argv) {
         t_rows.print("scores  qsa_block_scores_rows");
         ck(cudaFree(scores_b), "free");
         ck(cudaFree(ids_b), "free");
+    }
+    if (table_scores) {
+        // the production shapes at rows 12 / batch-spec 6: A1 (6 rows, and the solo guard's 8), A2, A3, A4; every
+        // owner has its own keys, segment starts differ by 7 cells (tail blocks with and without cells)
+        std::printf("-- row table scores (%s head reduction, STRATA_TABLE_QSA_ROWS=1 for rows): batch_device_scores against "
+                    "qsa_block_scores per segment\n", k::batch_device_scores_rows() ? "rows" : "multi");
+        if (!k::batch_device_scores_supported()) {
+            std::puts("  FAIL: the row table scorer is off in this environment (STRATA_SCORES_MULTI / HALVE / QSA_ROWS)");
+            ok = false;
+        } else {
+            constexpr int TR = k::kDeviceBatchRows;
+            std::vector<float*> opooled{pooled}, odead{dead};
+            for (int o = 1; o < 4; ++o) {
+                std::vector<float> h((size_t) (max_blocks * ID));
+                for (auto& x : h) x = nd(rng) * 0.09f;
+                opooled.push_back(upload(h));
+                h.assign((size_t) ID, 0.0f);
+                for (auto& x : h) x = nd(rng) * 0.09f;
+                odead.push_back(upload(h));
+            }
+            k::DeviceSlotTable ht{};
+            for (int o = 0; o < 4; ++o) {
+                ht.target[o].address_epoch = 1;
+                auto& q4 = ht.qsa[0][o];
+                q4.idx_pooled = opooled[(size_t) o]; q4.idx_dead = odead[(size_t) o]; q4.address_epoch = 1;
+                q4.flags = k::kDeviceQsaQ4 | k::kDeviceQsaRotated | k::kDeviceQsaStreamed;
+            }
+            auto* dtable = upload(std::vector<k::DeviceSlotTable>{ht});
+            auto* depoch = upload(std::vector<uint64_t>{1});
+            auto* dwin = dalloc<k::DeviceWindowLayout>(1);
+            auto* dcommit = dalloc<k::DeviceCommitLayout>(1);
+            auto* dstatus = dalloc<uint32_t>(1);
+            const k::DeviceBatchView view{dtable, dwin, dcommit, depoch, dstatus};
+            std::vector<float> htq((size_t) TR * IQ * ID);
+            for (int t = 0; t < TR; ++t)
+                for (int i = 0; i < IQ * ID; ++i) htq[(size_t) t * IQ * ID + i] = hq0[(size_t) i] + 0.15f * nd(rng);
+            float* tq = upload(htq);
+            int32_t* tsteps = dalloc<int32_t>((size_t) TR * k::kStepCount);
+            float* tscores = dalloc<float>((size_t) TR * max_blocks);
+            float* tref = dalloc<float>((size_t) TR * max_blocks);
+            const std::vector<std::pair<const char*, std::vector<std::pair<int, int>>>> layouts = {
+                {"A1 1x6", {{0, 6}}}, {"A1 1x8", {{1, 8}}}, {"A2 2x4", {{0, 4}, {3, 4}}}, {"A2 2x6", {{0, 6}, {2, 6}}},
+                {"A3 3x4", {{3, 4}, {1, 4}, {0, 4}}}, {"A4 4x3", {{0, 3}, {1, 3}, {2, 3}, {3, 3}}}};
+            for (const auto& [name, layout] : layouts) {
+                int owner[TR] = {}, count = 0;
+                int64_t pos[TR] = {};
+                for (const auto& [o, len] : layout) {
+                    const int64_t p0 = std::min<int64_t>(ctx + 7 * o, max_cells - TR);
+                    for (int j = 0; j < len; ++j, ++count) { owner[count] = o; pos[count] = p0 + j; }
+                }
+                const int cut = strata::core::segment_group_boundary(owner, count, true, true);
+                k::DeviceWindowLayout w;
+                std::string err;
+                if (cut < 0 || !strata::core::make_device_window(owner, pos, count, cut, {1, 1, 1, 1}, {1, 1, 1, 1}, 1, 1, 0, w, err)) {
+                    std::printf("  FAIL %s: no device window (%s)\n", name, err.c_str());
+                    ok = false;
+                    continue;
+                }
+                std::vector<int32_t> hs((size_t) TR * k::kStepCount);
+                for (int r = 0; r < count; ++r) k::qsa_step_fill(hs.data() + (size_t) r * k::kStepCount, pos[r], s);
+                ck(cudaMemcpy(tsteps, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice), "steps");
+                ck(cudaMemcpy(dwin, &w, sizeof w, cudaMemcpyHostToDevice), "window");
+                ck(cudaMemset(dstatus, 0, 4), "status");
+                const int G = cut > 0 ? 2 : 1, bound[3] = {0, cut > 0 ? cut : count, count};
+                auto run = [&] {
+                    for (int g = 0; g < G; ++g)
+                        k::batch_device_scores(view, 0, bound[g], bound[g + 1], tq, tsteps, max_blocks, tscores, s, st);
+                };
+                ck(cudaMemset(tscores, 0xFF, (size_t) TR * max_blocks * 4), "fill");
+                ck(cudaMemset(tref, 0xFF, (size_t) TR * max_blocks * 4), "fill");
+                run();
+                for (uint32_t i = 0; i < w.segments; ++i) {
+                    const auto& sg = w.segment[i];
+                    k::qsa_block_scores(opooled[(size_t) sg.slot], odead[(size_t) sg.slot], tq + (size_t) sg.first * IQ * ID,
+                                        tsteps + (size_t) sg.first * k::kStepCount, sg.length, max_blocks, s,
+                                        tref + (size_t) sg.first * max_blocks, st);
+                }
+                ck(cudaDeviceSynchronize(), "table sync");
+                const uint32_t status = download(dstatus, 1)[0];
+                const std::vector<float> a = download(tref, (size_t) count * max_blocks), b = download(tscores, (size_t) count * max_blocks);
+                const bool same = status == 0 && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+                ok = ok && same;
+                const double us = tm.us(run, iters);
+                std::printf("  %-7s rows %2d groups %d: %8.1f us a layer's scores, %s (status %u)\n", name, count, G, us,
+                            same ? "bit-identical" : "DIFFER", status);
+            }
+            for (int o = 1; o < 4; ++o) { ck(cudaFree(opooled[(size_t) o]), "free"); ck(cudaFree(odead[(size_t) o]), "free"); }
+            for (void* p : {(void*) dtable, (void*) depoch, (void*) dwin, (void*) dcommit, (void*) dstatus, (void*) tq,
+                            (void*) tsteps, (void*) tscores, (void*) tref})
+                ck(cudaFree(p), "free");
+        }
     }
     for (void* p : {(void*) k8, (void*) v8, (void*) k8s, (void*) v8s, (void*) table, (void*) pooled, (void*) dead,
                     (void*) tail, (void*) block_pos, (void*) gamma, (void*) q_idx, (void*) raw, (void*) q, (void*) steps,

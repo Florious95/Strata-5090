@@ -13,6 +13,7 @@ struct BatchGdnShape {
 #if defined(STRATA_GPU_METAL) || defined(STRATA_GPU_SYCL)
 inline bool batch_device_gdn_supported() { return false; }
 inline bool batch_device_scores_supported() { return false; }
+inline bool batch_device_scores_rows() { return false; }
 #define STRATA_UNSUPPORTED_TABLE(name) template <class... A> inline void name(A&&...) { \
     throw std::logic_error("batch row table requires NVIDIA CUDA"); }
 STRATA_UNSUPPORTED_TABLE(batch_device_gdn_conv)
@@ -29,6 +30,7 @@ STRATA_UNSUPPORTED_TABLE(batch_device_attention)
 #else
 bool batch_device_gdn_supported();
 bool batch_device_scores_supported();
+bool batch_device_scores_rows();   ///< STRATA_TABLE_QSA_ROWS=1: batch_device_scores uses the rows head reduction
 void batch_device_gdn_conv(DeviceBatchView v, int begin, int end, int gi, BatchGdnShape g,
                            const float* qkv, const float* weights, float* h, float epsilon, void* stream);
 void batch_device_gdn_step(DeviceBatchView v, int begin, int end, int gi, BatchGdnShape g,

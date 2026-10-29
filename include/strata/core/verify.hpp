@@ -504,6 +504,18 @@ private:
     const int32_t* batch_hist_[kBatchMaxRows] = {};
     int batch_hist_len_[kBatchMaxRows] = {};
     std::map<std::vector<int>, cudaGraphExec_t> exec_bm_, commit_bm_;   ///< full row layout avoids slot-ID collisions
+    // STRATA_BATCH_TABLE_SHARED_COMMIT=1 (opt-in): the row table's commit graph reads only the device table, never the
+    // layout, so one exec serves every table key instead of one identical copy per key in commit_bm_.
+    cudaGraphExec_t table_commit_exec_ = nullptr;
+    cudaGraphExec_t& batch_commit_exec(const std::vector<int>& key);
+    // STRATA_BATCH_GRAPH_UPDATE=1 (opt-in): the global LRU victim, when its table key differs from the incoming one only
+    // in the row count, is kept here instead of destroyed; capture_batch tries cudaGraphExecUpdate on it, else destroys
+    // it before instantiating.  The counters are by cudaGraphExecUpdateResult class.
+    cudaGraphExec_t recycle_exec_ = nullptr;
+    struct GraphUpdateStats {
+        uint64_t success = 0, failed_nodes = 0, failed_topology = 0, failed_other = 0;
+        uint64_t victim_incompatible = 0;   ///< LRU victims destroyed because their key is not the incoming one's family
+    } graph_update_;
     // Cached native GPU dispatch metadata, restored on every graph replay.
     struct HeadDispatch {
         int type = -1; bool wide = false;
@@ -609,7 +621,9 @@ private:
     std::map<std::vector<int>, cudaGraphExec_t> save_bm_, dcommit_bm_;
     bool capture_deferred(const int* rows, int S, int hbase, std::string& err);
     /// Free the graph pair of the least recently used batch layout other than `keep` (`evicted`: there was one).
-    bool evict_batch_graph(const std::vector<int>& keep, bool& evicted, std::string& err);
+    /// `recycle` (STRATA_BATCH_GRAPH_UPDATE): the same victim, but its window exec goes to recycle_exec_ when its table
+    /// key differs from `keep` only in the row count.
+    bool evict_batch_graph(const std::vector<int>& keep, bool& evicted, std::string& err, bool recycle = false);
     /// cudaGraphInstantiate; out of VRAM, batch layouts other than `key` are evicted (LRU) until it fits, and then (a
     /// single-request window, `keep_t` > 0) the graphs of the other window sizes, largest first (#3702): a window size
     /// whose graph does not fit used to end the engine ("verify: instantiate: out of memory"); a freed size is captured

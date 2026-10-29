@@ -62,6 +62,14 @@ per window the second card saves -0.09 ms at T=1 and -0.37 ms at T=4 (8 QSA laye
 layers). End to end on a deterministic 131k bench (forced tokens and window sizes, 1024 tokens, B-A-B): **+3.2% and
 +0.1%** decode tokens/s in the two B arms, the text identical.
 
+## The C4 row table (`STRATA_TABLE_QSA_ROWS=1`)
+
+`STRATA_QSA_ROWS=1` turns the C4 device-row table off. The table has its own switch, `STRATA_TABLE_QSA_ROWS=1`, which
+uses change 2 (the shuffles) inside the table's scorer. Change 1 (queries in registers) is not used there: a table
+segment has 1 to 8 rows and only the GPU knows how many, so the registers for 8 queries would cut occupancy.
+`qsa_rows_bench --table` checks the table's scores against the multi kernel bit for bit at the C4 shapes and times them;
+run it with and without the variable. No 5090 numbers yet.
+
 ## Not done
 
 A multi-row attention kernel (K/V of a cell read once for all the rows that selected it) is possible bit for bit only

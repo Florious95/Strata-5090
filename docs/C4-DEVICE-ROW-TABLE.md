@@ -37,6 +37,22 @@ Device descriptor failures make a consumed window fatal before output collection
 
 The merged controller publishes its complete expert window outside the per-group routing branch. Therefore it must not select the legacy late shared-expert fork: that fork is emitted only by the non-merged publication path. In a one-row table window with shared streaming enabled, skipping the early fork would leave the shared stream outside capture; joining its event can invalidate capture, with the later MoE combine reporting only the previous error. Merged windows now take the existing early-fork path. Non-merged late/early policy and all arithmetic bodies are unchanged. Shared join record/wait failures are checked at their source instead of surfacing at combine. A CPU policy regression covers all eight requested-late / effective-all-resident / merged combinations. The asset-free `batch_shared_stream_gpu` target first requires the old missing-fork topology to reject capture, ends that invalid capture safely, then plans eight production-helper captures and 40 dynamic-value replays across real main/shared streams. It is a dedicated topology gate, not full-model arithmetic or performance qualification.
 
+## Opt-in table scorer and graph-cache switches (not measured yet)
+
+Each is off unless set, read once at startup, and leaves the default path as before. Turn on one at a time.
+
+* `STRATA_TABLE_QSA_ROWS=1` (exactly `1`): the table's QSA block scores reduce the four indexer heads together, as `STRATA_QSA_ROWS` does elsewhere (docs/QSAROWS.md): 9 shuffles per key block and query instead of 20. Same grid, same device table, same FP32 keys and queries, queries still in shared memory (a segment has 1 to 8 rows, known only on the GPU). The scores are meant to be the same bits; `batch_device_qsa_gpu_table_rows` checks it. The engine prints `qsa table scores: rows head reduction` once when it is on. It does not touch Slot Solo windows. `STRATA_QSA_ROWS=1` still turns the table off.
+* `STRATA_BATCH_GRAPH_UPDATE=1`: when the LRU picks a victim to make room, the victim is still the LRU's choice. Only if its key differs from the new key in the row count alone (same dense cut and profile) is its exec kept and `cudaGraphExecUpdate` tried on the new capture. A refused update destroys it first and instantiates as before. Each batch capture's log line then adds `exec=`, `capture_us`, `exec_us` and running totals `graph_update_success`, `graph_update_failed_nodes`, `graph_update_failed_topology`, `graph_update_failed_other`, `graph_recycle_victim_incompatible`; a refusal also names the CUDA result and the failing node type.
+* `STRATA_BATCH_TABLE_SHARED_COMMIT=1`: one commit graph for every table key instead of one copy per key (the table commit reads only the device table).
+
+The last two make the 2 x 2 (shared commit on/off x update on/off). None of these is a claim of speed.
+
+```sh
+cmake --build build --target batch_device_qsa_gpu qsa_rows_bench
+ctest --test-dir build --output-on-failure -R '^batch_device_qsa_gpu(_table_rows)?$'
+build/qsa_rows_bench --table --no-dense; STRATA_TABLE_QSA_ROWS=1 build/qsa_rows_bench --table --no-dense
+```
+
 ## Optional RAM history when reusing an idle slot
 
 `--conversation-cache-mib 0` (or zero cache slots) explicitly disables parked conversation snapshots, not canonical hot-slot state or Host-backed Q4 streaming. Replacing/rewinding an inactive completed slot must then skip optional parking before any pointer/metadata exchange. Existing token IDs and checkpoints remain available to the normal same-owner checkpoint-donor path; normal admission reset/reconstruction evicts them at the appropriate point. BGEN continues to reject active owners. With RAM history enabled, successful full-live snapshot verification and real save-error handling remain strict; this change does not turn enabled-cache failures into success or claim unlimited history retention.
