@@ -269,10 +269,10 @@ uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
 void batch_device_kv_resolve(DeviceBatchView v, int qi, int begin, int end,
     const int32_t* ids, const int32_t* steps, int64_t cap, const QsaShapes& s, void* stream) {
     const auto st = (cudaStream_t)stream;
-    batch_resolve_kernel<<<kDeviceBatchSlots, RT, 0, st>>>(v, qi, begin, end, ids, steps, cap, s.page_size);
+    batch_resolve_kernel<<<v.slots, RT, 0, st>>>(v, qi, begin, end, ids, steps, cap, s.page_size);
     check("batch union resolve");
     const int bytes = s.n_head_kv * s.page_size * kv_q4_bytes_per_head(s.head_dim);
-    batch_copy_kernel<<<dim3(96, kDeviceBatchSlots), 128, 0, st>>>(v, qi, begin, end, bytes);
+    batch_copy_kernel<<<dim3(96, v.slots), 128, 0, st>>>(v, qi, begin, end, bytes);
     check("batch union copy");
 }
 

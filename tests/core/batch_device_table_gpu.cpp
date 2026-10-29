@@ -86,7 +86,7 @@ struct Layout {
     int cut;
     std::vector<std::pair<int, int>> segments; // owner, length, in causal row order
 };
-const std::vector<Layout> layouts = {
+const std::vector<Layout> layouts4 = {
     {"6+6 owners0/3", 6, {{0,6},{3,6}}},
     {"3+3+3+3 owners3/1/0/2", 6, {{3,3},{1,3},{0,3},{2,3}}},
     {"6+6 owners2/1", 6, {{2,6},{1,6}}},
@@ -102,6 +102,21 @@ const std::vector<Layout> layouts = {
     {"solo8 owner2", 0, {{2,8}}},
     {"solo8 owner1", 0, {{1,8}}},
 };
+// C8-3: 8 owners x 16 rows; every 16-row cut-8 window shares one graph across owners and segment counts.
+const std::vector<Layout> layouts8 = {
+    {"2x8 owners7/0/6/1/5/2/4/3", 8, {{7,2},{0,2},{6,2},{1,2},{5,2},{2,2},{4,2},{3,2}}},
+    {"2x8 owners0..7", 8, {{0,2},{1,2},{2,2},{3,2},{4,2},{5,2},{6,2},{7,2}}},
+    {"4x4 owners4/5/6/7", 8, {{4,4},{5,4},{6,4},{7,4}}},
+    {"4x4 owners3/6/0/5", 8, {{3,4},{6,4},{0,4},{5,4}}},
+    {"3+3+2+2+2+2+2 owners5/1/7/0/2/4/6", 8, {{5,3},{1,3},{7,2},{0,2},{2,2},{4,2},{6,2}}},
+    {"8+8 owners6/3", 8, {{6,8},{3,8}}},
+    {"5+4+4 owners6/2/5", 5, {{6,5},{2,4},{5,4}}},
+    {"6+6 owners1/6", 6, {{1,6},{6,6}}},
+    {"6+6 owners7/4", 6, {{7,6},{4,6}}},
+    {"1x8 owners2/7/0/5/3/6/1/4", 4, {{2,1},{7,1},{0,1},{5,1},{3,1},{6,1},{1,1},{4,1}}},
+    {"solo6 owner7", 0, {{7,6}}},
+    {"solo8 owner5", 0, {{5,8}}},
+};
 struct Graph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
@@ -110,17 +125,19 @@ struct Graph {
 };
 
 struct Fixture {
-    static constexpr int rows = 12, layers = 2, guard = 128;
+    static constexpr int layers = 2, guard = 128, max_owners = k::kDeviceBatchSlots;
     static constexpr int hist_floats = k::NG_HIST * k::NG_HC_DIM;
     static constexpr uint64_t table_epoch = 997;
+    const int owners, rows;   // C4 (4, 12) or C8 (8, 16)
+    const std::vector<Layout>& layouts;
     const int hk, hv, channels, value_dim;
     const int64_t state_floats, conv_offset, state_stride;
     const k::BatchGdnShape shape;
-    std::array<std::unique_ptr<Buffer<float>>, 4> reference, candidate, ref_ple, new_ple;
-    std::array<std::vector<float>, 4> initial, ple_initial;
+    std::array<std::unique_ptr<Buffer<float>>, max_owners> reference, candidate, ref_ple, new_ple;
+    std::array<std::vector<float>, max_owners> initial, ple_initial;
     Buffer<float> weights, gamma, qkv, gate, beta, z, normalized;
     Buffer<float> ref_h, new_h, ref_y, new_y, ref_snap, new_snap;
-    Buffer<int32_t> keeps{4};
+    Buffer<int32_t> keeps{max_owners};
     Buffer<k::DeviceSlotTable> table{1};
     Buffer<k::DeviceWindowLayout> window{1};
     Buffer<k::DeviceCommitLayout> commit{1};
@@ -134,11 +151,12 @@ struct Fixture {
     std::map<std::pair<int,int>, std::unique_ptr<Graph>> targets;
     std::unique_ptr<Graph> commit_graph;
     uint64_t sequence = 0;
-    std::array<uint64_t, 4> owner_epochs{101,103,107,109};
+    c::DeviceOwnerWords owner_epochs{101,103,107,109,113,127,131,137};
     size_t target_launches = 0;
 
-    Fixture(int key_heads, int value_heads)
-        : hk(key_heads), hv(value_heads), channels((2*hk+hv)*128), value_dim(hv*128),
+    Fixture(int key_heads, int value_heads, int owner_count, int row_count)
+        : owners(owner_count), rows(row_count), layouts(owner_count == 8 ? layouts8 : layouts4),
+          hk(key_heads), hv(value_heads), channels((2*hk+hv)*128), value_dim(hv*128),
           state_floats(int64_t(128)*hv*128), conv_offset(state_floats + guard),
           state_stride(conv_offset + 3*channels + guard),
           shape{channels,hk,hv,state_stride,conv_offset},
@@ -152,8 +170,9 @@ struct Fixture {
         ck(cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking), "side stream");
         ck(cudaEventCreateWithFlags(&fork, cudaEventDisableTiming), "fork event");
         ck(cudaEventCreateWithFlags(&join, cudaEventDisableTiming), "join event");
+        require(k::device_batch_geometry(owners,rows),"fixture geometry");
         k::DeviceSlotTable host_table{};
-        for (int b = 0; b < 4; ++b) {
+        for (int b = 0; b < owners; ++b) {
             const size_t n = 2*guard + layers*state_stride;
             reference[b] = std::make_unique<Buffer<float>>(n);
             candidate[b] = std::make_unique<Buffer<float>>(n);
@@ -165,7 +184,7 @@ struct Fixture {
             owner.max_cells = 262144; owner.address_epoch = owner_epochs[b];
         }
         table.upload({host_table}); epoch.upload({table_epoch});
-        view = {table.p,window.p,commit.p,epoch.p,status.device};
+        view = {table.p,window.p,commit.p,epoch.p,status.device,owners,rows};
     }
     ~Fixture() {
         // Captured arguments and staging outlive every graph using them.
@@ -176,8 +195,8 @@ struct Fixture {
     float* state(int b, int gi) { return reference[b]->p+guard+gi*state_stride; }
     float* history(int b) { return ref_ple[b]->p+guard; }
     void reset(const Layout& layout, int prefix_pattern) {
-        int ids[rows] = {}, accepted[4] = {}; int64_t positions[rows] = {};
-        bool active[4] = {}; int n = 0, segment_index = 0;
+        int ids[k::kDeviceBatchRows] = {}, accepted[max_owners] = {}; int64_t positions[k::kDeviceBatchRows] = {};
+        bool active[max_owners] = {}; int n = 0, segment_index = 0;
         for (auto [owner, length] : layout.segments) {
             active[owner] = true;
             int keep = 1;
@@ -191,15 +210,17 @@ struct Fixture {
             }
         }
         ++sequence;
-        std::array<uint64_t,4> generations{sequence+11,sequence+23,sequence+37,sequence+53};
+        c::DeviceOwnerWords generations{sequence+11,sequence+23,sequence+37,sequence+53,
+                                        sequence+61,sequence+71,sequence+83,sequence+97};
         std::string error;
         require(c::make_device_window(ids,positions,n,layout.cut,generations,owner_epochs,
-                                     sequence,table_epoch,17,*staged_window.host,error), error.c_str());
-        require(c::make_device_commit(*staged_window.host,accepted,*staged_commit.host,error), error.c_str());
-        keeps.upload({accepted[0],accepted[1],accepted[2],accepted[3]});
+                                     sequence,table_epoch,17,*staged_window.host,error,owners,rows), error.c_str());
+        require(c::make_device_commit(*staged_window.host,accepted,*staged_commit.host,error,owners,rows),
+                error.c_str());
+        keeps.upload(std::vector<int32_t>(accepted,accepted+max_owners));
         // Inactive mutable arenas contain NaN poison, rather than plausible
         // zeros. Guard bands include the gap before/after each layer's history.
-        for (int b = 0; b < 4; ++b) {
+        for (int b = 0; b < owners; ++b) {
             initial[b].resize(reference[b]->n);
             ple_initial[b].resize(ref_ple[b]->n);
             std::memset(initial[b].data(),0xff,initial[b].size()*sizeof(float));
@@ -315,7 +336,7 @@ struct Fixture {
             for (size_t i = size_t(gi)*rows*value_dim;
                  i < (size_t(gi)*rows+staged_window.host->rows)*value_dim; ++i)
                 require(std::isfinite(y[i]),"nonfinite GDN target");
-        for (int b = 0; b < 4; ++b) {
+        for (int b = 0; b < owners; ++b) {
             equal(reference[b]->download(),initial[b],"legacy verify mutated GDN state");
             equal(candidate[b]->download(),initial[b],"table verify mutated GDN state");
             equal(*ref_ple[b],*new_ple[b],"PLE forward/inactive-owner guards");
@@ -326,7 +347,7 @@ struct Fixture {
         const auto& w = *staged_window.host;
         const auto norm = normalized.download();
         const auto snapshots = new_snap.download();
-        for (int b = 0; b < 4; ++b) {
+        for (int b = 0; b < owners; ++b) {
             auto expected = ple_initial[b];
             for (uint32_t si = 0; si < w.segments; ++si) {
                 const auto& seg = w.segment[si]; if (seg.slot != b) continue;
@@ -348,15 +369,15 @@ struct Fixture {
         }
     }
     void reject_stale_commit() {
-        std::array<std::vector<float>,4> before, ple_before;
-        for (int b = 0; b < 4; ++b) {
+        std::array<std::vector<float>,max_owners> before, ple_before;
+        for (int b = 0; b < owners; ++b) {
             before[b] = candidate[b]->download(); ple_before[b] = new_ple[b]->download();
         }
         const auto valid = *staged_commit.host;
         ++staged_commit.host->sequence;
         launch(get_commit_graph(),"stale commit");
         require(*status.host == k::kBatchBadCommit,"stale commit must fail closed");
-        for (int b = 0; b < 4; ++b) {
+        for (int b = 0; b < owners; ++b) {
             equal(candidate[b]->download(),before[b],"stale commit wrote GDN");
             equal(new_ple[b]->download(),ple_before[b],"stale commit wrote PLE");
         }
@@ -381,26 +402,33 @@ struct Fixture {
     }
     void run() {
         for (const auto& layout : layouts) for (int pattern = 0; pattern < 4; ++pattern) {
-            std::snprintf(context,sizeof(context),"hk=%d hv=%d layout=%s prefix=%d",
-                          hk,hv,layout.name,pattern);
+            std::snprintf(context,sizeof(context),"owners=%d rows=%d hk=%d hv=%d layout=%s prefix=%d",
+                          owners,rows,hk,hv,layout.name,pattern);
             reset(layout,pattern); legacy_target();
             auto& graph = target_graph(); launch(graph,"candidate target"); ++target_launches;
             check_target();
             if (pattern == 0) reject_stale_commit();
             legacy_commit(); launch(get_commit_graph(),"candidate accepted-prefix commit");
             require(*status.host == 0,"accepted-prefix descriptor status");
-            for (int b = 0; b < 4; ++b) {
+            for (int b = 0; b < owners; ++b) {
                 equal(*reference[b],*candidate[b],"GDN accepted-prefix state/history/layer guards");
                 equal(*ref_ple[b],*new_ple[b],"PLE accepted-prefix/inactive-owner guards");
             }
             equal(ref_y,new_y,"commit must not overwrite target outputs");
             check_ple_oracle(true); ++cases;
         }
-        require(targets.size() == 4,"expected only R12/cut6, R12/cut8, R6/cut0, R8/cut0");
-        require(targets.at({12,6})->launches == 20,"R12/cut6 must reuse one graph across nseg/owners");
-        require(targets.at({12,8})->launches == 20,"R12/cut8 must reuse one graph across nseg/owners");
+        if (owners == 4) {
+            require(targets.size() == 4,"expected only R12/cut6, R12/cut8, R6/cut0, R8/cut0");
+            require(targets.at({12,6})->launches == 20,"R12/cut6 must reuse one graph across nseg/owners");
+            require(targets.at({12,8})->launches == 20,"R12/cut8 must reuse one graph across nseg/owners");
+        } else {
+            require(targets.size() == 6,"expected only R16/cut8, R13/cut5, R12/cut6, R8/cut4, R6/cut0, R8/cut0");
+            require(targets.at({16,8})->launches == 24,"R16/cut8 must reuse one graph across nseg 2..8 and owners 0..7");
+            require(targets.at({12,6})->launches == 8,"R12/cut6 must reuse one graph across owners");
+        }
         require(target_launches == layouts.size()*4,"target replay count");
-        std::printf("geometry hk=%d hv=%d: %zu target graphs, one fixed-four-segment commit graph\n",hk,hv,targets.size());
+        std::printf("geometry owners=%d rows=%d hk=%d hv=%d: %zu target graphs, one fixed-%d-segment commit graph\n",
+                    owners,rows,hk,hv,targets.size(),owners);
         for (const auto& [key,g] : targets)
             std::printf("  R=%d cut=%d nodes=%zu launches=%zu\n",key.first,key.second,g->nodes,g->launches);
     }
@@ -420,10 +448,12 @@ int main() {
     if (free < (8ull<<30)+(256ull<<20)) {
         std::fprintf(stderr,"SKIP: preserving 8 GiB reserve with 256 MiB fixture allowance\n"); return 77;
     }
-    { Fixture small(2,4); small.run(); }
-    { Fixture production(16,48); production.run(); }
+    { Fixture small(2,4,4,12); small.run(); }
+    { Fixture production(16,48,4,12); production.run(); }
+    { Fixture small8(2,4,8,16); small8.run(); }
+    { Fixture production8(16,48,8,16); production8.run(); }
     std::printf("PASS: %zu GDN/PLE fixtures, %zu stale commits rejected, %zu bitwise region comparisons; "
-                "actual 16/48-head GDN, 2 layers, 12-row stride, fork/join cached cross-owner/nseg replay\n",
+                "actual 16/48-head GDN, 2 layers, C4 12-row and C8 16-row strides, fork/join cached cross-owner/nseg replay\n",
                 cases,rejected_commits,comparisons);
     std::printf("NOT COVERED: QSA Q4 append/Host/pool, indexer tail/dead/pooled, scores/IDs, "
                 "union map, streamed 5120-slot attention, full-model sampling or performance\n");

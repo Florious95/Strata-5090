@@ -44,7 +44,7 @@ struct Host {
     ~Host(){cudaFreeHost(p);} Host(const Host&)=delete;
 };
 float rf(uint32_t& s){s^=s<<13;s^=s>>17;s^=s<<5;return float(int32_t(s))/2147483648.0f;}
-constexpr int Cells=262144, Slots=5120, Blocks=Cells/4, Rows=12, PBytes=4*2*144;
+constexpr int Cells=262144, Slots=5120, Blocks=Cells/4, Rows=k::kDeviceBatchRows, PBytes=4*2*144;
 const k::QsaShapes Shape=k::qsa_real_shapes();
 const int Cap=(int)k::qsa_selection_width(k::kTopkMaxCells,Shape), MaxBlocks=Blocks+2;
 const size_t Stride=k::qsa_decode_attn_scratch_floats(Cap,Shape);
@@ -116,7 +116,8 @@ template<class T> void equal(const Buffer<T>& a,const Buffer<T>& b,const char* n
         std::fprintf(stderr,"bit mismatch %s element=%zu\n",name,i);std::exit(1);
     }
 }
-void legacy_target(std::array<std::unique_ptr<Owner>,4>& owners,Work& w,const k::DeviceWindowLayout& d,
+using Owners=std::array<std::unique_ptr<Owner>,k::kDeviceBatchSlots>;
+void legacy_target(Owners& owners,Work& w,const k::DeviceWindowLayout& d,
                    Buffer<float>& gamma,const k::RopeScaling& rope,cudaStream_t stream) {
     for(uint32_t i=0;i<d.segments;++i) {
         const auto&s=d.segment[i];auto&o=*owners[s.slot];
@@ -149,29 +150,18 @@ void table_target(k::DeviceBatchView view,Work& w,int rows,int cut,Buffer<float>
         k::batch_device_attention(view,0,a,b,w.query.p,w.ids.p,w.steps.p,Cap,Shape,w.scratch.p,w.out.p,stream);
     }
 }
-int main() {
-#if defined(STRATA_USE_HIP) || defined(STRATA_GPU_METAL)
-    return 77;
-#endif
-    int devices=0;
-    if(cudaGetDeviceCount(&devices)!=cudaSuccess || devices<1) return 77;
-    size_t free_bytes=0,total_bytes=0;ck(cudaMemGetInfo(&free_bytes,&total_bytes),"memory info");
-    if(free_bytes<(8ull<<30)+(512ull<<20)) {
-        std::fprintf(stderr,"SKIP: preserving 8 GiB reserve with 512 MiB fixture allowance\n");return 77;
-    }
-    require(k::batch_device_scores_supported(),"normal score profile required");
-    std::array<std::unique_ptr<Owner>,4> ref,got;
-    for(int b=0;b<4;++b){ref[b]=std::make_unique<Owner>(b);got[b]=std::make_unique<Owner>(b);}
+// C4 (4 owners, 12 rows) or C8-3 (8 owners, 16 rows): the same production ABI and kernels.
+void run(int owners,int rows,std::vector<std::vector<std::pair<int,int>>> cases) {
+    Owners ref,got;
+    for(int b=0;b<owners;++b){ref[b]=std::make_unique<Owner>(b);got[b]=std::make_unique<Owner>(b);}
     Work a,b;Buffer<float> gamma{128};gamma.upload(std::vector<float>(128,1.0f));
     Buffer<k::DeviceSlotTable> table{1};Buffer<k::DeviceWindowLayout> window{1};
     Buffer<k::DeviceCommitLayout> commit{1};Buffer<uint64_t> epoch{1};Buffer<uint32_t> status{1};epoch.object(1);
-    k::DeviceSlotTable host{};for(int s=0;s<4;++s){host.target[s].address_epoch=1;host.qsa[0][s]=got[s]->q;}table.object(host);
-    k::DeviceBatchView view{table.p,window.p,commit.p,epoch.p,status.p};
+    k::DeviceSlotTable host{};for(int s=0;s<owners;++s){host.target[s].address_epoch=1;host.qsa[0][s]=got[s]->q;}table.object(host);
+    k::DeviceBatchView view{table.p,window.p,commit.p,epoch.p,status.p,owners,rows};
     cudaStream_t stream{};ck(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking),"stream");
     const k::RopeScaling rope{};
-    std::vector<std::vector<std::pair<int,int>>> cases={{{0,6},{3,6}},{{3,3},{1,3},{0,3},{2,3}},
-        {{1,6},{2,6}},{{2,3},{0,3},{3,3},{1,3}},{{0,4},{2,4},{3,4}},{{3,8},{1,4}},{{2,4},{0,8}}};
-    for(int width=1;width<=8;++width) cases.push_back({{width%4,width}});
+    for(int width=1;width<=8;++width) cases.push_back({{width%owners,width}});
     Buffer<int32_t> warm_ids{8},warm_steps{k::kStepCount};
     std::map<std::pair<int,int>,cudaGraphExec_t> graphs,append_graphs;
     int fixtures=0,replays=0,resident_rows=0,zero_rows=0,terminal_rows=0,width_calls[9]{};
@@ -180,7 +170,7 @@ int main() {
         ck(cudaStreamEndCapture(stream,&raw),"end capture");ck(cudaGraphInstantiate(&graph,raw,0),"instantiate");ck(cudaGraphDestroy(raw),"graph destroy");
     };
     for(int mode=0;mode<5;++mode)for(const auto& layout:cases) {
-        int owner[Rows]{};int64_t positions[Rows]{};int count=0,keep[4]{};
+        int owner[Rows]{};int64_t positions[Rows]{};int count=0,keep[k::kDeviceBatchSlots]{};
         for(const auto& [slot,len]:layout) {
             const int start=mode==0?0:mode==1?31+slot*7:mode==2?2051-len:
                             mode==3?258000+slot*17:262142-len;
@@ -188,7 +178,7 @@ int main() {
         }
         const int cut=c::segment_group_boundary(owner,count,true,true);
         const auto key=std::make_pair(count,cut);
-        for(int s=0;s<4;++s){ref[s]->reset(stream);got[s]->reset(stream);}
+        for(int s=0;s<owners;++s){ref[s]->reset(stream);got[s]->reset(stream);}
         ck(cudaDeviceSynchronize(),"independent fixture reset");
         // A second window retains the first window's committed state and map.
         // Near-end cases stop before a follow could exceed the logical capacity.
@@ -196,9 +186,10 @@ int main() {
             std::vector<int32_t> steps(Rows*k::kStepCount);
             for(int r=0;r<count;++r)k::qsa_step_fill(steps.data()+r*k::kStepCount,positions[r],Shape);
             k::DeviceWindowLayout d;std::string error;
-            require(c::make_device_window(owner,positions,count,cut,{1,2,3,4},{1,1,1,1},fixtures+1,1,1,d,error),error.c_str());
+            require(c::make_device_window(owner,positions,count,cut,{1,2,3,4,5,6,7,8},{1,1,1,1,1,1,1,1},fixtures+1,1,1,d,
+                                          error,owners,rows),error.c_str());
             for(uint32_t i=0;i<d.segments;++i)keep[d.segment[i].slot]=1+(fixtures+i)%d.segment[i].length;
-            k::DeviceCommitLayout cd;require(c::make_device_commit(d,keep,cd,error),error.c_str());
+            k::DeviceCommitLayout cd;require(c::make_device_commit(d,keep,cd,error,owners,rows),error.c_str());
             window.object(d);commit.object(cd);status.zero();a.inputs(0x1234+fixtures,steps);b.inputs(0x1234+fixtures,steps);
             ck(cudaDeviceSynchronize(),"descriptor and input ready");
             if(phase) {
@@ -235,7 +226,7 @@ int main() {
             const auto result=b.out.download();for(int i=0;i<count*24*256;++i)require(std::isfinite(result[i]),"finite attention");
             const auto ids=b.ids.download();
             for(uint32_t i=0;i<d.segments;++i){ref[d.segment[i].slot]->check_pages(ids,steps,d.segment[i]);got[d.segment[i].slot]->check_pages(ids,steps,d.segment[i]);}
-            for(int s=0;s<4;++s) {
+            for(int s=0;s<owners;++s) {
                 ref[s]->check_map();got[s]->check_map();
                 const auto x=ref[s]->ctl.download(),y=got[s]->ctl.download();
                 require(x[0]==y[0] && x[2]==y[2] && x[3]==0 && y[3]==0,"resolver epoch/misses/no overflow");
@@ -253,7 +244,7 @@ int main() {
             }
             k::batch_device_indexer(view,0,0,count,b.raw.p,b.steps.p,gamma.p,1e-6f,Shape,rope,true,stream);
             ck(cudaStreamSynchronize(stream),"commit sync");require(status.download()[0]==0,"commit status");
-            for(int s=0;s<4;++s){equal(ref[s]->tail,got[s]->tail,"commit tail owner");equal(ref[s]->dead,got[s]->dead,"commit dead owner");equal(ref[s]->pooled,got[s]->pooled,"commit pooled owner");equal(ref[s]->idxpos,got[s]->idxpos,"commit block position owner");}
+            for(int s=0;s<owners;++s){equal(ref[s]->tail,got[s]->tail,"commit tail owner");equal(ref[s]->dead,got[s]->dead,"commit dead owner");equal(ref[s]->pooled,got[s]->pooled,"commit pooled owner");equal(ref[s]->idxpos,got[s]->idxpos,"commit block position owner");}
             for(uint32_t i=0;i<d.segments;++i) {
                 const auto& s=d.segment[i];++width_calls[s.length];
                 for(int r=s.first;r<s.first+s.length;++r){zero_rows+=positions[r]==0;terminal_rows+=positions[r]==262141;}
@@ -268,7 +259,25 @@ int main() {
     ck(cudaStreamDestroy(stream),"stream destroy");
     require(zero_rows>0&&terminal_rows>0&&resident_rows>0,"boundary and resident fixtures executed");
     for(int w=1;w<=8;++w)require(width_calls[w]>0,"all causal widths executed");
-    std::printf("PASS table Q4: %d windows, %zu target + %zu resident-append rows-cut graph families, %d target replays; resident_rows=%d pos0=%d terminal262141=%d; full logical256K, no weights\n",
-        fixtures,graphs.size(),append_graphs.size(),replays,resident_rows,zero_rows,terminal_rows);
+    std::printf("PASS table Q4 owners=%d rows=%d: %d windows, %zu target + %zu resident-append rows-cut graph families, %d target replays; resident_rows=%d pos0=%d terminal262141=%d; full logical256K, no weights\n",
+        owners,rows,fixtures,graphs.size(),append_graphs.size(),replays,resident_rows,zero_rows,terminal_rows);
     for(int w=1;w<=8;++w)std::printf("width=%d windows=%d\n",w,width_calls[w]);
+}
+int main() {
+#if defined(STRATA_USE_HIP) || defined(STRATA_GPU_METAL)
+    return 77;
+#endif
+    int devices=0;
+    if(cudaGetDeviceCount(&devices)!=cudaSuccess || devices<1) return 77;
+    size_t free_bytes=0,total_bytes=0;ck(cudaMemGetInfo(&free_bytes,&total_bytes),"memory info");
+    if(free_bytes<(8ull<<30)+(1024ull<<20)) {
+        std::fprintf(stderr,"SKIP: preserving 8 GiB reserve with 1 GiB fixture allowance\n");return 77;
+    }
+    require(k::batch_device_scores_supported(),"normal score profile required");
+    run(4,12,{{{0,6},{3,6}},{{3,3},{1,3},{0,3},{2,3}},
+        {{1,6},{2,6}},{{2,3},{0,3},{3,3},{1,3}},{{0,4},{2,4},{3,4}},{{3,8},{1,4}},{{2,4},{0,8}}});
+    // C8-3: A8 2 rows each, A4 4 each on owners 4..7, A3 5+4+4, A2 6+6, mixed widths, 8+8 and owners past 3
+    run(8,16,{{{7,2},{0,2},{6,2},{1,2},{5,2},{2,2},{4,2},{3,2}},{{4,4},{5,4},{6,4},{7,4}},{{6,5},{2,4},{5,4}},
+        {{1,6},{6,6}},{{5,3},{1,3},{7,2},{0,2},{2,2},{4,2},{6,2}},{{6,8},{3,8}},{{3,4},{6,4},{0,4},{5,4}},
+        {{2,1},{7,1},{0,1},{5,1},{3,1},{6,1},{1,1},{4,1}}});
 }

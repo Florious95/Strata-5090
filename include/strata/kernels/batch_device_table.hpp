@@ -1,7 +1,10 @@
 #pragma once
 
-// Non-owning C4 ABI: canonical state stays in its original slot. Static tables
+// Non-owning C4/C8 ABI: canonical state stays in its original slot. Static tables
 // and pinned window/commit staging have fixed addresses for the verifier lifetime.
+// C8-3: the arrays hold C8 (8 owners x 16 rows); the view carries the process's
+// owner count and row capacity, and every grid is sized by the owner count, so a
+// C4 table launches exactly the CTAs it did when the ABI was C4-only.
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include <cstddef>
@@ -12,7 +15,11 @@
 #endif
 
 namespace strata::kernels {
-inline constexpr int kDeviceBatchSlots = 4, kDeviceBatchRows = 12, kDeviceBatchQsaLayers = 12;
+inline constexpr int kDeviceBatchSlots = 8, kDeviceBatchRows = 16, kDeviceBatchQsaLayers = 12;
+// (owners, row capacity): C4 rows12 or C8 rows16, two <=8-row dense groups either way.
+inline constexpr bool device_batch_geometry(int slots, int rows) {
+    return (slots == 4 && rows == 12) || (slots == 8 && rows == 16);
+}
 
 struct alignas(16) DeviceTargetSlot {
     float* gdn_base = nullptr;
@@ -79,6 +86,7 @@ struct DeviceBatchView {
     const DeviceCommitLayout* commit = nullptr;
     const uint64_t* table_epoch = nullptr;
     uint32_t* status = nullptr; // separate mapped word; nonzero makes the window fatal
+    int32_t slots = 4, rows = 12; // owners in the table and the window row capacity (device_batch_geometry)
 };
 
 enum DeviceBatchError : uint32_t {
@@ -89,10 +97,11 @@ enum DeviceBatchError : uint32_t {
 static_assert(sizeof(void*) == 8, "device table ABI requires 64-bit pointers");
 static_assert(sizeof(DeviceTargetSlot) == 48 && sizeof(DeviceQsaSlot) == 288);
 static_assert(sizeof(WindowRow) == 16 && sizeof(WindowSegment) == 32);
-static_assert(sizeof(DeviceSlotTable) == 14016 && sizeof(DeviceWindowLayout) == 352 && sizeof(DeviceCommitLayout) == 32);
-static_assert(sizeof(DeviceSlotTable) + sizeof(DeviceWindowLayout) + sizeof(DeviceCommitLayout) == 14400);
+static_assert(sizeof(DeviceSlotTable) == 28032 && sizeof(DeviceWindowLayout) == 544 && sizeof(DeviceCommitLayout) == 48);
+inline constexpr size_t kDeviceBatchAbiBytes = sizeof(DeviceSlotTable) + sizeof(DeviceWindowLayout) + sizeof(DeviceCommitLayout);
+static_assert(kDeviceBatchAbiBytes == 28624 && kDeviceBatchAbiBytes % 16 == 0);
 static_assert(offsetof(WindowSegment, owner_address_epoch) == 24);
-static_assert(offsetof(DeviceWindowLayout, row) == 32 && offsetof(DeviceWindowLayout, segment) == 224);
+static_assert(offsetof(DeviceWindowLayout, row) == 32 && offsetof(DeviceWindowLayout, segment) == 288);
 static_assert(std::is_standard_layout_v<DeviceSlotTable> && std::is_trivially_copyable_v<DeviceSlotTable>);
 static_assert(std::is_standard_layout_v<DeviceWindowLayout> && std::is_trivially_copyable_v<DeviceWindowLayout>);
 static_assert(std::is_standard_layout_v<DeviceCommitLayout> && std::is_trivially_copyable_v<DeviceCommitLayout>);
@@ -104,9 +113,10 @@ __device__ inline void batch_device_fail(const DeviceBatchView& v, uint32_t erro
 // Every decision is CTA-uniform. Inactive segments are no-ops, NOT invalid owners.
 __device__ inline const WindowSegment* batch_device_segment(const DeviceBatchView& v, int index,
                                                            int begin, int end, bool committing = false) {
-    if (!v.table || !v.window || !v.table_epoch || !v.status || v.window->segments < 1 ||
-        v.window->segments > kDeviceBatchSlots ||
-        v.window->rows < 1 || v.window->rows > kDeviceBatchRows || index < 0 || index >= kDeviceBatchSlots) {
+    if (!v.table || !v.window || !v.table_epoch || !v.status || v.slots < 1 || v.slots > kDeviceBatchSlots ||
+        v.rows < 1 || v.rows > kDeviceBatchRows || v.window->segments < 1 ||
+        v.window->segments > (uint32_t) v.slots ||
+        v.window->rows < 1 || v.window->rows > (uint32_t) v.rows || index < 0 || index >= v.slots) {
         batch_device_fail(v, kBatchBadDescriptor); return nullptr;
     }
     if (index >= (int) v.window->segments) return nullptr;
@@ -114,7 +124,7 @@ __device__ inline const WindowSegment* batch_device_segment(const DeviceBatchVie
         batch_device_fail(v, kBatchBadEpoch); return nullptr;
     }
     const auto& s = v.window->segment[index];
-    if (s.slot < 0 || s.slot >= kDeviceBatchSlots) { batch_device_fail(v, kBatchBadOwner); return nullptr; }
+    if (s.slot < 0 || s.slot >= v.slots) { batch_device_fail(v, kBatchBadOwner); return nullptr; }
     if (!s.owner_address_epoch || s.owner_address_epoch != v.table->target[s.slot].address_epoch) {
         batch_device_fail(v, kBatchBadEpoch); return nullptr;
     }
@@ -132,7 +142,7 @@ __device__ inline const WindowSegment* batch_device_segment(const DeviceBatchVie
     return &s;
 }
 __device__ inline const WindowSegment* batch_device_row(const DeviceBatchView& v, int row, int begin, int end) {
-    if (!v.window || row < 0 || row >= kDeviceBatchRows || row >= (int)v.window->rows ||
+    if (!v.window || row < 0 || row >= v.rows || row >= kDeviceBatchRows || row >= (int)v.window->rows ||
         row < begin || row >= end) {
         batch_device_fail(v, kBatchBadDescriptor); return nullptr;
     }

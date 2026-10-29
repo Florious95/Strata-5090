@@ -9,6 +9,7 @@
 namespace strata::core {
 using DeviceWindow = strata::kernels::DeviceWindowLayout;
 using DeviceCommit = strata::kernels::DeviceCommitLayout;
+using DeviceOwnerWords = std::array<uint64_t, strata::kernels::kDeviceBatchSlots>;   // per owner, unused tail zero
 
 // No slot IDs, segment count, generations or keep values are graph-key data.
 // profile contains only frozen execution choices; table replacement invalidates
@@ -23,17 +24,21 @@ struct BatchRowsCutKey {
     }
 };
 
+// `slots` owners and `capacity` rows: C4 (4, 12) or C8 (8, 16), strata::kernels::device_batch_geometry.
 inline bool make_device_window(const int* ids, const int64_t* positions, int rows, int cut,
-                               const std::array<uint64_t, 4>& generations,
-                               const std::array<uint64_t, 4>& owner_epochs,
+                               const DeviceOwnerWords& generations,
+                               const DeviceOwnerWords& owner_epochs,
                                uint64_t sequence, uint64_t table_epoch, uint32_t profile,
-                               DeviceWindow& out, std::string& err) {
+                               DeviceWindow& out, std::string& err, int slots = 4, int capacity = 12) {
     out = {}; // also invalidates every unused row/segment, never preserve stale owners
-    if (!sequence || !table_epoch || rows < 1 || rows > 12 || cut < 0 || cut >= rows ||
+    if (!strata::kernels::device_batch_geometry(slots, capacity)) {
+        err = "device window: unsupported owner/row geometry"; return false;
+    }
+    if (!sequence || !table_epoch || rows < 1 || rows > capacity || cut < 0 || cut >= rows ||
         (cut == 0 ? rows > 8 : cut > 8 || rows - cut > 8)) {
         err = "device window: invalid sequence/epoch or dense bounds"; return false;
     }
-    if (!validate_segments(ids, positions, rows, 12, 4, true, err)) return false;
+    if (!validate_segments(ids, positions, rows, capacity, slots, true, err)) return false;
     if (cut > 0 && ids[cut - 1] == ids[cut]) {
         err = "device window: dense cut bisects a causal segment"; return false;
     }
@@ -41,7 +46,7 @@ inline bool make_device_window(const int* ids, const int64_t* positions, int row
     out.sequence = sequence; out.table_epoch = table_epoch;
     for (int first = 0; first < rows;) {
         const int owner = ids[first], length = segment_width(ids, rows, first);
-        if (out.segments >= 4 || length > 8 || !generations[owner] || !owner_epochs[owner]) {
+        if (out.segments >= (uint32_t) slots || length > 8 || !generations[owner] || !owner_epochs[owner]) {
             err = "device window: invalid segment capacity or owner identity";
             out = {}; return false;
         }
@@ -58,19 +63,21 @@ inline bool make_device_window(const int* ids, const int64_t* positions, int row
     return true;
 }
 
+// `keeps_by_slot` has `slots` entries.
 inline bool make_device_commit(const DeviceWindow& w, const int* keeps_by_slot,
-                               DeviceCommit& out, std::string& err) {
+                               DeviceCommit& out, std::string& err, int slots = 4, int capacity = 12) {
     out = {};
-    if (!keeps_by_slot || w.segments < 1 || w.segments > 4 || !w.sequence || !w.table_epoch ||
-        w.rows < 1 || w.rows > 12 || w.dense_cut >= w.rows ||
+    if (!strata::kernels::device_batch_geometry(slots, capacity) ||
+        !keeps_by_slot || w.segments < 1 || w.segments > (uint32_t) slots || !w.sequence || !w.table_epoch ||
+        w.rows < 1 || w.rows > (uint32_t) capacity || w.dense_cut >= w.rows ||
         (w.dense_cut == 0 ? w.rows > 8 : w.dense_cut > 8 || w.rows - w.dense_cut > 8)) {
         err = "device commit: invalid window"; return false;
     }
-    bool active[4] = {};
+    bool active[strata::kernels::kDeviceBatchSlots] = {};
     int covered = 0;
     for (uint32_t i = 0; i < w.segments; ++i) {
         const auto& s = w.segment[i];
-        if (s.slot < 0 || s.slot >= 4 || active[s.slot] || s.first != covered ||
+        if (s.slot < 0 || s.slot >= slots || active[s.slot] || s.first != covered ||
             s.length < 1 || s.length > 8 || covered + s.length > (int)w.rows ||
             !s.request_generation || !s.owner_address_epoch ||
             (w.dense_cut > (uint32_t)s.first && w.dense_cut < (uint32_t)(s.first + s.length)) ||
@@ -88,21 +95,23 @@ inline bool make_device_commit(const DeviceWindow& w, const int* keeps_by_slot,
         covered += s.length;
         out.keep_by_segment[i] = keeps_by_slot[s.slot];
     }
-    for (int b = 0; b < 4; ++b) if (!active[b] && keeps_by_slot[b] != 0) {
+    for (int b = 0; b < slots; ++b) if (!active[b] && keeps_by_slot[b] != 0) {
         err = "device commit: nonzero keep for inactive owner"; out = {}; return false;
     }
-    if (w.rows < 1 || w.rows > 12 || covered != (int)w.rows) {
+    if (covered != (int)w.rows) {
         err = "device commit: uncovered rows"; out = {}; return false;
     }
     out.sequence = w.sequence; out.table_epoch = w.table_epoch;
     return true;
 }
 
-// Validate the frozen C4/Q4/20K-resident table before publishing any pointer to
+// Validate the frozen C4/C8 Q4/20K-resident table before publishing any pointer to
 // a graph. Equal-base checks are necessary, not a proof of allocation ranges.
-inline bool validate_device_slot_table(const strata::kernels::DeviceSlotTable& t, std::string& err) {
+// Owners past `slots` must be empty: no kernel may ever reach them.
+inline bool validate_device_slot_table(const strata::kernels::DeviceSlotTable& t, std::string& err, int slots = 4) {
     using namespace strata::kernels;
-    std::array<uintptr_t, 4 * 12 * 16 + 8> mutable_bases{};
+    if (slots != 4 && slots != 8) { err = "device table: unsupported owner count"; return false; }
+    std::array<uintptr_t, kDeviceBatchSlots * kDeviceBatchQsaLayers * 16 + 2 * kDeviceBatchSlots> mutable_bases{};
     size_t count = 0;
     auto independent = [&](const void* p) {
         if (!p) return false;
@@ -111,7 +120,13 @@ inline bool validate_device_slot_table(const strata::kernels::DeviceSlotTable& t
         mutable_bases[count++] = value;
         return true;
     };
-    for (int b = 0; b < 4; ++b) {
+    for (int b = slots; b < kDeviceBatchSlots; ++b) {
+        bool empty = !t.target[b].gdn_base && !t.target[b].ple_hist && !t.target[b].address_epoch;
+        for (int qi = 0; qi < kDeviceBatchQsaLayers; ++qi)
+            empty = empty && !t.qsa[qi][b].flags && !t.qsa[qi][b].address_epoch && !t.qsa[qi][b].pools.k_q4;
+        if (!empty) { err = "device table: an owner past the owner count is populated"; return false; }
+    }
+    for (int b = 0; b < slots; ++b) {
         const auto& owner = t.target[b];
         if (!owner.address_epoch || owner.max_cells < 262144 || owner.max_cells > INT32_MAX ||
             owner.gdn_ord0 != 0 || owner.qsa_ord0 != 0 || !independent(owner.gdn_base) ||
@@ -119,7 +134,7 @@ inline bool validate_device_slot_table(const strata::kernels::DeviceSlotTable& t
             err = "device table: target capacity/epoch or mutable base alias"; return false;
         }
     }
-    for (int qi = 0; qi < 12; ++qi) for (int b = 0; b < 4; ++b) {
+    for (int qi = 0; qi < kDeviceBatchQsaLayers; ++qi) for (int b = 0; b < slots; ++b) {
         const auto& q = t.qsa[qi][b];
         const auto& m = q.map;
         if (q.flags != (kDeviceQsaQ4 | kDeviceQsaRotated | kDeviceQsaStreamed) ||

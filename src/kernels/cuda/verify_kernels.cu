@@ -430,7 +430,7 @@ __global__ void __launch_bounds__(S * RG) batch_gdn_step_kernel(
 }
 __global__ void batch_gdn_commit_kernel(DeviceBatchView v, int gi, BatchGdnShape g,
                                        const float* h, const float* gate, const float* beta) {
-    const auto* seg = batch_device_segment(v, blockIdx.z, 0, kDeviceBatchRows, true);
+    const auto* seg = batch_device_segment(v, blockIdx.z, 0, v.rows, true);
     if (!seg) return;
     float* state = batch_gdn_state(v, *seg, gi, g);
     if (!state) return;
@@ -441,7 +441,7 @@ __global__ void batch_gdn_commit_kernel(DeviceBatchView v, int gi, BatchGdnShape
 }
 __global__ void batch_conv_commit_kernel(DeviceBatchView v, int gi, BatchGdnShape g,
                                         const float* qkv) {
-    const auto* seg = batch_device_segment(v, blockIdx.y, 0, kDeviceBatchRows, true);
+    const auto* seg = batch_device_segment(v, blockIdx.y, 0, v.rows, true);
     if (!seg) return;
     float* state = batch_gdn_state(v, *seg, gi, g);
     if (!state) return;
@@ -461,7 +461,7 @@ __global__ void batch_conv_commit_kernel(DeviceBatchView v, int gi, BatchGdnShap
 }
 __global__ void batch_ple_copy_kernel(DeviceBatchView v, int row, float* history,
                                      int64_t floats, bool to_slot) {
-    const auto* seg = batch_device_row(v, row, 0, kDeviceBatchRows);
+    const auto* seg = batch_device_row(v, row, 0, v.rows);
     if (!seg) return;
     float* owner = v.table->target[seg->slot].ple_hist;
     if (!owner) { batch_device_fail(v, kBatchBadOwner); return; }
@@ -471,7 +471,7 @@ __global__ void batch_ple_copy_kernel(DeviceBatchView v, int row, float* history
     }
 }
 __global__ void batch_ple_commit_kernel(DeviceBatchView v, const float* snapshots, int64_t floats) {
-    const auto* seg = batch_device_segment(v, blockIdx.y, 0, kDeviceBatchRows, true);
+    const auto* seg = batch_device_segment(v, blockIdx.y, 0, v.rows, true);
     if (!seg) return;
     float* owner = v.table->target[seg->slot].ple_hist;
     if (!owner) { batch_device_fail(v, kBatchBadOwner); return; }
@@ -1395,16 +1395,16 @@ void batch_device_gdn_conv(DeviceBatchView v, int begin, int end, int gi, BatchG
 void batch_device_gdn_step(DeviceBatchView v, int begin, int end, int gi, BatchGdnShape g,
                            const float* h, const float* gate, const float* beta, const float* z,
                            const float* gamma, float* y, float eps, void* stream) {
-    batch_gdn_step_kernel<<<dim3(g.value_heads, kDeviceBatchSlots), dim3(S, RG), 0, (cudaStream_t)stream>>>(
+    batch_gdn_step_kernel<<<dim3(g.value_heads, v.slots), dim3(S, RG), 0, (cudaStream_t)stream>>>(
         v, begin, end, gi, g, h, gate, beta, z, gamma, y, eps);
     check("batch device GDN target");
 }
 void batch_device_gdn_commit(DeviceBatchView v, int gi, BatchGdnShape g, const float* qkv,
                              const float* h, const float* gate, const float* beta, void* stream) {
     const auto st = (cudaStream_t)stream;
-    batch_gdn_commit_kernel<<<dim3(g.value_heads, S / 32, kDeviceBatchSlots), dim3(32, RG), 0, st>>>(
+    batch_gdn_commit_kernel<<<dim3(g.value_heads, S / 32, v.slots), dim3(32, RG), 0, st>>>(
         v, gi, g, h, gate, beta);
-    batch_conv_commit_kernel<<<dim3((g.channels + 255) / 256, kDeviceBatchSlots), 256, 0, st>>>(v, gi, g, qkv);
+    batch_conv_commit_kernel<<<dim3((g.channels + 255) / 256, v.slots), 256, 0, st>>>(v, gi, g, qkv);
     check("batch device GDN commit");
 }
 void batch_device_ple_copy(DeviceBatchView v, int row, float* history, int64_t floats, bool to_slot, void* stream) {
@@ -1412,7 +1412,7 @@ void batch_device_ple_copy(DeviceBatchView v, int row, float* history, int64_t f
     check("batch device PLE copy");
 }
 void batch_device_ple_commit(DeviceBatchView v, const float* snapshots, int64_t floats, void* stream) {
-    batch_ple_commit_kernel<<<dim3(32, kDeviceBatchSlots), 256, 0, (cudaStream_t)stream>>>(v, snapshots, floats);
+    batch_ple_commit_kernel<<<dim3(32, v.slots), 256, 0, (cudaStream_t)stream>>>(v, snapshots, floats);
     check("batch device PLE commit");
 }
 

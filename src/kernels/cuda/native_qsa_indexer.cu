@@ -295,10 +295,10 @@ void batch_device_indexer(DeviceBatchView v, int qi, int begin, int end, const f
     const auto k = scaling.kernel_args(ROT);
     const auto rt = rope_table_for(scaling);
     if (rt.cos)
-        batch_indexer_kernel<true><<<kDeviceBatchSlots, THREADS, 0, (cudaStream_t)stream>>>(
+        batch_indexer_kernel<true><<<v.slots, THREADS, 0, (cudaStream_t)stream>>>(
             v, qi, begin, end, raw, steps, gamma, eps, theta, k, rt, committing);
     else
-        batch_indexer_kernel<false><<<kDeviceBatchSlots, THREADS, 0, (cudaStream_t)stream>>>(
+        batch_indexer_kernel<false><<<v.slots, THREADS, 0, (cudaStream_t)stream>>>(
             v, qi, begin, end, raw, steps, gamma, eps, theta, k, rt, committing);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));

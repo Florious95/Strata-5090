@@ -2105,7 +2105,7 @@ bool batch_device_scores_supported() {
 }
 void batch_device_scores(DeviceBatchView v, int qi, int begin, int end, const float* queries,
     const int32_t* steps, int64_t max_blocks, float* scores, const QsaShapes&, void* stream) {
-    batch_scores_kernel<<<dim3(256, kDeviceBatchSlots), SCORE_WARPS * 32, 0, (cudaStream_t)stream>>>(
+    batch_scores_kernel<<<dim3(256, v.slots), SCORE_WARPS * 32, 0, (cudaStream_t)stream>>>(
         v, qi, begin, end, queries, steps, max_blocks, scores, scores_early_exit());
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) {

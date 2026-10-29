@@ -3793,9 +3793,9 @@ int main(int argc, char** argv) {
     if (!strata::core::parse_slot_solo(std::getenv("STRATA_BATCH_ROW_TABLE"), row_table)) {
         std::fprintf(stderr, "strata: STRATA_BATCH_ROW_TABLE must be 0 or 1\n"); return 2;
     }
-    if (row_table && (!generalized || !audit_requested || o.batch != 4 || o.batch_rows != 12 ||
+    if (row_table && (!generalized || !audit_requested || !strata::kernels::device_batch_geometry(o.batch, o.batch_rows) ||
         o.max_context != 262144 || o.kv_resident != 20480 || !o.batch_expert_merge || o.spec > 8)) {
-        std::fprintf(stderr, "strata: row table requires audited generalized C4 rows12, merged experts, "
+        std::fprintf(stderr, "strata: row table requires audited generalized C4 rows12 or C8 rows16, merged experts, "
                              "context262144 and Q4 resident20480\n"); return 2;
     }
 #if defined(STRATA_USE_HIP) || defined(STRATA_GPU_METAL) || defined(STRATA_GPU_SYCL)

@@ -4024,7 +4024,7 @@ bool Verifier::wait_commit(std::string& err) {
 
 bool Verifier::set_slot_request_generation(int slot, uint64_t generation, std::string& err) {
     if (!row_table_) return true;
-    if (slot < 0 || slot >= 4 || !generation) {
+    if (slot < 0 || slot >= (int) slots_.size() || slot >= strata::kernels::kDeviceBatchSlots || !generation) {
         err = "row table: invalid request generation"; return false;
     }
     slot_generation_[(size_t)slot] = generation;
@@ -4037,13 +4037,14 @@ bool Verifier::init_device_table(std::string& err) {
 #if defined(STRATA_GPU_METAL) || defined(STRATA_USE_HIP)
     err = "row table: experimental path requires NVIDIA CUDA"; return false;
 #else
-    if (device_table_arena_ || slots_.size() != 4 || max_t_ != 12 || lb_ || le_ != g_->n_layers || next_ ||
+    const int owners = (int) slots_.size();
+    if (device_table_arena_ || !device_batch_geometry(owners, max_t_) || lb_ || le_ != g_->n_layers || next_ ||
         g_->n_qsa_layers() != 12 || !batch_generalized_ || !batch_expert_merge_ ||
         device_plan_ || all_resident_ || remote_opt_ || !batch_device_gdn_supported() ||
         !batch_device_scores_supported()) {
-        err = "row table: requires complete C4/rows12/generalized/default GDN profile"; return false;
+        err = "row table: requires complete C4/rows12 or C8/rows16 generalized/default GDN profile"; return false;
     }
-    for (int b = 0; b < 4; ++b) {
+    for (int b = 0; b < owners; ++b) {
         const auto& sx = *slots_[b];
         // Banks are not table inputs: stage_batch admits only text-only owners.
         if (sx.max_cells != 262144 || sx.gdn_ord0 || sx.qsa_ord0 ||
@@ -4072,8 +4073,8 @@ bool Verifier::init_device_table(std::string& err) {
         }
         table_owner_profile_[b] = solo_profile(b);
     }
-    if (!validate_device_slot_table(table_snapshot_, err)) return false;
-    constexpr size_t bytes = sizeof(DeviceSlotTable) + sizeof(DeviceWindowLayout) + sizeof(DeviceCommitLayout) + 16;
+    if (!validate_device_slot_table(table_snapshot_, err, owners)) return false;
+    constexpr size_t bytes = kDeviceBatchAbiBytes + 16;
     if (cudaMalloc(&device_table_arena_, bytes) != cudaSuccess ||
         !mapped(sizeof(DeviceWindowLayout), (void**)&h_window_, (void**)&m_window_) ||
         !mapped(sizeof(DeviceCommitLayout), (void**)&h_device_commit_, (void**)&m_device_commit_) ||
@@ -4084,15 +4085,18 @@ bool Verifier::init_device_table(std::string& err) {
     device_batch_.table = (DeviceSlotTable*)base;
     device_batch_.window = (DeviceWindowLayout*)(base + sizeof(DeviceSlotTable));
     device_batch_.commit = (DeviceCommitLayout*)(base + sizeof(DeviceSlotTable) + sizeof(DeviceWindowLayout));
-    device_batch_.table_epoch = (uint64_t*)(base + 14400);
+    device_batch_.table_epoch = (uint64_t*)(base + kDeviceBatchAbiBytes);
     device_batch_.status = m_table_status_;
+    device_batch_.slots = owners;
+    device_batch_.rows = max_t_;
     if (cudaMemcpy((void*)device_batch_.table, &table_snapshot_, sizeof(table_snapshot_), cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy((void*)device_batch_.table_epoch, &row_table_epoch_, sizeof(row_table_epoch_), cudaMemcpyHostToDevice) != cudaSuccess) {
         err = "row table: static table upload failed"; return false;
     }
     *h_window_ = {}; *h_device_commit_ = {}; *h_table_status_ = 0;
-    std::fprintf(stderr, "strata row table: ABI=14400 device_allocation=%zu pinned_staging=%zu key=rows_cut slots=4 rows=12\n",
-        bytes, sizeof(DeviceWindowLayout) + sizeof(DeviceCommitLayout) + sizeof(uint32_t));
+    std::fprintf(stderr, "strata row table: ABI=%zu device_allocation=%zu pinned_staging=%zu key=rows_cut slots=%d rows=%d\n",
+        kDeviceBatchAbiBytes, bytes, sizeof(DeviceWindowLayout) + sizeof(DeviceCommitLayout) + sizeof(uint32_t),
+        owners, max_t_);
     return true;
 #endif
 }
@@ -4102,18 +4106,19 @@ bool Verifier::stage_device_window(const int* rows, int S, int hbase, const int6
     if (!device_table_arena_ || hbase || !batch_generalized_ || !batch_expert_merged_ || row_table_sequence_ == UINT64_MAX) {
         err = "row table: noncanonical profile or sequence overflow"; return false;
     }
-    for (int b = 0; b < 4; ++b) if (table_owner_profile_[b] != solo_profile(b)) {
+    for (int b = 0; b < (int) slots_.size(); ++b) if (table_owner_profile_[b] != solo_profile(b)) {
         // No graph may survive a static-address change. Restart is intentionally
         // required; do not try to rescue a window by replaying a stale family.
         err = "row table: frozen owner address/profile changed; restart required"; return false;
     }
     if (!make_device_window(rows, pos, S, batch_dense_boundary_, slot_generation_, owner_address_epoch_,
-                            row_table_sequence_ + 1, row_table_epoch_, device_execution_profile(), *h_window_, err)) return false;
-    int keeps[4] = {};
+                            row_table_sequence_ + 1, row_table_epoch_, device_execution_profile(), *h_window_, err,
+                            device_batch_.slots, device_batch_.rows)) return false;
+    int keeps[strata::kernels::kDeviceBatchSlots] = {};
     for (uint32_t i = 0; i < h_window_->segments; ++i) {
         const auto& s = h_window_->segment[i]; keeps[s.slot] = s.length;
     }
-    if (!make_device_commit(*h_window_, keeps, *h_device_commit_, err)) return false;
+    if (!make_device_commit(*h_window_, keeps, *h_device_commit_, err, device_batch_.slots, device_batch_.rows)) return false;
     ++row_table_sequence_;
     *h_table_status_ = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -4173,7 +4178,7 @@ bool Verifier::capture_device_commit(cudaGraphExec_t& ex, const std::vector<int>
                 const LayerView v(*wt_, l);
                 const auto* gamma = need(v, "indexer.k_norm.weight", err);
                 if (!gamma) { ok = false; break; }
-                batch_device_indexer(device_batch_, qi, 0, 12,
+                batch_device_indexer(device_batch_, qi, 0, device_batch_.rows,
                     idx_raw_L_ + (size_t)qi * MT * g.idx_key_dim, step_,
                     (const float*)gamma->data, EPS, shapes_of(g), rope_scaling(), true, cs_);
                 ++qi;
@@ -5355,7 +5360,8 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
         for (int j = 0; j < max_t_; ++j)
             c[2 + j] = j < n ? (int32_t) last_pos_b_[first + j] : -1;
     }
-    if (last_row_table_ && !make_device_commit(*h_window_, keep, *h_device_commit_, err)) return false;
+    if (last_row_table_ && !make_device_commit(*h_window_, keep, *h_device_commit_, err, device_batch_.slots,
+                                               device_batch_.rows)) return false;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (last_row_table_ || !batch_self_commits(last_rows_, S)) {   // (else the window has kept its rows)
         const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);

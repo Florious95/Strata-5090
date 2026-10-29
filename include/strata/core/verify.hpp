@@ -541,8 +541,9 @@ private:
             (batch_dense_parallel_ ? 4u : 0u) | (batch_shared_after_ring_ ? 8u : 0u) |
             (batch_generalized_ ? 16u : 0u);
     }
-    std::array<uint64_t, 4> slot_generation_ = {}, owner_address_epoch_ = {1, 1, 1, 1};
-    std::vector<uintptr_t> table_owner_profile_[4];
+    std::array<uint64_t, strata::kernels::kDeviceBatchSlots> slot_generation_ = {},
+        owner_address_epoch_ = {1, 1, 1, 1, 1, 1, 1, 1};
+    std::vector<uintptr_t> table_owner_profile_[strata::kernels::kDeviceBatchSlots];
     bool init_device_table(std::string& err);
     bool stage_device_window(const int* rows, int S, int hbase, const int64_t* pos, std::string& err);
     bool device_table_status(std::string& err) const;
