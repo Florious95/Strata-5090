@@ -3782,6 +3782,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata: slot solo needs generalized C4, rows12, spec<=8, context262144, resident20480\n");
         return 2;
     }
+    bool shared_rope = false;   // C8-1: batch slot sessions borrow their stage session's read-only RoPE table
+    if (!strata::core::parse_slot_solo(std::getenv("STRATA_SHARED_ROPE"), shared_rope)) {
+        std::fprintf(stderr, "strata: STRATA_SHARED_ROPE must be 0 or 1\n"); return 2;
+    }
     const char* audit_path = std::getenv("STRATA_BATCH_AUDIT");
     const bool audit_requested = audit_path && *audit_path;
     bool row_table = false;
@@ -6222,17 +6226,27 @@ int main(int argc, char** argv) {
                              "one group\n", o.batch_groups, o.batch);
         o.batch_groups = 1;
     }
+    bool slot_rope_shared = false;   // C8-1: CUDA0's slot sessions borrow the main session's RoPE table
     if (o.batch > 0) {
         bslot_ss.resize(1 + stages.size());
         int fit = o.batch;   // the slots every stage could carve
-        uint64_t bytes0 = 0;
+        uint64_t bytes0 = 0, own0 = 0;
         for (size_t k = 0; k < bslot_ss.size(); ++k) {
             const int dev = k == 0 ? 0 : stages[k - 1]->dev;
             const int64_t lo = k == 0 ? 0 : stages[k - 1]->lb;
             const int64_t hi = k == 0 ? (multi_gpu ? split_at[0] : -1) : stages[k - 1]->le;
             const strata::core::OnDevice on_k(dev);
-            const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, lo, hi);
-            if (k == 0) bytes0 = bytes;
+            // C8-1: the stage's own session is on this device, carved with this range and context, and outlives
+            // the slots (its arena is released after bslot_arenas). Its cos/sin are bit-identical to a slot's own.
+            const strata::core::SessionState& own = k == 0 ? ss : stages[k - 1]->ss;
+            const strata::core::QsaState* rope = shared_rope && g.n_qsa_layers() > 0 && (k > 0 || primary_device == 0)
+                ? &own.qsa_states[own.qsa_primary()] : nullptr;
+            const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, lo, hi, rope == nullptr);
+            if (k == 0) {
+                bytes0 = bytes;
+                own0 = strata::core::session_bytes(g, o.max_context, K, lo, hi);
+                slot_rope_shared = rope != nullptr;
+            }
             for (int b = 0; b < fit; ++b) {
                 if (o.batch_slot_only && k == 0 && b == 0) {
                     bslot_ss[k].push_back(&ss);
@@ -6240,7 +6254,8 @@ int main(int argc, char** argv) {
                 }
                 auto u = std::make_unique<strata::core::SessionState>();
                 void* buf = nullptr;
-                if (cudaMalloc(&buf, bytes) != cudaSuccess || strata::core::session_init(g, o.max_context, K, buf, *u, lo, hi) == 0) {
+                if (cudaMalloc(&buf, bytes) != cudaSuccess ||
+                    strata::core::session_init(g, o.max_context, K, buf, *u, lo, hi, rope) == 0) {
                     cudaGetLastError();
                     if (buf != nullptr) cudaFree(buf);
                     size_t fb = 0, tb = 0;
@@ -6265,8 +6280,9 @@ int main(int argc, char** argv) {
             cudaDeviceSynchronize();
             size_t fb = 0, tb = 0;
             cudaMemGetInfo(&fb, &tb);
-            std::fprintf(stderr, "strata generate: --batch: %d slot sessions on CUDA%d (%.2f GiB each); %.2f GiB free\n",
-                         (int) bslot_ss[k].size(), dev, (double) bytes / 1073741824.0, (double) fb / 1073741824.0);
+            std::fprintf(stderr, "strata generate: --batch: %d slot sessions on CUDA%d (%.2f GiB each%s); %.2f GiB free\n",
+                         (int) bslot_ss[k].size(), dev, (double) bytes / 1073741824.0,
+                         rope != nullptr ? ", RoPE table shared" : "", (double) fb / 1073741824.0);
         }
         if ((generalized || audit_requested) && fit != o.batch) {
             std::fprintf(stderr, "strata: generalized batching cannot allocate all %d requested target owners\n", o.batch);
@@ -6296,7 +6312,7 @@ int main(int argc, char** argv) {
             // the sessions' VRAM is the expert cache's: say what it costs (docs/BATCHING.md has the measured trade)
             std::fprintf(stderr, "strata generate: --batch %d: the slot sessions take %.2f GiB of VRAM on CUDA0 that the "
                                  "expert cache would otherwise hold\n", o.batch,
-                         (double) bytes0 * o.batch / 1073741824.0);
+                         (double) (o.batch_slot_only ? own0 + bytes0 * (o.batch - 1) : bytes0 * o.batch) / 1073741824.0);
         }
     }
 
@@ -6963,13 +6979,15 @@ int main(int argc, char** argv) {
     // numbers if the slots do not fit, instead of handing back a cache smaller than it was asked for.
     if (o.batch_slot_only) {
         const auto bytes = strata::core::session_bytes(g, o.max_context, K);
+        const auto borrow = strata::core::session_bytes(g, o.max_context, K, 0, -1, !slot_rope_shared);
         uint64_t bind_reserved = 0;
         for (const auto* draft : slot_mtp) bind_reserved += draft->bind_bytes(native_head.row_bytes(), n_vocab);
         std::fprintf(stderr, "strata slot-only ledger before expert-cache sizing: target_sessions=%d "
                              "target_bytes_each=%llu target_bytes_total=%llu draft_states=%d draft_weights_owners=1 "
-                             "draft_bind_reserved=%llu\n",
-                     o.batch, (unsigned long long) bytes, (unsigned long long) (o.batch * bytes),
-                     o.batch, (unsigned long long) bind_reserved);
+                             "draft_bind_reserved=%llu%s\n",
+                     o.batch, (unsigned long long) bytes, (unsigned long long) (bytes + (o.batch - 1) * borrow),
+                     o.batch, (unsigned long long) bind_reserved,
+                     slot_rope_shared ? (" rope_shared=1 borrower_bytes_each=" + std::to_string(borrow)).c_str() : "");
     }
     mem_mark("the weights, the session and the drafter");
     strata::core::ExpertCache xcache;
