@@ -3813,10 +3813,12 @@ int main(int argc, char** argv) {
     }
     strata::core::WindowAudit window_audit;
     const bool slot_only_cli = o.batch_slot_only;
-    if (generalized && (!o.serve || (o.batch != 2 && o.batch != 4 && o.batch != 8) || (o.vision && o.batch > 4) ||
+    // C8-4: --vision takes every generalized slot count. Each slot owns one position bank (mrope_bank_offset); a
+    // window with an image owner keeps the legacy owner-keyed graphs, as at 2/4.
+    if (generalized && (!o.serve || (o.batch != 2 && o.batch != 4 && o.batch != 8) ||
                         o.kv != "q4_0" || o.mtp.empty() || o.batch_spec < 2 || o.spec < 2 ||
                         o.batch_spec_fixed || o.pipeline_windows > 0 || o.kv_grow || o.adapt_async || o.batch_groups > 1)) {
-        std::fprintf(stderr, "strata: generalized batching needs 2/4/8 slots (vision: 2/4), Q4 KV, MTP, variable segments, "
+        std::fprintf(stderr, "strata: generalized batching needs 2/4/8 slots, Q4 KV, MTP, variable segments, "
                              "one group, no KV grow/pipeline/async adaptation\n"); return 2;
     }
     // From here the old internal slot-only field denotes effective canonical
@@ -6328,7 +6330,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata: invalid experimental batch prefill/PCIe options\n"); return 2;
     }
     if (o.batch_slot_only && o.vision) {
-        const size_t stride = (size_t) (o.max_context + 64) * 3;
+        const int64_t cells = o.max_context + 64;
+        const size_t stride = strata::kernels::mrope_bank_offset(1, cells);
         if (bslot_ss[0].size() * stride > mrope_host.size()) {
             std::fprintf(stderr, "strata vision: %zu slots but %zu position banks\n",
                          bslot_ss[0].size(), mrope_host.size() / stride);
@@ -6336,8 +6339,8 @@ int main(int argc, char** argv) {
         }
         for (size_t b = 0; b < bslot_ss[0].size(); ++b) {
             auto& sx = *bslot_ss[0][b];
-            sx.mrope_device = d_mrope + b * stride;
-            sx.mrope_host = mrope_host.data() + b * stride;
+            sx.mrope_device = d_mrope + strata::kernels::mrope_bank_offset((int) b, cells);
+            sx.mrope_host = mrope_host.data() + strata::kernels::mrope_bank_offset((int) b, cells);
         }
     }
     // C8-2: generalized rows16 also takes depth 5..6. The window still gives each slot min(depth, rows/active)
@@ -14713,7 +14716,8 @@ int main(int argc, char** argv) {
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
             const int64_t mrope_cells = o.max_context + 64;
-            const size_t mrope_offset = o.batch_slot_only && o.vision ? (size_t) admit_slot * mrope_cells * 3 : 0;
+            const size_t mrope_offset = o.batch_slot_only && o.vision
+                                            ? strata::kernels::mrope_bank_offset(admit_slot, mrope_cells) : 0;
             if (geni || !mrope_identity || (o.batch_slot_only && o.vision)) {
                 // Update only this slot's stable bank. Other live slots keep their captured pointers and values.
                 std::string ve;

@@ -14,6 +14,7 @@
 // change between requests.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #if defined(__HIPCC__) && defined(STRATA_HIP_GFX906)   // PR #638: the gfx906 compat build only
 #include <hip/hip_runtime.h>
@@ -26,6 +27,10 @@ namespace strata::kernels {
 /// The table of the CURRENT device (a layer split sets one per device; null = the identity).
 void mrope_table_set(const int32_t* device_table);
 const int32_t* mrope_table();
+
+/// --vision with canonical slots: the table holds one bank of `cells` (max_context + 64) rows of (t, h, w) per slot,
+/// slot b's at this offset (int32 elements).  An image request rewrites only its own slot's bank (C8-4: 2, 4 or 8).
+inline std::size_t mrope_bank_offset(int slot, int64_t cells) { return (std::size_t) slot * (std::size_t) cells * 3; }
 
 // Text-only chunks before/after an image keep their prompt-local position; decode
 // past the prompt uses the saved per-slot delta. This never shifts a KV cell index.

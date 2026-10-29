@@ -1,5 +1,6 @@
 // CPU-only tests of the production position helper and capture-pointer scopes.
 #include "strata/kernels/mrope.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -79,5 +80,66 @@ int main() {
     };
     check(table_window({2, 2, 3, 3, 3}) && table_window({3}));
     check(!table_window({2, 0, 0, 3}) && !table_window({1}) && !table_window({3, 3, 4}));
-    std::printf("slot_mrope_cpu: %d checks PASS; layouts=1,7,8,9,10,11,12; c4_routing=5\n",checks);
+    // C8-4 Vision8: generate.cpp's table of max(batch, 2) banks, slot b at mrope_bank_offset(b, cells). The banks are
+    // disjoint and tile the table for 2/4/8 slots, also at the production 262144 + 64 cells.
+    for (int64_t cells : {int64_t(128), int64_t(262208)})
+        for (int slots : {2, 4, 8}) {
+            check(k::mrope_bank_offset(0, cells) == 0);
+            for (int b = 0; b < slots; ++b)
+                check(k::mrope_bank_offset(b + 1, cells) - k::mrope_bank_offset(b, cells) == size_t(cells) * 3);
+            check(k::mrope_bank_offset(slots, cells) == size_t(slots) * size_t(cells) * 3);
+        }
+    // Owners 0..7, each its own image (or none) and delta. An admission rewrites only its slot's bank (generate.cpp's
+    // put/upload_mrope over [offset, offset + cells * 3)); every other bank keeps its bytes.
+    constexpr int C8 = 8, CELLS = 128;
+    std::array<int32_t, C8 * CELLS * 3> table{};
+    auto bank = [&](int b) { return table.data() + k::mrope_bank_offset(b, CELLS); };
+    for (int b = 0; b < C8; ++b) for (int c = 0; c < CELLS; ++c) for (int s = 0; s < 3; ++s) bank(b)[c * 3 + s] = c;
+    const int img_w[C8] = {2, 0, 3, 0, 4, 0, 1, 5}, img_h[C8] = {3, 0, 4, 0, 2, 0, 6, 1};   // 0: a text slot
+    int32_t c8_delta[C8]{}, c8_end[C8]{};
+    bool c8_identity[C8]{};
+    for (int b = 0; b < C8; ++b) {
+        const std::array<int32_t, C8 * CELLS * 3> before = table;
+        const int start = 4 + b, n = img_w[b] * img_h[b], end = start + n;
+        c8_identity[b] = n == 0;
+        c8_delta[b] = n ? std::max(img_w[b], img_h[b]) - n : 0;
+        c8_end[b] = n ? end : 20 + b;
+        for (int c = start; c < end; ++c) {
+            bank(b)[c * 3] = start;
+            bank(b)[c * 3 + 1] = start + (c - start) / img_w[b];
+            bank(b)[c * 3 + 2] = start + (c - start) % img_w[b];
+        }
+        for (int c = end; n && c < CELLS; ++c) for (int s = 0; s < 3; ++s) bank(b)[c * 3 + s] = c + c8_delta[b];
+        const size_t lo = k::mrope_bank_offset(b, CELLS), hi = k::mrope_bank_offset(b + 1, CELLS);
+        for (size_t i = 0; i < table.size(); ++i) check(i >= lo && i < hi ? true : table[i] == before[i]);
+    }
+    bool c8_text[C8];
+    for (int b = 0; b < C8; ++b) {
+        c8_text[b] = k::mrope_text_only(bank(b), c8_identity[b], c8_delta[b]);
+        check(c8_text[b] == (img_w[b] == 0));
+        // the row's own bank and delta: a decode row of owner b at cell c rotates at c + delta[b], never another's
+        for (int c = c8_end[b]; c < CELLS; ++c) {
+            check(k::mrope_text_position(c, c8_end[b], c8_delta[b], bank(b)) == c + c8_delta[b]);
+            check(k::mrope_text_position(c, c8_end[b], c8_delta[b], bank(b)) == bank(b)[c * 3]);
+        }
+        for (int c = 0; c < c8_end[b]; ++c) check(k::mrope_text_position(c, c8_end[b], c8_delta[b], bank(b)) == bank(b)[c * 3]);
+    }
+    check(c8_delta[6] == 0 && !c8_text[6]);   // a 1x6 strip moves no delta and is still an image owner
+    // verify.cpp stage_batch: a window stays on the row table only when every row's owner is text (1, 3, 5)
+    auto c8_window = [&](std::initializer_list<int> rows) {
+        bool ok = true;
+        for (int r : rows) ok = ok && c8_text[r];
+        return ok;
+    };
+    check(c8_window({1, 1, 3, 3, 5, 5}) && c8_window({5}));
+    check(!c8_window({1, 3, 4, 5}) && !c8_window({7}) && !c8_window({0, 1, 2, 3, 4, 5, 6, 7}));
+    // owners 4..7 under one capture scope each: the scope is the row's bank and restores the previous table
+    current = nullptr;
+    for (int b = 4; b < C8; ++b) {
+        k::MropeTableScope own(bank(b)); check(current == bank(b));
+        { k::MropeTableScope merged(nullptr); check(current == nullptr); }
+        check(current == bank(b));
+    }
+    check(current == nullptr);
+    std::printf("slot_mrope_cpu: %d checks PASS; layouts=1,7,8,9,10,11,12; c4_routing=5; c8_banks=8\n",checks);
 }
