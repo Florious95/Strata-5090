@@ -3777,9 +3777,10 @@ int main(int argc, char** argv) {
     if (!strata::core::parse_slot_solo(std::getenv("STRATA_BATCH_SLOT_SOLO"), slot_solo)) {
         std::fprintf(stderr, "strata: STRATA_BATCH_SLOT_SOLO must be 0 or 1\n"); return 2;
     }
-    if (slot_solo && (!generalized || o.batch != 4 || o.batch_rows != 12 ||
+    if (slot_solo && (!generalized || !strata::core::slot_solo_geometry(o.batch, o.batch_rows) ||
                       o.max_context != 262144 || o.kv_resident != 20480 || o.spec > 8)) {
-        std::fprintf(stderr, "strata: slot solo needs generalized C4, rows12, spec<=8, context262144, resident20480\n");
+        std::fprintf(stderr, "strata: slot solo needs generalized C4 rows12 or C8 rows16, spec<=8, context262144, "
+                             "resident20480\n");
         return 2;
     }
     bool shared_rope = false;   // C8-1: batch slot sessions borrow their stage session's read-only RoPE table
@@ -3804,6 +3805,11 @@ int main(int argc, char** argv) {
     if (!strata::core::parse_batch_graph_limit(std::getenv("STRATA_BATCH_GRAPH_LIMIT"),
                                              generalized || audit_requested, batch_graph_limit)) {
         std::fprintf(stderr, "strata: STRATA_BATCH_GRAPH_LIMIT must be a decimal integer in 1..64\n"); return 2;
+    }
+    size_t solo_graph_limit = 0;
+    if (!strata::core::parse_solo_graph_limit(std::getenv("STRATA_BATCH_SOLO_GRAPH_LIMIT"), (size_t) batch_graph_limit,
+                                              solo_graph_limit)) {
+        std::fprintf(stderr, "strata: STRATA_BATCH_SOLO_GRAPH_LIMIT must be a decimal integer in 1..16\n"); return 2;
     }
     strata::core::WindowAudit window_audit;
     const bool slot_only_cli = o.batch_slot_only;
@@ -6334,11 +6340,13 @@ int main(int argc, char** argv) {
             sx.mrope_host = mrope_host.data() + b * stride;
         }
     }
+    // C8-2: generalized rows16 also takes depth 5..6. The window still gives each slot min(depth, rows/active)
+    // rows in at most two eight-row groups (A1/A2 6, A3 5, A4 4, A5 3, A6..A8 2).
     const int max_batch_spec = o.batch_slot_only ? 6 : 4;
     if (o.batch_spec < 1 || o.batch_spec > max_batch_spec ||
-        (o.batch_spec > 4 && (o.spec < o.batch_spec || o.batch_rows != 12))) {
+        (o.batch_spec > 4 && (o.spec < o.batch_spec || (o.batch_rows != 12 && !(generalized && o.batch_rows == 16))))) {
         std::fprintf(stderr, "strata: --batch-spec must be 1..4, or slot-only C2 5..6 with --spec >= depth "
-                             "and --batch-rows 12\n"); return 2;
+                             "and --batch-rows 12 (generalized: 12 or 16)\n"); return 2;
     }
     const bool adaptive_rows = generalized || (o.batch_slot_only && o.batch_spec > 4);
     if (o.batch_rows != 8 && o.batch_rows != 12 && o.batch_rows != 16) {
@@ -10319,6 +10327,7 @@ int main(int argc, char** argv) {
         ver.set_batch_expert_merge(batch_fast && o.batch_expert_merge);
         if (batch_mtp || batch_fast || audit_requested) {
             ver.set_batch_graph_limit((size_t) batch_graph_limit);
+            ver.set_solo_graph_limit(solo_graph_limit);
             if (generalized || audit_requested)
                 std::fprintf(stderr, "strata: batch graph cache limit=%d layout pairs (not a MiB budget)\n", batch_graph_limit);
         }
@@ -10403,7 +10412,7 @@ int main(int argc, char** argv) {
             c.generalized = generalized; c.canonical = o.batch_slot_only; c.segmented = batch_fast;
             c.slot_solo = slot_solo;
             c.row_table = row_table;
-            c.solo_graph_limit = slot_solo ? (int) strata::core::slot_solo_graph_limit((size_t) batch_graph_limit) : 0;
+            c.solo_graph_limit = slot_solo ? (int) solo_graph_limit : 0;
             c.engine_version = STRATA_VERSION;
 #ifdef STRATA_SOURCE_SHA
             c.source_sha = STRATA_SOURCE_SHA;
@@ -12441,8 +12450,8 @@ int main(int argc, char** argv) {
                 cudaMemGetInfo(&after, &total) != cudaSuccess) {
                 std::fprintf(stderr, "strata slot solo: prewarm failed: %s\n", err.c_str()); return 1;
             }
-            std::fprintf(stderr, "strata slot solo: READY prewarm target_limit=%zu commit_limit=4 free_before=%llu free_after=%llu retained_bytes=%llu\n",
-                         strata::core::slot_solo_graph_limit((size_t)batch_graph_limit), (unsigned long long)before,
+            std::fprintf(stderr, "strata slot solo: READY prewarm target_limit=%zu commit_limit=%d free_before=%llu free_after=%llu retained_bytes=%llu\n",
+                         solo_graph_limit, o.batch, (unsigned long long)before,
                          (unsigned long long)after, (unsigned long long)(before > after ? before - after : 0));
             if (after < (size_t)512 * 1024 * 1024) {
                 std::fprintf(stderr, "strata slot solo: less than 512 MiB after graph prewarm; raise --vram-reserve-mib\n");

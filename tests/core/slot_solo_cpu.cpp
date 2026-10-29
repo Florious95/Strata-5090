@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <set>
+#include <string>
 #include <type_traits>
 using namespace strata::core;
 namespace {
@@ -24,11 +25,25 @@ int main() {
     for (std::size_t configured : {0u, 1u, 2u, 4u, 5u, 6u, 7u, 8u, 64u})
         require(slot_solo_graph_limit(configured) == (configured < 1 ? 1 : configured > 8 ? 8 : configured),
                 "configured Solo limit reaches eight without changing default four");
+    std::size_t solo_limit = 0;
+    require(parse_solo_graph_limit(nullptr, 4, solo_limit) && solo_limit == 4, "unset Solo limit follows the default four");
+    require(parse_solo_graph_limit(nullptr, 64, solo_limit) && solo_limit == 8, "unset Solo limit follows GRAPH_LIMIT up to eight");
+    for (int value = 1; value <= 16; ++value) {
+        const std::string text = std::to_string(value);
+        require(parse_solo_graph_limit(text.c_str(), 4, solo_limit) && solo_limit == (std::size_t) value,
+                "explicit Solo limit 1..16");
+    }
+    for (const char* invalid : {"", "0", "17", "64", "-1", "8 ", "x"})
+        require(!parse_solo_graph_limit(invalid, 4, solo_limit), "strict Solo limit parsing");
+    for (int slots : {1, 2, 4, 8}) for (int stride : {8, 12, 16})
+        require(slot_solo_geometry(slots, stride) == ((slots == 4 && stride == 12) || (slots == 8 && stride == 16)),
+                "Solo geometry is C4 rows12 or C8 rows16");
+    require(kSlotSoloMaxOwners == 8, "Solo banks cover C8");
     for (int slots : {1, 2, 4, 8}) for (int stride : {8, 12, 16})
         for (int active = 0; active <= slots; ++active) for (int owner = -1; owner <= slots; ++owner)
             for (int rows = 0; rows <= 16; ++rows) for (bool images : {false, true}) for (bool prefilling : {false, true}) {
-                const bool valid = slots == 4 && stride == 12 && active == 1 && owner >= 0 && owner < 4 &&
-                                   rows > 0 && rows <= 8 && !images && !prefilling;
+                const bool valid = ((slots == 4 && stride == 12) || (slots == 8 && stride == 16)) && active == 1 &&
+                                   owner >= 0 && owner < slots && rows > 0 && rows <= 8 && !images && !prefilling;
                 require(slot_solo_eligible(true, slots, stride, active, owner, rows, images, prefilling) == valid, "bounded eligible geometry");
                 require(!slot_solo_eligible(false, slots, stride, active, owner, rows, images, prefilling), "off never dispatches solo");
             }
@@ -43,7 +58,7 @@ int main() {
     }
     using Bank = SoloGraphBank<uintptr_t>;
     static_assert(!std::is_copy_constructible_v<Bank> && !std::is_copy_assignable_v<Bank>);
-    Bank parked[4];
+    Bank parked[kSlotSoloMaxOwners];
     uintptr_t active[9] = {}, active_nr[9] = {}, commit = 99;
     int groups[9] = {};
     bool launched[9] = {}, launched_nr[9] = {};
@@ -51,7 +66,7 @@ int main() {
         active[t] = t; active_nr[t] = t + 10; groups[t] = t % 2 + 1;
         launched[t] = t % 3 == 0; launched_nr[t] = t % 3 == 1;
     }
-    for (int b = 0; b < 4; ++b) {
+    for (int b = 0; b < kSlotSoloMaxOwners; ++b) {
         parked[b].commit = 1000 + b;
         for (int t = 1; t <= 8; ++t) {
             parked[b].exec[t] = 100 + b * 20 + t;
@@ -69,10 +84,10 @@ int main() {
             insert(bank.commit);
             for (int t = 1; t <= 8; ++t) { insert(bank.exec[t]); insert(bank.exec_nr[t]); }
         }
-        require(seen.size() == 85, "no handles lost in binding or restoration");
+        require(seen.size() == 1 + 16 + kSlotSoloMaxOwners * 17, "no handles lost in binding or restoration");
     };
     ownership();
-    for (int owner : {3, 1, 0, 2, 2, 3, 0, 1}) {
+    for (int owner : {3, 1, 0, 2, 2, 3, 0, 1, 7, 4, 6, 5, 5, 7}) {
         parked[owner].exchange(active, active_nr, commit, groups, launched, launched_nr);
         ownership();
         require(commit == (uintptr_t) (1000 + owner), "nonzero owner has its own commit graph");

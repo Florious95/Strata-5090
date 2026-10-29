@@ -744,7 +744,7 @@ Verifier::~Verifier() {
         for (auto& e : row)
             if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
-    for (int b = 0; b < 4; ++b) destroy_solo_graphs(b);
+    for (int b = 0; b < kSlotSoloMaxOwners; ++b) destroy_solo_graphs(b);
     for (auto& kv : exec_bm_)
         if (kv.second) cudaGraphExecDestroy(kv.second);
     for (auto& kv : commit_bm_)
@@ -5013,9 +5013,9 @@ std::vector<uintptr_t> Verifier::solo_profile(int owner) const {
 }
 
 void Verifier::reserve_solo_graph(int T) {
-    // Bound on-demand target graphs across all four owners AND both residency
-    // variants, independently of the legacy batch LRU. Four owner commit graphs
-    // are additional persistent graphs, not four new verifier scratch arenas.
+    // Bound on-demand target graphs across all owners (4 or 8) AND both residency
+    // variants, independently of the legacy batch LRU. One commit graph per owner
+    // is an additional persistent graph, not a new verifier scratch arena.
     auto graph = [&](int b, int v, int t) -> cudaGraphExec_t& {
         if (b == solo_slot_) return v ? exec_nr_[0][t] : exec_[0][t];   // Solo windows use the one-CTA select (sel_long_ 0)
         return v ? solo_graphs_[b].exec_nr[t] : solo_graphs_[b].exec[t];
@@ -5027,12 +5027,12 @@ void Verifier::reserve_solo_graph(int T) {
     if (graph(solo_slot_, ar_off_ ? 1 : 0, T)) return;
     size_t count = 0; uint64_t oldest = UINT64_MAX;
     int ob = -1, ov = 0, ot = 0;
-    for (int b = 0; b < 4; ++b) for (int v = 0; v < 2; ++v) for (int t = 1; t <= 8; ++t) {
+    for (int b = 0; b < kSlotSoloMaxOwners; ++b) for (int v = 0; v < 2; ++v) for (int t = 1; t <= 8; ++t) {
         if (!graph(b, v, t)) continue;
         ++count;
         if (solo_used_[b][v][t] < oldest) { oldest = solo_used_[b][v][t]; ob = b; ov = v; ot = t; }
     }
-    if (count >= slot_solo_graph_limit(batch_graph_limit_) && ob >= 0) {
+    if (count >= (solo_graph_limit_ ? solo_graph_limit_ : slot_solo_graph_limit(batch_graph_limit_)) && ob >= 0) {
         cudaGraphExecDestroy(graph(ob, ov, ot));
         graph(ob, ov, ot) = nullptr;
         launched(ob, ov, ot) = false;   // the next graph of that size is a cold first launch again
@@ -5043,7 +5043,7 @@ void Verifier::reserve_solo_graph(int T) {
 Verifier::ScopedSoloBinding::ScopedSoloBinding(Verifier& v, int owner, std::string& err)
     : rope_(nullptr, owner >= 0) {   // Solo graphs use cell positions: text-only owners only
     if (owner < 0) return; // disabled/legacy: no synchronization or graph work
-    if (owner >= 4 || v.slots_.size() != 4 || v.max_t_ != 12 || v.solo_slot_ >= 0 ||
+    if (owner >= (int) v.slots_.size() || !slot_solo_geometry((int) v.slots_.size(), v.max_t_) || v.solo_slot_ >= 0 ||
         v.batch_rec_ || v.admission_sampling_ || v.b_running_.load() || v.staged_ || v.prelaunched_ || v.next_ ||
         v.lb_ != 0 || v.le_ != v.g_->n_layers || !v.slots_[owner]->rope_text_only() || select_long_on()) {
         err = "slot solo: unsupported or busy verifier binding"; return;
@@ -5098,7 +5098,7 @@ bool Verifier::prewarm_slot_solo(int T, std::string& err) {
     // One maximum-width target per owner, not every owner x width x variant.
     // Subsequent shapes share a global <=8-target LRU. All static runtime setters
     // must be complete before this READY-time capture. No target graph is run.
-    for (int b = 0; b < 4; ++b) {
+    for (int b = 0; b < (int) slots_.size(); ++b) {
         ScopedSoloBinding binding(*this, b, err);
         if (!binding) return false;
         refresh_ar();

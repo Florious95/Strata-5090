@@ -160,7 +160,7 @@ public:
              ",\"segmented_verify\":" + boolean(c.segmented) + ",\"streaming\":" + boolean(streaming) +
              ",\"slot_solo\":" + boolean(c.slot_solo) + ",\"row_table\":" + boolean(c.row_table) +
              ",\"slot_solo_target_graph_limit\":" + num(c.solo_graph_limit) +
-             ",\"slot_solo_commit_graph_limit\":" + num(c.slot_solo ? 4 : 0) +
+             ",\"slot_solo_commit_graph_limit\":" + num(c.slot_solo ? c.slots : 0) +
              ",\"max_rows\":" + num(c.max_rows) + ",\"max_dense_groups\":2,\"audit_all_batch_paths\":true}," +
              "\"provenance\":{\"counter_schema\":\"expert-dispatch-occurrences-v1\",\"route_sources\":{" +
              "\"routed\":\"ExpertDispatch.experts\",\"hits\":\"ExpertDispatch.cache_hits\"," +

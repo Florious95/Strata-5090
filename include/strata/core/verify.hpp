@@ -325,6 +325,7 @@ public:
     bool commit_slot_prefixes(const int* keep, std::string& err);
     /// --batch-mtp: slot rotation makes many row layouts, so bound the captured batch graph pairs (LRU). 0 = unbounded.
     void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n; }
+    void set_solo_graph_limit(size_t n) { solo_graph_limit_ = n; }
 
     // ---- The stages of a layer split as a PIPELINE.  A batch window over the slot GROUP
     // [base, base + S) is launched on ONE stage with its commit right behind it on the stage's stream (a batch window
@@ -512,10 +513,11 @@ private:
         int table_scores = 0, table_segments = 0, table_attn = 0, table_rows = 0;
     };
     HeadDispatch record_head_, last_head_;
-    SoloGraphBank<cudaGraphExec_t> solo_graphs_[4];
-    HeadDispatch solo_head_[4][2][9];
-    uint64_t solo_used_[4][2][9] = {}, solo_tick_ = 0, solo_epoch_[4] = {};
-    std::vector<uintptr_t> solo_profile_[4];
+    SoloGraphBank<cudaGraphExec_t> solo_graphs_[kSlotSoloMaxOwners];
+    HeadDispatch solo_head_[kSlotSoloMaxOwners][2][9];
+    uint64_t solo_used_[kSlotSoloMaxOwners][2][9] = {}, solo_tick_ = 0, solo_epoch_[kSlotSoloMaxOwners] = {};
+    std::vector<uintptr_t> solo_profile_[kSlotSoloMaxOwners];
+    size_t solo_graph_limit_ = 0;          ///< 0: slot_solo_graph_limit(batch_graph_limit_)
     int solo_slot_ = -1, last_solo_owner_ = -1, solo_groups_ = 0;
     bool last_slot_solo_ = false;
     void reserve_solo_graph(int T);
