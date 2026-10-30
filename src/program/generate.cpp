@@ -6128,6 +6128,9 @@ int main(int argc, char** argv) {
     if (batch_fast)
         std::fprintf(stderr, "strata batch speculation: packed capacity %d, fixed layout %d, draft overlap %d\n",
                      o.batch_rows, o.batch_spec_fixed ? 1 : 0, o.batch_draft_overlap ? 1 : 0);
+    if (batch_fast)   // which engine this is: the CMake STRATA_WINDOW_MAX_T (-> STRATA_VERIFY_MAX_T) the binary was built with
+        std::fprintf(stderr, "strata batch: window build %d rows (narrow kernels %d, packed rows %d)\n",
+                     (int) strata::kernels::kWindowMaxT, (int) strata::kernels::kVerifyNarrowT, o.batch_rows);
     if (o.batch_suffix)
         std::fprintf(stderr, "strata batch suffix: %s\n",
                      batch_fast && o.suffix_draft > 0 ? "enabled, private per-slot history and MTP selection" :
