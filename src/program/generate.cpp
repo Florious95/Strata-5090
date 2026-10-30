@@ -12909,6 +12909,11 @@ int main(int argc, char** argv) {
             std::swap(live_ok, sl.cached);
             std::swap(cvec_cached, sl.cvec);
             conversations.take_reuse(); // single-active retained provenance is disabled in the experiment
+            // #4420 (0.2.8) guards the legacy idle-slot park. This park keeps the full state (checked below) and slot-only
+            // takes a donor whole with its chain, so a richer copy is not expected here: name it if one is dropped.
+            if (conversations.supersedes_richer(live, live_imgs, checks, cvec_cached))
+                std::fprintf(stderr, "strata serve: conversation cache: slot %d park drops a parked copy holding a checkpoint "
+                                     "its chain does not (#4420 case, canonical park)\n", b);
             bool ok = park_current(held);
             if (ok && conversations.enabled()) {
                 auto probe = live;
