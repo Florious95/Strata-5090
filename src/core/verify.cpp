@@ -2726,8 +2726,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                          (int) N, (int) n_vocab_, T, cs);
                 record_head_.type = head_->type();
                 record_head_.wide = wide_head;
-                for (int first = 0; !wide_head && first < T; first += kVerifyMaxT) {
-                    const int count = std::min(kVerifyMaxT, T - first);
+                for (int first = 0; !wide_head && first < T; first += kVerifyNarrowT) {   // (8-column head reads in every build)
+                    const int count = std::min(kVerifyNarrowT, T - first);
                     native_quantize_q8_1(head_mixed_ + (size_t) first * N, xq_, (int) N, count, cs);
                     if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), count, (int) n_vocab_)) {
                         if (count >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, count, cs);
@@ -2885,7 +2885,7 @@ void Verifier::refresh_ar() {
 }
 
 bool Verifier::capture(int T, std::string& err) {
-    if (T < 1 || T > std::min(max_t_, strata::kernels::kVerifyMaxT)) { err = "verify: capture width out of range"; return false; }
+    if (T < 1 || T > std::min(max_t_, strata::kernels::kVerifyNarrowT)) { err = "verify: capture width out of range"; return false; }
     cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T];
     if (solo_slot_ >= 0) {
         batch_graph_cache_hit_ = exec_t != nullptr;
@@ -3368,7 +3368,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     last_batch_ = false;
     last_slot_solo_ = false;
     last_row_table_ = false;
-    if (T < 1 || T > std::min(max_t_, strata::kernels::kVerifyMaxT)) { err = "verify: window size out of range"; return false; }
+    if (T < 1 || T > std::min(max_t_, strata::kernels::kVerifyNarrowT)) { err = "verify: window size out of range"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
@@ -5030,7 +5030,8 @@ Verifier::ScopedSoloBinding::ScopedSoloBinding(Verifier& v, int owner, std::stri
     if (owner < 0) return; // disabled/legacy: no synchronization or graph work
     if (owner >= (int) v.slots_.size() || !slot_solo_geometry((int) v.slots_.size(), v.max_t_) || v.solo_slot_ >= 0 ||
         v.batch_rec_ || v.admission_sampling_ || v.b_running_.load() || v.staged_ || v.prelaunched_ || v.next_ ||
-        v.lb_ != 0 || v.le_ != v.g_->n_layers || !v.slots_[owner]->rope_text_only() || select_long_on()) {
+        v.lb_ != 0 || v.le_ != v.g_->n_layers || !v.slots_[owner]->rope_text_only() || select_long_on() ||
+        !SoloGraphBank<cudaGraphExec_t>::narrow_only(v.exec_[0]) || !SoloGraphBank<cudaGraphExec_t>::narrow_only(v.exec_nr_[0])) {
         err = "slot solo: unsupported or busy verifier binding"; return;
     }
     const OnDevice on(v.device_);
@@ -5621,7 +5622,7 @@ bool Verifier::capture_all(std::string& err) {
     // needs, and nothing can be captured once pipelined windows are in flight.  Without it only [0]
     for (int sl = 0; sl < (select_long_on() ? 2 : 1); ++sl) {
         sel_long_ = sl;
-        for (int T = 1; T <= std::min(max_t_, strata::kernels::kVerifyMaxT); ++T)
+        for (int T = 1; T <= std::min(max_t_, strata::kernels::kVerifyNarrowT); ++T)
             if (!capture(T, err)) return false;
     }
     sel_long_ = 0;
@@ -5663,7 +5664,7 @@ void Verifier::pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_
 
 bool Verifier::prestage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err) {
     if (fl_active_) { err = "verify: a window is in flight on this verifier"; return false; }
-    if (T < 1 || T > std::min(max_t_, strata::kernels::kVerifyMaxT)) { err = "verify: window size out of range"; return false; }
+    if (T < 1 || T > std::min(max_t_, strata::kernels::kVerifyNarrowT)) { err = "verify: window size out of range"; return false; }
     if (pl_ple_rows_.empty()) { err = "verify: pipelined window not prepared (capture_all)"; return false; }
     const Clock::time_point t0 = Clock::now();
     pl_stage(T, tokens, pos0, ple_prev);
@@ -5676,7 +5677,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     const OnDevice on_device(device_);
     if (fl_active_) { err = "verify: a window is already in flight on this verifier"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
-    if (T < 1 || T > std::min(max_t_, strata::kernels::kVerifyMaxT)) { err = "verify: window size out of range"; return false; }
+    if (T < 1 || T > std::min(max_t_, strata::kernels::kVerifyNarrowT)) { err = "verify: window size out of range"; return false; }
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
     const int sl = select_long_on() && pos0 + T >= select_long_at() ? 1 : 0;   // the variant this window's context pays off with

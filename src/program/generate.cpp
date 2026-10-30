@@ -10380,7 +10380,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata: batch graph cache limit=%d layout pairs (not a MiB budget)\n", batch_graph_limit);
         }
         const int batch_capacity = batch_fast ? std::min(o.batch_rows, o.batch * o.batch_spec) :
-                                   batch_mtp ? strata::kernels::kVerifyMaxT : std::min(o.batch, (int) strata::kernels::kVerifyMaxT);
+                                   batch_mtp ? strata::kernels::kVerifyNarrowT : std::min(o.batch, (int) strata::kernels::kVerifyMaxT);
         size_t slot_bind_before = 0, slot_bind_total = 0;
         if (o.batch_slot_only && cudaMemGetInfo(&slot_bind_before, &slot_bind_total) != cudaSuccess) {
             std::fprintf(stderr, "strata slot-only: cannot measure pre-bind GPU memory\n");
@@ -16616,7 +16616,7 @@ int main(int argc, char** argv) {
                 if (host_res.empty() || !pending.empty() ||
                     std::any_of(host_res.begin(), host_res.end(), [](int32_t r) { return r < 0; }))
                     return -1;
-                int mt = strata::kernels::kVerifyMaxT;
+                int mt = strata::kernels::kVerifyNarrowT;   // (Verifier::run takes <= 8 rows in the fork, in every build)
                 for (int k = 0; k < n_pipe; ++k) {
                     if (!stage_verifier(k).ar_live()) return -1;
                     mt = std::min(mt, stage_verifier(k).max_t());

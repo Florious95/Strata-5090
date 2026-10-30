@@ -60,16 +60,29 @@ inline bool row_needs_sampling(bool greedy, float temperature, int history, cons
 // is permitted (including between the active bank and a slot's parked bank).
 // The verifier's one-CTA select row only (sel_long_ 0): a Solo binding refuses STRATA_SELECT_LONG. A graph's
 // first-launch flags move with it, so a parked graph is never mistaken for a launched one.
+// 0.2.8: the verifier's window-graph arrays are indexed by T = 1..kWindowMaxT (17 entries in a 16-row build). A Solo
+// window is at most 8 rows, so a bank owns [0..8] only; the verifier's wider entries are never exchanged, and a Solo
+// binding refuses a verifier that holds one (narrow_only), so no wide graph can replay under an owner's binding.
 template<class Handle> struct SoloGraphBank {
-    Handle exec[9] = {}, exec_nr[9] = {}, commit = {};
-    int groups[9] = {};
-    bool launched[9] = {}, launched_nr[9] = {};
+    static constexpr std::size_t kRows = 9;
+    Handle exec[kRows] = {}, exec_nr[kRows] = {}, commit = {};
+    int groups[kRows] = {};
+    bool launched[kRows] = {}, launched_nr[kRows] = {};
     SoloGraphBank() = default;
     SoloGraphBank(const SoloGraphBank&) = delete;
     SoloGraphBank& operator=(const SoloGraphBank&) = delete;
-    void exchange(Handle (&a)[9], Handle (&b)[9], Handle& c, int (&g)[9], bool (&la)[9], bool (&lb)[9]) {
-        std::swap(exec, a); std::swap(exec_nr, b); std::swap(commit, c); std::swap(groups, g);
-        std::swap(launched, la); std::swap(launched_nr, lb);
+    template<std::size_t M> static bool narrow_only(const Handle (&a)[M]) {
+        for (std::size_t t = kRows; t < M; ++t) if (a[t]) return false;
+        return true;
+    }
+    template<std::size_t M>
+    void exchange(Handle (&a)[M], Handle (&b)[M], Handle& c, int (&g)[M], bool (&la)[M], bool (&lb)[M]) {
+        static_assert(M >= kRows, "the verifier holds at least the narrow window graphs");
+        for (std::size_t t = 0; t < kRows; ++t) {
+            std::swap(exec[t], a[t]); std::swap(exec_nr[t], b[t]); std::swap(groups[t], g[t]);
+            std::swap(launched[t], la[t]); std::swap(launched_nr[t], lb[t]);
+        }
+        std::swap(commit, c);
     }
 };
 

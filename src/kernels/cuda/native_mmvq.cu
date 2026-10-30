@@ -3461,10 +3461,12 @@ bool native_head_f32_wide(int ggml_type, const void* weights, const float* x, vo
     const auto qcol = native_q8_1_bytes(n_in, 1);
     // The small quantizer stays <=8 columns; its outputs occupy distinct columns
     // of the already allocated wide verifier scratch. No extra workspace.
-    for (int first = 0; first < ncols; first += MAX_NCOLS)
+    // (8, not MAX_NCOLS: a 16-row build takes 16 columns a launch, and this path keeps its 0.2.7 launches)
+    constexpr int kQuantCols = 8;
+    for (int first = 0; first < ncols; first += kQuantCols)
         native_quantize_q8_1(x + std::size_t(first) * n_in,
                             static_cast<uint8_t*>(scratch_q8_1) + std::size_t(first) * qcol,
-                            n_in, std::min(MAX_NCOLS, ncols - first), stream);
+                            n_in, std::min(kQuantCols, ncols - first), stream);
     // Canonical GGUF weights remain valid even when a packed copy is registered.
     // Force the exact layout: four warps, two rows, the original reduction order.
     // Q5KTraits already snapshots ql/qh, unpacked scales/mins and dm by value.

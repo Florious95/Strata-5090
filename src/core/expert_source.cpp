@@ -4810,6 +4810,9 @@ namespace {
 // refused at run time rather than written past them.
 constexpr int64_t kMaxWindowEntries = strata::kernels::cpu::MAXT * 16;
 static_assert(strata::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
+// (the fork's merged dispatch takes cpu::MAXT = 16 tokens in every build: a 16-row C8 window is one dispatch even where
+// kWindowMaxT is 8, so the window tables and the token limit below follow cpu::MAXT, not the build's window)
+static_assert(strata::kernels::cpu::MAXT >= strata::kernels::kWindowMaxT, "the merged dispatch holds a whole window");
 }  // namespace
 
 namespace {
@@ -4833,7 +4836,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic) {
     using namespace strata::kernels::cpu;
     if (d.failed) return;
-    if (n_tok < 1 || n_tok > strata::kernels::kWindowMaxT) {
+    if (n_tok < 1 || n_tok > MAXT) {
         d.failed = true;
         d.fail = "a verify window has more tokens than the multi-token expert kernel takes";
         d.fail_layer = d.layers;
@@ -4854,13 +4857,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.fail_layer = d.layers;
         return;
     }
-    if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) strata::kernels::kWindowMaxT);
+    if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) MAXT);
     const ExpertLayout& lay = expert_layout();
     const bool native = lay.native;
-    if (native && d.nact_multi.size() < (size_t) strata::kernels::kWindowMaxT * kNativeActBytes)
-        d.nact_multi.resize((size_t) strata::kernels::kWindowMaxT * kNativeActBytes);
+    if (native && d.nact_multi.size() < (size_t) MAXT * kNativeActBytes) d.nact_multi.resize((size_t) MAXT * kNativeActBytes);
     if (d.job_of.size() != (size_t) d.n_expert) d.job_of.assign((size_t) d.n_expert, (int16_t) -1);
-    if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (strata::kernels::kWindowMaxT * k));
+    if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (MAXT * k));
     static const bool ptrace = std::getenv("STRATA_POOL_TRACE") != nullptr;
     auto pt = [&](const char* what, long long a = -1) {
         if (ptrace) { std::fprintf(stderr, "pool trace: layer %lld %s %lld\n", (long long) d.layers, what, a); std::fflush(stderr); }

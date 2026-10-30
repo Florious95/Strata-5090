@@ -105,5 +105,28 @@ int main() {
                     launched[t] == (t % 3 == 0) && launched_nr[t] == (t % 3 == 1),
                     "anchor graph/groups/first-launch flags restored exactly");
     }
+    {   // 0.2.8 wide build: the verifier's arrays have kWindowMaxT + 1 = 17 entries; the bank swaps [0..8] only
+        Bank bank;
+        uintptr_t w[17] = {}, w_nr[17] = {}, w_commit = 7;
+        int w_groups[17] = {};
+        bool w_la[17] = {}, w_lb[17] = {};
+        for (int t = 1; t <= 8; ++t) { bank.exec[t] = 500 + t; bank.exec_nr[t] = 600 + t; bank.groups[t] = 2; bank.launched[t] = true; }
+        bank.commit = 700;
+        for (int t = 1; t <= 16; ++t) { w[t] = 800 + t; w_nr[t] = 900 + t; w_groups[t] = 1; w_lb[t] = true; }
+        require(!Bank::narrow_only(w) && !Bank::narrow_only(w_nr), "a held 9..16-row graph is seen (the binding refuses it)");
+        bank.exchange(w, w_nr, w_commit, w_groups, w_la, w_lb);
+        for (int t = 1; t <= 8; ++t)
+            require(w[t] == (uintptr_t) (500 + t) && w_nr[t] == (uintptr_t) (600 + t) && w_groups[t] == 2 && w_la[t] && !w_lb[t] &&
+                    bank.exec[t] == (uintptr_t) (800 + t) && bank.exec_nr[t] == (uintptr_t) (900 + t) && bank.groups[t] == 1 &&
+                    !bank.launched[t] && bank.launched_nr[t], "the narrow graphs, groups and flags change places");
+        for (int t = 9; t <= 16; ++t)
+            require(w[t] == (uintptr_t) (800 + t) && w_nr[t] == (uintptr_t) (900 + t) && w_groups[t] == 1 && !w_la[t] && w_lb[t],
+                    "the wide entries stay with the verifier");
+        require(w_commit == 700 && bank.commit == 7, "the commit graph changes places");
+        for (int t = 9; t <= 16; ++t) w[t] = w_nr[t] = 0;
+        require(Bank::narrow_only(w) && Bank::narrow_only(w_nr), "no wide graph held: the binding may proceed");
+        uintptr_t n9[9] = {1, 2};
+        require(Bank::narrow_only(n9), "the 8-row build's arrays are always narrow");
+    }
     std::printf("PASS %d Solo dispatch/sampling-predicate/handle ownership checks (CPU only)\n", checks);
 }
